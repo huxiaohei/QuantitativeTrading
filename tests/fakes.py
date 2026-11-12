@@ -346,6 +346,22 @@ def make_st_history(rows: Sequence[tuple[str, date, date | None]]) -> pd.DataFra
     )
 
 
+def make_benchmark(code: str, days: Sequence[date], closes: Sequence[float]) -> pd.DataFrame:
+    """构造 BENCHMARKS 表：某个基准代码的每日收盘价。"""
+    return pd.DataFrame(
+        {
+            "code": pd.Series([code] * len(days), dtype="str"),
+            "day": _ts(list(days)),
+            "close": pd.Series([float(c) for c in closes], dtype="float64"),
+        }
+    )
+
+
+def write_calendar(store: ParquetStore, days: Sequence[date]) -> None:
+    """把交易日写入 store 的 trade_days 表。"""
+    store.write(Table.TRADE_DAYS, pd.DataFrame({"day": _ts(list(days))}))
+
+
 def populate_store(
     store: ParquetStore,
     *,

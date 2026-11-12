@@ -1,0 +1,364 @@
+"""回测报告：周期解析、run_period、基准加载、图表与 HTML 渲染。
+
+报告是单个自包含 HTML 文件：图用 matplotlib（Agg 后端）生成 SVG 后内嵌，不引用任何外部资源。
+"""
+
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import date
+from io import BytesIO
+from pathlib import Path
+from typing import Any, cast
+
+import matplotlib
+import pandas as pd
+from jinja2 import Environment, PackageLoader
+from matplotlib import font_manager
+from matplotlib.figure import Figure
+
+from qt.backtest.engine import BacktestResult, run_backtest
+from qt.backtest.metrics import (
+    Metrics,
+    benchmark_metrics,
+    exit_breakdown,
+    rejection_breakdown,
+)
+from qt.config import AppConfig
+from qt.costs import CostModel
+from qt.data.schema import Table
+from qt.data.store import ParquetStore
+from qt.data.update import load_calendar
+from qt.features import build_panel
+from qt.risk import RiskManager
+from qt.strategy.high_dividend_low import HighDividendLow
+
+matplotlib.use("Agg")
+
+ETF_CODE = "510880"
+BENCHMARK_NAMES = {"H00300": "沪深300 全收益", ETF_CODE: "红利 ETF (510880)"}
+PERIOD_LABELS = {"in": "样本内", "out": "样本外", "full": "全区间"}
+EXIT_LABELS = {
+    "take_profit_fixed": "固定止盈",
+    "take_profit_trailing": "移动止盈",
+    "stop_loss": "价格止损",
+    "time_stop": "时间止损",
+    "fundamental": "基本面止损",
+    "delisted": "退市清算",
+}
+RULE_LABELS = {
+    "paused": "暂停买入期间",
+    "already_held": "已持有",
+    "cooldown": "卖出后冷却期内",
+    "max_positions": "持仓数已满",
+    "industry_cap": "行业集中度上限",
+    "lot_too_expensive": "一手也买不起",
+    "no_cash": "现金不足",
+}
+KIND_LABELS = {"warn": "回撤预警", "pause": "暂停买入", "resume": "恢复买入"}
+FIXED_LIMITATIONS = [
+    "分红按除权价再投资且未扣红利税",
+    "财务指标为最新口径，已被追溯调整的历史数值可能与当时公布的不同",
+    "没有实际披露日期的财报按法定披露截止日使用，对延迟披露的公司偏乐观",
+    "退市股票按最后一个交易日收盘价清算",
+    "涨跌停与停牌按日线开盘价近似判断",
+    "回测结果不代表未来收益",
+]
+DRAWDOWN_BANNER = "最大回撤接近 50% 上限，按设计文档策略需要重做"
+DRAWDOWN_BANNER_LEVEL = -0.40
+# 买入时指标快照的中文名与格式：pct 为百分比，int 为整数
+METRIC_LABELS = {
+    "dividend_yield": ("股息率", "pct"),
+    "price_position": ("价格分位", "pct"),
+    "dividend_years": ("连续分红年数", "int"),
+    "roe_avg3": ("三年平均 ROE", "pct"),
+    "payout_ratio": ("分红率", "pct"),
+    "profit_yoy": ("净利润同比", "pct"),
+    "debt_ratio": ("资产负债率", "pct"),
+}
+CJK_FONTS = ("PingFang SC", "Heiti TC", "Songti SC", "Arial Unicode MS")
+
+
+class BacktestInputError(ValueError):
+    """回测输入（日期区间、已存数据）不满足要求。"""
+
+
+@dataclass(frozen=True)
+class BenchmarkSet:
+    """已对齐到回测交易日的基准收盘价，以及缺失的基准代码。"""
+
+    series: dict[str, "pd.Series[float]"]
+    missing: list[str]
+
+
+# ---------- 周期与回测 ----------
+
+
+def last_bar_day(store: ParquetStore) -> date | None:
+    """存储中所有股票日线的最后一个交易日；没有日线返回 None。"""
+    days: list[date] = []
+    for symbol in store.read(Table.SECURITIES)["symbol"]:
+        day = store.last_day(Table.BARS, str(symbol))
+        if day is not None:
+            days.append(day)
+    return max(days, default=None)
+
+
+def resolve_period(cfg: AppConfig, store: ParquetStore, period: str) -> tuple[date, date]:
+    """把 in/out/full 解析成 (开始, 结束)；out 与 full 的结束日取最后一个有日线的交易日。"""
+    bt = cfg.backtest
+    if period == "in":
+        return bt.in_sample_start, bt.in_sample_end
+    if period not in ("out", "full"):
+        raise ValueError(f"period 只能是 in、out、full，收到 {period!r}")
+    last = last_bar_day(store)
+    if last is None:
+        raise BacktestInputError("存储中没有日线数据，请先运行 qt data update")
+    return (bt.out_sample_start if period == "out" else bt.in_sample_start), last
+
+
+def run_period(cfg: AppConfig, store: ParquetStore, start: date, end: date) -> BacktestResult:
+    """在 [start, end] 上运行回测；区间收缩到日历交易日与最后一根日线之内。"""
+    calendar = load_calendar(store)
+    last = last_bar_day(store)
+    days = calendar.between(start, min(end, last)) if last is not None else []
+    if not days:
+        raise BacktestInputError(f"{start} 至 {end} 之间没有日线数据，无法回测")
+    start, end = days[0], days[-1]
+    panel = build_panel(store, calendar, cfg, start, end)
+    costs = CostModel(cfg.costs)
+    strategy = HighDividendLow(cfg.strategy, cfg.universe)  # 想换策略，在这里替换
+    risk = RiskManager(cfg.risk, calendar, costs)
+    return run_backtest(
+        panel,
+        strategy,
+        risk,
+        costs,
+        calendar,
+        start,
+        end,
+        cfg.backtest.initial_cash,
+        cfg.backtest.buy_order_valid_days,
+    )
+
+
+def load_benchmarks(store: ParquetStore, cfg: AppConfig, index: "pd.Index[Any]") -> BenchmarkSet:
+    """读取各基准在回测区间内的收盘价，前向填充对齐到 index；完全没有数据的记入 missing。"""
+    frame = store.read(Table.BENCHMARKS, start=index[0], end=index[-1])
+    found: dict[str, pd.Series[float]] = {}
+    missing: list[str] = []
+    for code in cfg.backtest.benchmarks:
+        rows = frame[frame["code"] == code]
+        days = [pd.Timestamp(ts).date() for ts in rows["day"]]
+        close = pd.Series(rows["close"].to_numpy(dtype="float64"), index=pd.Index(days))
+        aligned = close.sort_index().reindex(close.index.union(index)).ffill().reindex(index)
+        aligned = aligned.dropna()
+        if len(aligned) == 0:
+            missing.append(code)
+        else:
+            found[code] = aligned
+    return BenchmarkSet(found, missing)
+
+
+def load_last_closes(store: ParquetStore, symbols: list[str], end: date) -> dict[str, float]:
+    """各股票截至 end 的最后收盘价，用于计算期末持仓的浮动收益。"""
+    if not symbols:
+        return {}
+    bars = store.read(Table.BARS, symbols=symbols, end=end).sort_values("day")
+    last = bars.groupby("symbol")["close"].last()
+    return {str(s): float(c) for s, c in last.items()}
+
+
+# ---------- 文字与格式 ----------
+
+
+def verdict_sentence(strategy: Metrics, etf: Metrics | None) -> str:
+    """一句话回答是否优于直接持有红利 ETF：只陈述两项指标孰优孰劣，不给建议。"""
+    if etf is None:
+        return "红利 ETF 基准数据缺失，无法比较策略与直接持有红利 ETF 的差异。"
+    higher = strategy.annual_return > etf.annual_return
+    ret = "高于" if higher else ("低于" if strategy.annual_return < etf.annual_return else "等于")
+    if strategy.max_drawdown == etf.max_drawdown:
+        return f"年化收益{ret}红利 ETF，最大回撤相同。"
+    bigger = strategy.max_drawdown < etf.max_drawdown  # 回撤为负数，更小即回撤更大
+    also = "也" if higher == bigger else ""
+    return f"年化收益{ret}红利 ETF，最大回撤{also}{'更大' if bigger else '更小'}。"
+
+
+def _pct(value: float) -> str:
+    return f"{value:.2%}"
+
+
+def _money(value: float) -> str:
+    return f"{value:,.2f}"
+
+
+def _snapshot_text(metrics: Mapping[str, float]) -> str:
+    parts: list[str] = []
+    for key, value in metrics.items():
+        label, kind = METRIC_LABELS.get(key, (key, "num"))
+        text = (
+            _pct(value) if kind == "pct" else (f"{value:.0f}" if kind == "int" else f"{value:.4g}")
+        )
+        parts.append(f"{label} {text}")
+    return "；".join(parts)
+
+
+def _flatten(data: Mapping[str, object], prefix: str = "") -> list[tuple[str, str]]:
+    """把嵌套配置展开成 (a.b.c, 值) 列表。"""
+    rows: list[tuple[str, str]] = []
+    for key, item in data.items():
+        name = f"{prefix}.{key}" if prefix else key
+        if isinstance(item, dict):
+            rows.extend(_flatten(cast("dict[str, object]", item), name))
+        else:
+            rows.append((name, str(item)))
+    return rows
+
+
+# ---------- 图表 ----------
+
+
+def _cjk_font() -> str | None:
+    """macOS 上可用的中文字体名；一个都没有返回 None。"""
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    return next((name for name in CJK_FONTS if name in available), None)
+
+
+def _clean_svg(svg: str) -> str:
+    """去掉 XML 声明、DOCTYPE、metadata 与命名空间声明，保证内嵌后不含任何外部网址。"""
+    svg = re.sub(r"<\?xml.*?\?>", "", svg, flags=re.S)
+    svg = re.sub(r"<!DOCTYPE.*?>", "", svg, flags=re.S)
+    svg = re.sub(r"<metadata>.*?</metadata>", "", svg, flags=re.S)
+    return re.sub(r'\s+xmlns(:\w+)?="[^"]*"', "", svg).strip()
+
+
+def _chart_svg(equity: "pd.Series[float]", benchmarks: Mapping[str, "pd.Series[float]"]) -> str:
+    """上图为起点归一的净值曲线，下图为回撤曲线；返回内嵌用的 SVG 文本。"""
+    font = _cjk_font()
+    zh = font is not None
+    names = BENCHMARK_NAMES if zh else {}
+    series: dict[str, pd.Series[float]] = {"策略" if zh else "Strategy": equity}
+    series.update({names.get(code, code): close for code, close in benchmarks.items()})
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    if font is not None:
+        matplotlib.rcParams["font.sans-serif"] = [font]
+    fig = Figure(figsize=(10, 7))
+    top, bottom = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
+    for name, close in series.items():
+        days = list(close.index)
+        top.plot(days, close.to_numpy(dtype="float64") / float(close.iloc[0]), label=name)
+        drawdown = close / close.cummax() - 1
+        bottom.plot(days, drawdown.to_numpy(dtype="float64") * 100, label=name)
+    top.set_title("净值曲线（起点 = 1）" if zh else "Equity (start = 1)")
+    bottom.set_title("回撤（%）" if zh else "Drawdown (%)")
+    top.legend(loc="upper left")
+    for ax in (top, bottom):
+        ax.grid(alpha=0.3)
+    fig.tight_layout()
+    buf = BytesIO()
+    cast("Any", fig).savefig(buf, format="svg")  # savefig 的类型标注含未知类型，按 Any 调用
+    return _clean_svg(buf.getvalue().decode("utf-8"))
+
+
+# ---------- 渲染 ----------
+
+
+def _environment() -> Environment:
+    env = Environment(loader=PackageLoader("qt.backtest", "templates"), autoescape=True)
+    env.filters["pct"] = _pct
+    env.filters["money"] = _money
+    return env
+
+
+def _summary_rows(
+    metrics: Metrics, benchmarks: Mapping[str, "pd.Series[float]"], cfg: AppConfig
+) -> tuple[list[dict[str, object]], Metrics | None]:
+    """概要表各行（策略在前，基准按配置顺序），以及红利 ETF 的指标（缺失为 None）。"""
+    rows: list[dict[str, object]] = [{"name": "策略", "m": metrics}]
+    etf: Metrics | None = None
+    for code in cfg.backtest.benchmarks:
+        if code in benchmarks:
+            m = benchmark_metrics(benchmarks[code])
+            rows.append({"name": BENCHMARK_NAMES.get(code, code), "m": m})
+            if code == ETF_CODE:
+                etf = m
+    return rows, etf
+
+
+def render_report(
+    result: BacktestResult,
+    metrics: Metrics,
+    benchmarks: Mapping[str, "pd.Series[float]"],
+    cfg: AppConfig,
+    period_label: str,
+    data_gaps: Path,
+    out: Path,
+    last_closes: Mapping[str, float] | None = None,
+) -> Path:
+    """渲染单文件 HTML 报告并写到 out，返回 out。
+
+    benchmarks 为已对齐回测交易日的收盘价；配置里有但这里没有的基准在报告中给出缺失说明。
+    last_closes 为期末持仓的最后收盘价，用于计算浮动收益（缺失显示为 —）。
+    """
+    closes = last_closes or {}
+    rows, etf = _summary_rows(metrics, benchmarks, cfg)
+    trades = [
+        {
+            "t": t,
+            "reason": EXIT_LABELS.get(t.exit_reason.value, t.exit_reason.value),
+            "snapshot": _snapshot_text(t.entry_metrics),
+        }
+        for t in result.trades
+    ]
+    held = [
+        {
+            "p": p,
+            "ret": p.ret(closes[p.symbol]) if p.symbol in closes else None,
+            "snapshot": _snapshot_text(p.entry_metrics),
+        }
+        for p in result.open_positions
+    ]
+    exits = [
+        {**r, "label": EXIT_LABELS.get(str(r["exit_reason"]), str(r["exit_reason"]))}
+        for r in exit_breakdown(result.trades).to_dict("records")
+    ]
+    rejects = [
+        {**r, "label": RULE_LABELS.get(str(r["rule"]), "")}
+        for r in rejection_breakdown(result.rejections).to_dict("records")
+    ]
+    days = list(result.equity.index)
+    html = (
+        _environment()
+        .get_template("report.html.j2")
+        .render(
+            banner=DRAWDOWN_BANNER if metrics.max_drawdown <= DRAWDOWN_BANNER_LEVEL else None,
+            period=PERIOD_LABELS.get(period_label, period_label),
+            first_day=days[0],
+            last_day=days[-1],
+            initial_cash=cfg.backtest.initial_cash,
+            final_equity=float(result.equity.iloc[-1]),
+            summary=rows,
+            verdict=verdict_sentence(metrics, etf),
+            missing=[
+                BENCHMARK_NAMES.get(c, c) for c in cfg.backtest.benchmarks if c not in benchmarks
+            ],
+            chart=_chart_svg(result.equity, benchmarks),
+            m=metrics,
+            exits=exits,
+            events=[
+                {"e": e, "kind": KIND_LABELS.get(e.kind.value, e.kind.value)}
+                for e in result.risk_events
+            ],
+            rejects=rejects,
+            expired=len(result.expired_buys),
+            trades=trades,
+            held=held,
+            params=_flatten(cfg.model_dump(mode="json")),
+            gaps=data_gaps.read_text(encoding="utf-8"),
+            limitations=FIXED_LIMITATIONS,
+        )
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    return out
