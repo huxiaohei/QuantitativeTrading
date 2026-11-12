@@ -1,12 +1,12 @@
 """测试辅助：假数据与默认配置。"""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
-from qt.config import CostsConfig, RiskConfig, load_config
+from qt.config import CostsConfig, RiskConfig, StrategyConfig, UniverseConfig, load_config
 from qt.data.schema import Table, empty_frame
 from qt.models import BuyCandidate, Position
 
@@ -21,6 +21,49 @@ def default_costs() -> CostsConfig:
 def default_risk() -> RiskConfig:
     """返回 config/default.yaml 中的 risk 配置。"""
     return load_config(_ROOT / "config" / "default.yaml").risk
+
+
+def default_strategy_config() -> StrategyConfig:
+    """返回 config/default.yaml 中的 strategy 配置。"""
+    return load_config(_ROOT / "config" / "default.yaml").strategy
+
+
+def default_universe_config() -> UniverseConfig:
+    """返回 config/default.yaml 中的 universe 配置。"""
+    return load_config(_ROOT / "config" / "default.yaml").universe
+
+
+# 默认行：满足全部买入条件，测试只覆盖要测的列
+_SNAPSHOT_DEFAULTS: dict[str, object] = {
+    "close": 10.0,
+    "price_position": 0.12,
+    "dividend_yield": 0.052,
+    "dividend_years": 8,
+    "dividend_cut": False,
+    "roe_avg3": 0.12,
+    "payout_ratio": 0.5,
+    "profit_yoy": 0.05,
+    "debt_ratio": 0.5,
+    "industry": "银行",
+    "is_financial": False,
+    "is_st": False,
+    "listed_years": 10.0,
+    "avg_amount_60d": 1e8,
+}
+
+
+def make_snapshot(rows: Mapping[str, Mapping[str, object]]) -> pd.DataFrame:
+    """构造 snapshot：以 symbol 为索引，列与任务 6 的 snapshot 契约一致。
+
+    每行先取默认值（通过全部买入条件），再用 rows 中给出的列覆盖。
+    """
+    records = [{**_SNAPSHOT_DEFAULTS, **overrides} for overrides in rows.values()]
+    df = pd.DataFrame(
+        records, index=pd.Index(list(rows), name="symbol"), columns=list(_SNAPSHOT_DEFAULTS)
+    )
+    for col in ("dividend_cut", "is_financial", "is_st"):
+        df[col] = df[col].astype(bool)
+    return df
 
 
 def make_candidate(
