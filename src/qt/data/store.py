@@ -1,4 +1,7 @@
-"""Parquet 存储：按股票分文件的表放 {root}/{table}/{symbol}.parquet，其余放 {root}/{table}.parquet。"""
+"""Parquet 存储。
+
+按股票分文件的表放 {root}/{table}/{symbol}.parquet，其余放 {root}/{table}.parquet。
+"""
 
 import os
 import tempfile
