@@ -111,3 +111,14 @@ def test_interrupted_write_leaves_old_file_intact(
     monkeypatch.undo()
     assert store.read(Table.BARS)["close"].tolist() == [1.0, 2.0]
     assert [p.name for p in (tmp_path / "bars").iterdir()] == ["600000.parquet"]
+
+
+def test_modified_time(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    assert store.modified_time(Table.DIVIDENDS, "600000") is None
+    store.write(Table.BARS, make_bars("600000", D[:2], [1.0, 2.0]), symbol="600000")
+    path = tmp_path / "bars" / "600000.parquet"
+    os.utime(path, (1_700_000_000, 1_700_000_000))
+    stamp = store.modified_time(Table.BARS, "600000")
+    assert stamp is not None
+    assert stamp.timestamp() == 1_700_000_000

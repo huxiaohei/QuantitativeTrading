@@ -6,7 +6,7 @@
 import os
 import tempfile
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -146,3 +146,10 @@ class ParquetStore:
             directory = self._root / table.value
             return directory.is_dir() and any(directory.glob("*.parquet"))
         return self._path(table, symbol).exists()
+
+    def modified_time(self, table: Table, symbol: str | None = None) -> datetime | None:
+        """文件的最后修改时间（本地时间）；文件不存在返回 None。"""
+        path = self._path(table, symbol)
+        if not path.exists():
+            return None
+        return datetime.fromtimestamp(path.stat().st_mtime)

@@ -30,6 +30,9 @@ def test_default_config_matches_spec() -> None:
     assert cfg.backtest.initial_cash == 150000
     assert cfg.backtest.data_start.isoformat() == "2009-01-01"
     assert cfg.backtest.benchmarks == ["H00300", "510880"]
+    assert cfg.data.fundamentals_refresh_days == 7
+    assert cfg.data.request_pause_seconds == 1.0
+    assert cfg.data.retries == 3
 
 
 def test_unknown_key_rejected(tmp_path: Path) -> None:

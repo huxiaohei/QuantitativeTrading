@@ -40,3 +40,7 @@ backtest:
   out_sample_start: 2022-01-01
   buy_order_valid_days: 3
   benchmarks: [H00300, "510880"]
+data:
+  fundamentals_refresh_days: 7     # 分红、财务数据文件超过此天数才重新下载
+  request_pause_seconds: 1.0       # 每次网络请求之后的礼貌间隔
+  retries: 3                       # 单次请求最多尝试次数

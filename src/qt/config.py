@@ -76,6 +76,14 @@ class BacktestConfig(_Frozen):
     benchmarks: list[str]
 
 
+class DataConfig(_Frozen):
+    """数据下载参数：基本面刷新间隔、请求间隔与重试次数。"""
+
+    fundamentals_refresh_days: int
+    request_pause_seconds: float
+    retries: int
+
+
 class AppConfig(_Frozen):
     """应用总配置。"""
 
@@ -84,6 +92,7 @@ class AppConfig(_Frozen):
     risk: RiskConfig
     costs: CostsConfig
     backtest: BacktestConfig
+    data: DataConfig
 
 
 def load_config(path: Path) -> AppConfig:
