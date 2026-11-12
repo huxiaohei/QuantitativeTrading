@@ -82,6 +82,8 @@ class DataConfig(_Frozen):
     fundamentals_refresh_days: int
     request_pause_seconds: float
     retries: int
+    industries_refresh_days: int
+    min_industry_coverage: float
 
 
 class AppConfig(_Frozen):

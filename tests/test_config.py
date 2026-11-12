@@ -33,6 +33,8 @@ def test_default_config_matches_spec() -> None:
     assert cfg.data.fundamentals_refresh_days == 7
     assert cfg.data.request_pause_seconds == 1.0
     assert cfg.data.retries == 3
+    assert cfg.data.industries_refresh_days == 30
+    assert cfg.data.min_industry_coverage == 0.9
 
 
 def test_unknown_key_rejected(tmp_path: Path) -> None:

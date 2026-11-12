@@ -6,11 +6,10 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from qt.data.akshare_source import (
+from qt.data.akshare_convert import (
     board_of_code,
     build_etf_total_return,
     build_industries,
-    call_with_retry,
     classify_industry,
     fiscal_year_of,
     normalize_bars,
@@ -26,6 +25,8 @@ from qt.data.akshare_source import (
     period_label,
     statutory_deadline,
 )
+from qt.data.akshare_source import call_with_retry
+from qt.data.delist import UNKNOWN_DELIST_DATE
 from qt.data.schema import SCHEMAS, Table, validate
 
 
@@ -320,7 +321,7 @@ def test_normalize_securities_boards_and_delisted() -> None:
     assert rows.loc["600000", "board"] == "sh_main"
     assert rows.loc["000001", "board"] == "sz_main"
     assert rows.loc["000004", "board"] == "sz_main"
-    assert rows["delist_date"].isna().loc["600000"]
+    assert bool(rows["delist_date"].isna().loc["600000"])
     assert rows.loc["600001", "delist_date"] == pd.Timestamp("2009-12-29")
     assert rows.loc["000004", "delist_date"] == pd.Timestamp("2026-07-14")
     assert rows.loc["600000", "list_date"] == pd.Timestamp("1999-11-10")
@@ -461,3 +462,49 @@ def test_call_with_retry_gives_up_after_retries() -> None:
     with pytest.raises(ConnectionError):
         call_with_retry(broken, retries=3, pause_seconds=0.0, sleep=lambda _: None)
     assert len(attempts) == 3
+
+
+# ---------------------------------------------------------------- 复审修订
+
+
+def test_normalize_bars_rejects_empty_factor_table() -> None:
+    raw = _raw_daily([(date(2024, 1, 2), 5.0, 1e6, 5e6)])
+    with pytest.raises(ValueError, match="复权因子"):
+        normalize_bars("000001", raw, _events([]))
+
+
+def test_normalize_securities_marks_delisted_rows_without_date() -> None:
+    sh, sz, sh_d, sz_d = _listing_frames()
+    sh_d.loc[0, "暂停上市日期"] = None
+    out = normalize_securities(sh, sz, sh_d, sz_d, ["sh_main", "sz_main"])
+    row = out.set_index("symbol").loc["600001"]
+    assert bool(row["delist_date"] == UNKNOWN_DELIST_DATE)  # 绝不能是 NaT（会被当成在市）
+
+
+def test_classify_industry_rejects_unexpected_shape() -> None:
+    odd = pd.DataFrame({"某列": [1]})
+    with pytest.raises(ValueError, match="列"):
+        classify_industry(odd)
+
+
+def test_call_with_retry_does_not_sleep_after_final_failure() -> None:
+    sleeps: list[float] = []
+
+    def broken() -> str:
+        raise ConnectionError("断线")
+
+    with pytest.raises(ConnectionError):
+        call_with_retry(broken, retries=3, pause_seconds=0.5, sleep=sleeps.append)
+    assert sleeps == [0.5, 1.0]
+
+
+def test_call_with_retry_does_not_retry_fatal_errors() -> None:
+    attempts: list[int] = []
+
+    def odd_shape() -> str:
+        attempts.append(1)
+        raise KeyError("变更日期")
+
+    with pytest.raises(KeyError):
+        call_with_retry(odd_shape, 3, 0.0, sleep=lambda _: None, fatal=(KeyError,))
+    assert len(attempts) == 1
