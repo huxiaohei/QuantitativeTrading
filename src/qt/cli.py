@@ -1,4 +1,4 @@
-"""命令行入口：qt data update。"""
+"""命令行入口：qt data update、qt backtest run、qt backtest sweep。"""
 
 import json
 from datetime import datetime

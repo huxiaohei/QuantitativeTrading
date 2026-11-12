@@ -5,6 +5,7 @@ from collections.abc import Set as AbstractSet
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from qt.config import (
@@ -386,3 +387,67 @@ def populate_store(
     ):
         for frame in frames:
             store.write(table, frame, symbol=str(frame["symbol"].iloc[0]))
+
+
+TRADING_START = date(2021, 1, 4)
+TRADING_DAYS = 520
+TRADING_SYMBOLS = ("600001", "600002", "600003", "600004")
+# 各股票价格走势的折点 (交易日序号, 价格)，折点之间线性插值。前 200 天都在 14 元，
+# 之后跌到 10 元附近，一年价格位置接近 0，满足买入条件；买入后走势各不相同：
+#   600001 缓慢涨到 12.5 元（固定止盈）；600002 快速跌到 7 元（价格止损，之后在低位横盘，
+#   冷却期过后可再次买入）；600003 与 600004 在样本内横盘，第 400 天之后暴跌（样本外才止损）。
+_TRADING_KNOTS: dict[str, list[tuple[int, float]]] = {
+    "600001": [(0, 14.0), (199, 14.0), (259, 10.0), (262, 10.0), (330, 12.5), (519, 12.5)],
+    "600002": [(0, 14.0), (199, 14.0), (259, 10.0), (262, 10.0), (290, 7.0), (519, 7.0)],
+    "600003": [(0, 14.0), (199, 14.0), (259, 10.0), (399, 10.0), (430, 7.0), (519, 7.0)],
+    "600004": [(0, 14.0), (199, 14.0), (259, 10.2), (399, 10.2), (430, 7.0), (519, 7.0)],
+}
+_TRADING_INDUSTRIES = {"600001": "银行", "600002": "煤炭", "600003": "电力", "600004": "钢铁"}
+
+
+def populate_trading_store(store: ParquetStore) -> list[date]:
+    """写入一个真实策略会交易的确定性数据集，返回交易日列表。
+
+    4 只股票自 2010 年上市，日成交额 1 亿元；2015 至 2021 财年每年派息 0.6 元（公告于次年 4
+    月 20 日），2017 至 2021 财年年报 ROE 10%、每股收益 1 元（分红率 60%）。
+    默认配置（回看 250 天、连续分红 5 年等）下，第 250 个交易日前后四只股票同时满足全部买入条件。
+    价格走势见 _TRADING_KNOTS：有固定止盈、价格止损，以及样本内结束之后才发生的暴跌。
+    """
+    days = weekdays(TRADING_START, TRADING_DAYS)
+    write_calendar(store, days)
+    bars: list[pd.DataFrame] = []
+    dividends: list[pd.DataFrame] = []
+    financials: list[pd.DataFrame] = []
+    for symbol, knots in _TRADING_KNOTS.items():
+        xs = [k[0] for k in knots]
+        ys = [k[1] for k in knots]
+        closes = [round(float(p), 4) for p in np.interp(range(TRADING_DAYS), xs, ys)]
+        frame = make_bars(symbol, days, closes)
+        frame["amount"] = pd.Series([1e8] * TRADING_DAYS, dtype="float64")
+        bars.append(frame)
+        dividends.append(
+            make_dividends(
+                symbol,
+                [(fy, date(fy + 1, 4, 20), date(fy + 1, 6, 15), 0.6) for fy in range(2015, 2022)],
+            )
+        )
+        financials.append(
+            make_financials(
+                symbol,
+                [
+                    {"report_period": date(fy, 12, 31), "announce_date": date(fy + 1, 4, 20)}
+                    for fy in range(2017, 2022)
+                ],
+            )
+        )
+    populate_store(
+        store,
+        securities=make_securities(
+            [(s, "sh_main", date(2010, 1, 1), None) for s in TRADING_SYMBOLS]
+        ),
+        bars=bars,
+        dividends=dividends,
+        financials=financials,
+        industries=make_industries([(s, _TRADING_INDUSTRIES[s], False) for s in TRADING_SYMBOLS]),
+    )
+    return days

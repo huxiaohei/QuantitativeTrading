@@ -12,6 +12,7 @@ from typing import cast
 import pandas as pd
 from pydantic import ValidationError
 
+from qt.backtest.engine import BacktestResult
 from qt.backtest.metrics import compute_metrics
 from qt.backtest.report import clamp_period, last_bar_day, run_period
 from qt.config import AppConfig
@@ -45,7 +46,9 @@ def override(cfg: AppConfig, path: str, value: object) -> AppConfig:
         return AppConfig.model_validate(raw)
     except ValidationError as exc:
         reason = exc.errors()[0]["msg"]
-        raise ValueError(f"参数 {path} 的取值 {value!r} 无效：{reason}") from exc
+        raise ValueError(
+            f"参数 {path} 的取值 {value!r} 无效，类型或取值范围不符合该字段的要求（{reason}）"
+        ) from exc
 
 
 def parse_param(cfg: AppConfig, text: str) -> tuple[str, list[object]]:
@@ -71,6 +74,7 @@ def run_sweep(
     store: ParquetStore,
     grid: Mapping[str, Sequence[object]],
     progress: Callable[[int, int], None] | None = None,
+    on_result: Callable[[Mapping[str, object], BacktestResult], None] | None = None,
 ) -> pd.DataFrame:
     """对 grid 的笛卡尔积逐一回测，返回每组参数一行的表。
 
@@ -78,6 +82,8 @@ def run_sweep(
     列为每个参数（列名为完整路径），然后是 annual_return、max_drawdown、sharpe、win_rate、
     trade_count。所有组合先校验再运行，任何一组无效都不会开始回测。
     指标面板只建一次并复用；若扫描 universe.* 或 strategy.lookback_days 则每组重建。
+    on_result 每组回测结束后收到 (该组参数取值, 完整回测结果)，供检查净值与逐笔交易；
+    不影响返回的表。
     """
     if not grid:
         raise ValueError("至少需要扫描一个参数")
@@ -117,6 +123,8 @@ def run_sweep(
                 "trade_count": m.trade_count,
             }
         )
+        if on_result is not None:
+            on_result(dict(zip(paths, combo, strict=True)), result)
         if progress is not None:
             progress(done, len(configs))
     return pd.DataFrame(rows, columns=[*paths, *RESULT_COLUMNS])

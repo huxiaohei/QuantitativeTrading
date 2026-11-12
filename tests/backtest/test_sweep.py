@@ -2,9 +2,11 @@
 
 import csv
 import re
+from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 import yaml
 from typer.testing import CliRunner, Result
@@ -18,16 +20,19 @@ from qt.backtest.report import run_period
 from qt.backtest.sweep import override, parse_param, run_sweep
 from qt.calendar import TradingCalendar
 from qt.cli import app
-from qt.config import AppConfig, RiskConfig
+from qt.config import AppConfig
 from qt.costs import CostModel
 from qt.data.store import ParquetStore
 from qt.features import FeaturePanel
-from qt.risk import RiskManager
+from qt.models import ExitReason
+from qt.risk import RiskEventKind, RiskManager
+from qt.strategy.base import Strategy
 from tests.fakes import (
     default_app_config,
     make_bars,
     make_securities,
     populate_store,
+    populate_trading_store,
     weekdays,
     write_calendar,
 )
@@ -161,15 +166,6 @@ def _spy_run_period(monkeypatch: pytest.MonkeyPatch) -> list[tuple[date, date]]:
     return seen
 
 
-def test_sweep_never_touches_out_of_sample(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg()
-    seen = _spy_run_period(monkeypatch)
-    run_sweep(cfg, _store(tmp_path), {"strategy.stop_loss": [0.1, 0.2]})
-    assert len(seen) == 2
-    for start, end in seen:
-        assert cfg.backtest.in_sample_start <= start <= end <= cfg.backtest.in_sample_end
-
-
 def test_sweep_rejects_changing_sample_boundaries(tmp_path: Path) -> None:
     for path in ("backtest.in_sample_start", "backtest.in_sample_end", "backtest.out_sample_start"):
         with pytest.raises(ValueError, match="样本"):
@@ -230,36 +226,180 @@ def test_panel_rebuilt_per_combination_for_panel_params(
     assert len(calls) == 3
 
 
-def test_each_combination_gets_fresh_risk_manager_and_matches_standalone_run(
+# ---------- 真实策略有成交的数据集：隔离、面板重建、样本内约束 ----------
+
+
+class _Trading:
+    """交易数据集与样本内配置：样本内到第 360 个交易日，之后还有 160 天含暴跌的样本外行情。"""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.store = ParquetStore(tmp_path / "trading")
+        self.days = populate_trading_store(self.store)
+        cfg = default_app_config()
+        backtest = cfg.backtest.model_copy(
+            update={
+                "in_sample_start": self.days[0],
+                "in_sample_end": self.days[360],
+                "out_sample_start": self.days[361],
+            }
+        )
+        self.cfg = cfg.model_copy(update={"backtest": backtest})
+
+    def sweep(
+        self, grid: dict[str, list[object]]
+    ) -> tuple[pd.DataFrame, list[tuple[Mapping[str, object], BacktestResult]]]:
+        """运行扫描，同时收集每组参数的完整回测结果。"""
+        got: list[tuple[Mapping[str, object], BacktestResult]] = []
+        table = run_sweep(
+            self.cfg, self.store, grid, on_result=lambda ov, res: got.append((ov, res))
+        )
+        return table, got
+
+    def standalone(self, overrides: Mapping[str, object]) -> BacktestResult:
+        """用同一组覆盖后的配置单独跑一次样本内回测。"""
+        one = self.cfg
+        for path, value in overrides.items():
+            one = override(one, path, value)
+        bt = self.cfg.backtest
+        return run_period(one, self.store, bt.in_sample_start, bt.in_sample_end)
+
+
+def _assert_same_result(a: BacktestResult, b: BacktestResult) -> None:
+    pd.testing.assert_series_equal(a.equity, b.equity)
+    assert a.trades == b.trades
+    assert a.risk_events == b.risk_events
+    assert [p.symbol for p in a.open_positions] == [p.symbol for p in b.open_positions]
+
+
+def _exit_reasons(result: BacktestResult) -> set[ExitReason]:
+    return {t.exit_reason for t in result.trades}
+
+
+def _paused(result: BacktestResult) -> bool:
+    return any(e.kind is RiskEventKind.PAUSE for e in result.risk_events)
+
+
+def test_trading_fixture_really_trades_under_default_config(tmp_path: Path) -> None:
+    """夹具本身：默认配置下真实策略有止盈、止损，并且买入的是四只候选股。"""
+    t = _Trading(tmp_path)
+    result = t.standalone({})
+    assert {ExitReason.TAKE_PROFIT_FIXED, ExitReason.STOP_LOSS} <= _exit_reasons(result)
+    assert {"600001", "600002"} <= {x.symbol for x in result.trades}
+    assert len(result.open_positions) >= 2
+
+
+def test_every_combination_equals_standalone_run_on_all_outputs(tmp_path: Path) -> None:
+    t = _Trading(tmp_path)
+    grid: dict[str, list[object]] = {
+        "risk.pause_drawdown": [0.01, 0.20],
+        "risk.cooldown_days": [60, 0],
+        "strategy.take_profit_mode": ["fixed", "trailing"],
+    }
+    table, got = t.sweep(grid)
+    assert len(got) == len(table) == 8
+    for (overrides, result), (_, row) in zip(got, table.iterrows(), strict=True):
+        alone = t.standalone(overrides)
+        _assert_same_result(result, alone)
+        m = compute_metrics(alone.equity, alone.trades)
+        assert row["annual_return"] == pytest.approx(m.annual_return)
+        assert row["max_drawdown"] == pytest.approx(m.max_drawdown)
+        assert row["sharpe"] == pytest.approx(m.sharpe)
+        assert row["win_rate"] == pytest.approx(m.win_rate)
+        assert row["trade_count"] == m.trade_count
+    # 数据集必须真的覆盖这些场景，否则测试会退化成零成交
+    results = [res for _, res in got]
+    assert any(_paused(r) for r in results)
+    assert any(ExitReason.STOP_LOSS in _exit_reasons(r) for r in results)
+    assert any(ExitReason.TAKE_PROFIT_FIXED in _exit_reasons(r) for r in results)
+    assert len({repr(r.trades) for r in results}) >= 3
+
+
+def test_risk_state_does_not_leak_to_later_combinations(tmp_path: Path) -> None:
+    """先出现暂停与止损冷却的组合，后面的组合必须不受影响。"""
+    t = _Trading(tmp_path)
+    grid: dict[str, list[object]] = {
+        "risk.pause_drawdown": [0.01, 0.20],
+        "risk.cooldown_days": [60, 0],
+    }
+    _, got = t.sweep(grid)
+    first, last = got[0][1], got[3][1]
+    assert _paused(first)
+    assert ExitReason.STOP_LOSS in _exit_reasons(first)
+    assert not _paused(last)
+    # 冷却期 0 且没有暂停：止损后的 600002 在次日重新买入，所以有两笔止损
+    assert [x.symbol for x in last.trades].count("600002") == 2
+    _assert_same_result(last, t.standalone(got[3][0]))
+    assert last.trades != first.trades
+
+
+@pytest.mark.parametrize(
+    ("path", "values"),
+    [
+        ("strategy.lookback_days", [250, 60]),
+        ("universe.min_listed_years", [3, 30]),
+        ("universe.min_avg_amount_60d", [5e7, 5e9]),
+    ],
+)
+def test_rebuilt_panel_uses_the_overridden_config(
+    tmp_path: Path, path: str, values: list[object]
+) -> None:
+    t = _Trading(tmp_path)
+    _, got = t.sweep({path: values})
+    for overrides, result in got:
+        _assert_same_result(result, t.standalone(overrides))
+    # 两组参数的结果必须不同；若重建面板时误用基础配置，它们会一模一样
+    (_, a), (_, b) = got
+    assert a.trades != b.trades or not a.equity.equals(b.equity)
+
+
+def test_sweep_effective_period_stays_inside_in_sample(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    created: list[RiskManager] = []
-    real_init = RiskManager.__init__
+    t = _Trading(tmp_path)
+    bt = t.cfg.backtest
+    # 前提：样本外确实有数据，而且一旦纳入会改变结果（暴跌触发的止损发生在样本外）
+    whole = run_period(t.cfg, t.store, bt.in_sample_start, t.days[-1])
+    assert any(x.exit_day > bt.in_sample_end for x in whole.trades)
+    reached: list[tuple[date, date]] = []
+    real = report_module.run_backtest
 
-    def tracking(
-        self: RiskManager, cfg: RiskConfig, calendar: TradingCalendar, costs: CostModel
-    ) -> None:
-        created.append(self)
-        real_init(self, cfg, calendar, costs)
-
-    store = _store(tmp_path)
-    cfg = _cfg()
-    grid = {"risk.cooldown_days": [0, 60], "risk.max_positions": [3, 10]}
-    monkeypatch.setattr(RiskManager, "__init__", tracking)
-    table = run_sweep(cfg, store, grid)
-    monkeypatch.undo()
-    assert len(created) == 4
-    assert len({id(r) for r in created}) == 4
-    for _, row in table.iterrows():
-        one = override(
-            override(cfg, "risk.cooldown_days", row["risk.cooldown_days"]),
-            "risk.max_positions",
-            row["risk.max_positions"],
+    def spy(
+        panel: FeaturePanel,
+        strategy: Strategy,
+        risk: RiskManager,
+        costs: CostModel,
+        calendar: TradingCalendar,
+        start: date,
+        end: date,
+        initial_cash: float,
+        buy_order_valid_days: int = 3,
+    ) -> BacktestResult:
+        reached.append((start, end))
+        return real(
+            panel, strategy, risk, costs, calendar, start, end, initial_cash, buy_order_valid_days
         )
-        result = run_period(one, store, cfg.backtest.in_sample_start, cfg.backtest.in_sample_end)
-        m = compute_metrics(result.equity, result.trades)
-        assert row["annual_return"] == pytest.approx(m.annual_return)
-        assert row["trade_count"] == m.trade_count
+
+    monkeypatch.setattr(report_module, "run_backtest", spy)
+    grid: dict[str, list[object]] = {
+        "strategy.stop_loss": [0.10, 0.15],
+        "risk.cooldown_days": [0, 60],
+    }
+    _, got = t.sweep(grid)
+    assert len(reached) == 4
+    for start, end in reached:
+        assert start == bt.in_sample_start
+        assert end == bt.in_sample_end
+    for _, result in got:
+        assert result.equity.index[0] >= bt.in_sample_start
+        assert result.equity.index[-1] == bt.in_sample_end
+        for trade in result.trades:
+            assert bt.in_sample_start <= trade.entry_day <= trade.exit_day <= bt.in_sample_end
+
+
+def test_override_error_message_is_chinese_and_keeps_path() -> None:
+    with pytest.raises(ValueError, match="无效") as info:
+        override(default_app_config(), "strategy.min_dividend_years", "60.5")
+    assert "strategy.min_dividend_years" in str(info.value)
 
 
 # ---------- 命令行 ----------
@@ -308,6 +448,9 @@ def test_sweep_command_prints_table_and_writes_csv(tmp_path: Path) -> None:
         rows = list(csv.reader(fh))
     assert rows[0] == ["strategy.stop_loss", "risk.cooldown_days", *RESULT_COLUMNS]
     assert len(rows) == 5
+    assert "共 4 组参数" in result.output
+    for done in range(1, 5):
+        assert f"[进度] 已完成 {done}/4 组" in result.output
 
 
 @pytest.mark.parametrize(
@@ -366,3 +509,16 @@ def test_sweep_command_missing_config_and_data(tmp_path: Path) -> None:
 def test_root_app_exposes_commands(args: list[str]) -> None:
     result = CliRunner().invoke(app, args)
     assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("command", ["sweep", "run"])
+def test_nonexistent_data_dir_gives_chinese_error(tmp_path: Path, command: str) -> None:
+    args = ["--param", "strategy.stop_loss=0.1"] if command == "sweep" else []
+    result = CliRunner().invoke(
+        backtest_app,
+        [command, *args, "--data-dir", str(tmp_path / "no-such-dir"), "--out", str(tmp_path / "o")],
+    )
+    assert result.exit_code == 1
+    assert "qt data update" in result.output
+    assert "Traceback" not in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
