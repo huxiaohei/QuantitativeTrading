@@ -25,12 +25,13 @@ from qt.backtest.metrics import (
     exit_breakdown,
     rejection_breakdown,
 )
+from qt.calendar import TradingCalendar
 from qt.config import AppConfig
 from qt.costs import CostModel
 from qt.data.schema import Table
 from qt.data.store import ParquetStore
 from qt.data.update import load_calendar
-from qt.features import build_panel
+from qt.features import FeaturePanel, build_panel
 from qt.risk import RiskManager
 from qt.strategy.high_dividend_low import HighDividendLow
 
@@ -124,10 +125,10 @@ def resolve_period(
     return (bt.out_sample_start if period == "out" else bt.in_sample_start), last
 
 
-def run_period(
-    cfg: AppConfig, store: ParquetStore, start: date, end: date, last_day: date | None = None
-) -> BacktestResult:
-    """在 [start, end] 上运行回测；区间收缩到日历交易日与最后一根日线之内。
+def clamp_period(
+    store: ParquetStore, start: date, end: date, last_day: date | None = None
+) -> tuple[TradingCalendar, date, date]:
+    """把 [start, end] 收缩到日历交易日与最后一根日线之内；返回 (日历, 实际开始, 实际结束)。
 
     last_day 是调用方已查好的最后日线日，传入可避免重复扫描存储。
     """
@@ -136,8 +137,26 @@ def run_period(
     days = calendar.between(start, min(end, last)) if last is not None else []
     if not days:
         raise BacktestInputError(f"{start} 至 {end} 之间没有日线数据，无法回测")
-    start, end = days[0], days[-1]
-    panel = build_panel(store, calendar, cfg, start, end)
+    return calendar, days[0], days[-1]
+
+
+def run_period(
+    cfg: AppConfig,
+    store: ParquetStore,
+    start: date,
+    end: date,
+    last_day: date | None = None,
+    panel: FeaturePanel | None = None,
+) -> BacktestResult:
+    """在 [start, end] 上运行回测；区间收缩到日历交易日与最后一根日线之内。
+
+    last_day 是调用方已查好的最后日线日，传入可避免重复扫描存储。
+    panel 是调用方为同一收缩后区间预先建好的指标面板（参数扫描复用）；
+    不传则在这里按 cfg 构建。
+    """
+    calendar, start, end = clamp_period(store, start, end, last_day)
+    if panel is None:
+        panel = build_panel(store, calendar, cfg, start, end)
     costs = CostModel(cfg.costs)
     strategy = HighDividendLow(cfg.strategy, cfg.universe)  # 想换策略，在这里替换
     risk = RiskManager(cfg.risk, calendar, costs)

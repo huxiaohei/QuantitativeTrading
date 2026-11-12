@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import typer
 
+from qt.backtest.commands import backtest_app
 from qt.config import AppConfig, load_config
 from qt.data.akshare_source import AkshareSource
 from qt.data.schema import Table
@@ -26,6 +27,7 @@ from qt.data.update import (
 app = typer.Typer(help="A 股量化回测工具", no_args_is_help=True)
 data_app = typer.Typer(help="数据下载与检查", no_args_is_help=True)
 app.add_typer(data_app, name="data")
+app.add_typer(backtest_app, name="backtest")
 
 # 完整性问题最多逐条打印的数量
 _MAX_PRINTED_PROBLEMS = 50
