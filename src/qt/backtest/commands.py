@@ -6,10 +6,13 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
+from pydantic import ValidationError
 
 from qt.backtest.metrics import compute_metrics
 from qt.backtest.report import (
     BacktestInputError,
+    last_bar_day,
     load_benchmarks,
     load_last_closes,
     render_report,
@@ -47,11 +50,22 @@ def run(
     data_gaps: Annotated[Path, typer.Option(help="数据局限文档")] = Path("docs/data-gaps.md"),
 ) -> None:
     """运行回测并生成单文件 HTML 报告。"""
-    cfg = load_config(config)
-    store = ParquetStore(data_dir)
     try:
-        start, end = resolve_period(cfg, store, period.value)
-        result = run_period(cfg, store, start, end)
+        cfg = load_config(config)
+    except (OSError, yaml.YAMLError, ValidationError) as exc:
+        typer.echo(f"无法读取配置文件 {config}：{exc}")
+        raise typer.Exit(code=1) from exc
+    if not data_gaps.is_file():
+        typer.echo(f"找不到数据局限文档 {data_gaps}，请用 --data-gaps 指定")
+        raise typer.Exit(code=1)
+    store = ParquetStore(data_dir)
+    last = last_bar_day(store)  # 只查一次，传给下面两步
+    if last is None:
+        typer.echo("无法回测：存储中没有日线数据，请先运行 qt data update")
+        raise typer.Exit(code=1)
+    try:
+        start, end = resolve_period(cfg, store, period.value, last_day=last)
+        result = run_period(cfg, store, start, end, last_day=last)
     except (BacktestInputError, DataIntegrityError) as exc:
         typer.echo(f"无法回测：{exc}")
         raise typer.Exit(code=1) from exc
@@ -74,7 +88,7 @@ def run(
     typer.echo(f"报告已生成：{path}")
     typer.echo(
         f"区间 {result.equity.index[0]} 至 {result.equity.index[-1]}；"
-        f"年化收益 {metrics.annual_return:.2%}，最大回撤 {metrics.max_drawdown:.2%}，"
+        f"回测全区间：年化收益 {metrics.annual_return:.2%}，最大回撤 {metrics.max_drawdown:.2%}，"
         f"夏普 {metrics.sharpe:.2f}，交易 {metrics.trade_count} 笔，胜率 {metrics.win_rate:.2%}"
     )
     for code in benchmarks.missing:

@@ -3,6 +3,7 @@
 报告是单个自包含 HTML 文件：图用 matplotlib（Agg 后端）生成 SVG 后内嵌，不引用任何外部资源。
 """
 
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -66,6 +67,7 @@ FIXED_LIMITATIONS = [
 ]
 DRAWDOWN_BANNER = "最大回撤接近 50% 上限，按设计文档策略需要重做"
 DRAWDOWN_BANNER_LEVEL = -0.40
+TIE_THRESHOLD = 0.0005  # 年化收益或回撤幅度相差不足 0.05 个百分点视为持平
 # 买入时指标快照的中文名与格式：pct 为百分比，int 为整数
 METRIC_LABELS = {
     "dividend_yield": ("股息率", "pct"),
@@ -104,23 +106,33 @@ def last_bar_day(store: ParquetStore) -> date | None:
     return max(days, default=None)
 
 
-def resolve_period(cfg: AppConfig, store: ParquetStore, period: str) -> tuple[date, date]:
-    """把 in/out/full 解析成 (开始, 结束)；out 与 full 的结束日取最后一个有日线的交易日。"""
+def resolve_period(
+    cfg: AppConfig, store: ParquetStore, period: str, last_day: date | None = None
+) -> tuple[date, date]:
+    """把 in/out/full 解析成 (开始, 结束)；out 与 full 的结束日取最后一个有日线的交易日。
+
+    last_day 是调用方已查好的最后日线日，传入可避免重复扫描存储。
+    """
     bt = cfg.backtest
     if period == "in":
         return bt.in_sample_start, bt.in_sample_end
     if period not in ("out", "full"):
         raise ValueError(f"period 只能是 in、out、full，收到 {period!r}")
-    last = last_bar_day(store)
+    last = last_bar_day(store) if last_day is None else last_day
     if last is None:
         raise BacktestInputError("存储中没有日线数据，请先运行 qt data update")
     return (bt.out_sample_start if period == "out" else bt.in_sample_start), last
 
 
-def run_period(cfg: AppConfig, store: ParquetStore, start: date, end: date) -> BacktestResult:
-    """在 [start, end] 上运行回测；区间收缩到日历交易日与最后一根日线之内。"""
+def run_period(
+    cfg: AppConfig, store: ParquetStore, start: date, end: date, last_day: date | None = None
+) -> BacktestResult:
+    """在 [start, end] 上运行回测；区间收缩到日历交易日与最后一根日线之内。
+
+    last_day 是调用方已查好的最后日线日，传入可避免重复扫描存储。
+    """
     calendar = load_calendar(store)
-    last = last_bar_day(store)
+    last = last_bar_day(store) if last_day is None else last_day
     days = calendar.between(start, min(end, last)) if last is not None else []
     if not days:
         raise BacktestInputError(f"{start} 至 {end} 之间没有日线数据，无法回测")
@@ -173,16 +185,25 @@ def load_last_closes(store: ParquetStore, symbols: list[str], end: date) -> dict
 
 
 def verdict_sentence(strategy: Metrics, etf: Metrics | None) -> str:
-    """一句话回答是否优于直接持有红利 ETF：只陈述两项指标孰优孰劣，不给建议。"""
+    """分别在年化收益与最大回撤上给出相对红利 ETF 的明确好坏判断，不给操作建议。
+
+    两项差异的绝对值小于 TIE_THRESHOLD 视为持平；回撤按幅度比较，幅度更小为更好。
+    """
     if etf is None:
         return "红利 ETF 基准数据缺失，无法比较策略与直接持有红利 ETF 的差异。"
-    higher = strategy.annual_return > etf.annual_return
-    ret = "高于" if higher else ("低于" if strategy.annual_return < etf.annual_return else "等于")
-    if strategy.max_drawdown == etf.max_drawdown:
-        return f"年化收益{ret}红利 ETF，最大回撤相同。"
-    bigger = strategy.max_drawdown < etf.max_drawdown  # 回撤为负数，更小即回撤更大
-    also = "也" if higher == bigger else ""
-    return f"年化收益{ret}红利 ETF，最大回撤{also}{'更大' if bigger else '更小'}。"
+    ret_diff = strategy.annual_return - etf.annual_return
+    dd_diff = abs(strategy.max_drawdown) - abs(etf.max_drawdown)
+    if abs(ret_diff) < TIE_THRESHOLD:
+        ret = "年化收益与红利 ETF 持平（持平）"
+    else:
+        word, grade = ("高于", "更好") if ret_diff > 0 else ("低于", "更差")
+        ret = f"年化收益{word}红利 ETF（{grade}）"
+    if abs(dd_diff) < TIE_THRESHOLD:
+        dd = "最大回撤与红利 ETF 持平（持平）"
+    else:
+        word, grade = ("小于", "更好") if dd_diff < 0 else ("大于", "更差")
+        dd = f"最大回撤{word}红利 ETF（{grade}）"
+    return f"{ret}；{dd}。"
 
 
 def _pct(value: float) -> str:
@@ -197,6 +218,9 @@ def _snapshot_text(metrics: Mapping[str, float]) -> str:
     parts: list[str] = []
     for key, value in metrics.items():
         label, kind = METRIC_LABELS.get(key, (key, "num"))
+        if math.isnan(value):
+            parts.append(f"{label} —")
+            continue
         text = (
             _pct(value) if kind == "pct" else (f"{value:.0f}" if kind == "int" else f"{value:.4g}")
         )
@@ -216,6 +240,44 @@ def _flatten(data: Mapping[str, object], prefix: str = "") -> list[tuple[str, st
     return rows
 
 
+@dataclass(frozen=True)
+class CommonCurves:
+    """共同对比区间内的策略净值与基准收盘价（均为原值，未归一）。"""
+
+    start: date  # 共同区间起点：策略与各基准中最晚的首个可用日
+    end: date
+    truncated: bool  # 共同区间是否短于回测区间
+    equity: "pd.Series[float]"
+    benchmarks: dict[str, "pd.Series[float]"]
+
+
+def common_curves(
+    equity: "pd.Series[float]", benchmarks: Mapping[str, "pd.Series[float]"]
+) -> CommonCurves:
+    """把策略与基准截到共同区间。
+
+    早于回测区间的基准数据一律忽略；区间内没有任何数据的基准被剔除；
+    不向前回填，只在区间内前向填充。
+    """
+    first, last = equity.index[0], equity.index[-1]
+    usable: dict[str, pd.Series[float]] = {}
+    for code, close in benchmarks.items():
+        inside = close.loc[[first <= d <= last for d in close.index]].dropna().sort_index()
+        if len(inside) > 0:
+            usable[code] = inside
+    start = max([first, *(c.index[0] for c in usable.values())])
+    skip = sum(1 for d in equity.index if d < start)
+    window = equity.iloc[skip:]
+    aligned = {c: s.reindex(window.index).ffill().dropna() for c, s in usable.items()}
+    return CommonCurves(start, last, start > first, window, aligned)
+
+
+def normalised_curves(cc: CommonCurves) -> dict[str, "pd.Series[float]"]:
+    """各曲线在共同起点归一为 1.0；策略的键为 "strategy"，基准的键为基准代码。"""
+    curves = {"strategy": cc.equity, **cc.benchmarks}
+    return {name: s / float(s.iloc[0]) for name, s in curves.items()}
+
+
 # ---------- 图表 ----------
 
 
@@ -233,31 +295,34 @@ def _clean_svg(svg: str) -> str:
     return re.sub(r'\s+xmlns(:\w+)?="[^"]*"', "", svg).strip()
 
 
-def _chart_svg(equity: "pd.Series[float]", benchmarks: Mapping[str, "pd.Series[float]"]) -> str:
-    """上图为起点归一的净值曲线，下图为回撤曲线；返回内嵌用的 SVG 文本。"""
+def chart_svg(equity: "pd.Series[float]", benchmarks: Mapping[str, "pd.Series[float]"]) -> str:
+    """共同对比区间内的图：上图为起点归一的净值曲线，下图为回撤曲线；返回内嵌用的 SVG 文本。"""
     font = _cjk_font()
     zh = font is not None
-    names = BENCHMARK_NAMES if zh else {}
-    series: dict[str, pd.Series[float]] = {"策略" if zh else "Strategy": equity}
-    series.update({names.get(code, code): close for code, close in benchmarks.items()})
-    matplotlib.rcParams["axes.unicode_minus"] = False
+    curves = normalised_curves(common_curves(equity, benchmarks))
+    labels = {"strategy": "策略" if zh else "Strategy"}
+    labels.update({c: BENCHMARK_NAMES.get(c, c) if zh else c for c in benchmarks})
+    rc: dict[str, Any] = {"axes.unicode_minus": False}
     if font is not None:
-        matplotlib.rcParams["font.sans-serif"] = [font]
-    fig = Figure(figsize=(10, 7))
-    top, bottom = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
-    for name, close in series.items():
-        days = list(close.index)
-        top.plot(days, close.to_numpy(dtype="float64") / float(close.iloc[0]), label=name)
-        drawdown = close / close.cummax() - 1
-        bottom.plot(days, drawdown.to_numpy(dtype="float64") * 100, label=name)
-    top.set_title("净值曲线（起点 = 1）" if zh else "Equity (start = 1)")
-    bottom.set_title("回撤（%）" if zh else "Drawdown (%)")
-    top.legend(loc="upper left")
-    for ax in (top, bottom):
-        ax.grid(alpha=0.3)
-    fig.tight_layout()
-    buf = BytesIO()
-    cast("Any", fig).savefig(buf, format="svg")  # savefig 的类型标注含未知类型，按 Any 调用
+        rc["font.sans-serif"] = [font]
+    with cast("Any", matplotlib).rc_context(rc):  # 只在绘图期间改字体，不污染全局设置
+        fig = Figure(figsize=(10, 7))
+        top, bottom = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
+        for name, curve in curves.items():
+            days = list(curve.index)
+            top.plot(days, curve.to_numpy(dtype="float64"), label=labels.get(name, name))
+            drawdown = curve / curve.cummax() - 1
+            bottom.plot(
+                days, drawdown.to_numpy(dtype="float64") * 100, label=labels.get(name, name)
+            )
+        top.set_title("净值曲线（共同起点 = 1）" if zh else "Equity (common start = 1)")
+        bottom.set_title("回撤（%）" if zh else "Drawdown (%)")
+        top.legend(loc="upper left")
+        for ax in (top, bottom):
+            ax.grid(alpha=0.3)
+        fig.tight_layout()
+        buf = BytesIO()
+        cast("Any", fig).savefig(buf, format="svg")  # savefig 的类型标注含未知类型，按 Any 调用
     return _clean_svg(buf.getvalue().decode("utf-8"))
 
 
@@ -272,14 +337,14 @@ def _environment() -> Environment:
 
 
 def _summary_rows(
-    metrics: Metrics, benchmarks: Mapping[str, "pd.Series[float]"], cfg: AppConfig
+    cc: CommonCurves, cfg: AppConfig
 ) -> tuple[list[dict[str, object]], Metrics | None]:
-    """概要表各行（策略在前，基准按配置顺序），以及红利 ETF 的指标（缺失为 None）。"""
-    rows: list[dict[str, object]] = [{"name": "策略", "m": metrics}]
+    """概要表各行（策略在前，基准按配置顺序），全部按共同区间计算；同时返回红利 ETF 的指标。"""
+    rows: list[dict[str, object]] = [{"name": "策略", "m": benchmark_metrics(cc.equity)}]
     etf: Metrics | None = None
     for code in cfg.backtest.benchmarks:
-        if code in benchmarks:
-            m = benchmark_metrics(benchmarks[code])
+        if code in cc.benchmarks:
+            m = benchmark_metrics(cc.benchmarks[code])
             rows.append({"name": BENCHMARK_NAMES.get(code, code), "m": m})
             if code == ETF_CODE:
                 etf = m
@@ -302,7 +367,8 @@ def render_report(
     last_closes 为期末持仓的最后收盘价，用于计算浮动收益（缺失显示为 —）。
     """
     closes = last_closes or {}
-    rows, etf = _summary_rows(metrics, benchmarks, cfg)
+    cc = common_curves(result.equity, benchmarks)
+    rows, etf = _summary_rows(cc, cfg)
     trades = [
         {
             "t": t,
@@ -339,11 +405,14 @@ def render_report(
             initial_cash=cfg.backtest.initial_cash,
             final_equity=float(result.equity.iloc[-1]),
             summary=rows,
-            verdict=verdict_sentence(metrics, etf),
+            win_start=cc.start,
+            win_end=cc.end,
+            truncated=cc.truncated,
+            verdict=verdict_sentence(benchmark_metrics(cc.equity), etf),
             missing=[
-                BENCHMARK_NAMES.get(c, c) for c in cfg.backtest.benchmarks if c not in benchmarks
+                BENCHMARK_NAMES.get(c, c) for c in cfg.backtest.benchmarks if c not in cc.benchmarks
             ],
-            chart=_chart_svg(result.equity, benchmarks),
+            chart=chart_svg(result.equity, benchmarks),
             m=metrics,
             exits=exits,
             events=[

@@ -23,19 +23,21 @@ th { background: #f3f3f3; } td.l, th.l { text-align: left; }
 <h1>回测报告（{{ period }}）</h1>
 <p>区间 {{ first_day }} 至 {{ last_day }}；初始资金 {{ initial_cash | money }}，期末总资产 {{ final_equity | money }}。</p>
 
-<h2>1. 概要</h2>
+<h2>1. 概要（对比区间 {{ win_start }} 至 {{ win_end }}）</h2>
 <table>
 <tr><th class="l">对象</th><th>年化收益</th><th>最大回撤</th><th>夏普</th></tr>
 {% for r in summary %}<tr><td class="l">{{ r.name }}</td><td>{{ r.m.annual_return | pct }}</td><td>{{ r.m.max_drawdown | pct }}</td><td>{{ "%.2f" | format(r.m.sharpe) }}</td></tr>
 {% endfor %}</table>
-<p class="verdict">{{ verdict }}</p>
+{% if truncated %}<p class="note">基准数据自 {{ win_start }} 起，对比区间短于回测区间；下表策略与各基准均只按该区间计算。</p>
+{% endif %}<p class="verdict">{{ verdict }}</p>
 {% for name in missing %}<p class="note">基准 {{ name }} 缺少数据，已从报告中省略。</p>
 {% endfor %}
 
 <h2>2. 净值与回撤</h2>
 {{ chart | safe }}
 
-<h2>3. 交易统计</h2>
+<h2>3. 交易统计（回测全区间）</h2>
+<p>回测全区间 {{ first_day }} 至 {{ last_day }}：年化收益 {{ m.annual_return | pct }}，最大回撤 {{ m.max_drawdown | pct }}，夏普 {{ "%.2f" | format(m.sharpe) }}。</p>
 <table>
 <tr><th>胜率</th><th>盈亏比</th><th>平均持有天数</th><th>年换手率</th><th>交易笔数</th></tr>
 <tr><td>{{ m.win_rate | pct }}</td><td>{{ "%.2f" | format(m.profit_loss_ratio) }}</td><td>{{ "%.1f" | format(m.avg_holding_days) }}</td><td>{{ "%.2f" | format(m.annual_turnover) }}</td><td>{{ m.trade_count }}</td></tr>
