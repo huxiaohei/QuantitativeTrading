@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from qt.config import CostsConfig, load_config
+from qt.config import CostsConfig, RiskConfig, load_config
 from qt.data.schema import Table, empty_frame
+from qt.models import BuyCandidate, Position
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -15,6 +16,38 @@ _ROOT = Path(__file__).resolve().parent.parent
 def default_costs() -> CostsConfig:
     """返回 config/default.yaml 中的 costs 配置。"""
     return load_config(_ROOT / "config" / "default.yaml").costs
+
+
+def default_risk() -> RiskConfig:
+    """返回 config/default.yaml 中的 risk 配置。"""
+    return load_config(_ROOT / "config" / "default.yaml").risk
+
+
+def make_candidate(
+    symbol: str, close: float = 10.0, industry: str = "银行", day: date = date(2024, 1, 2)
+) -> BuyCandidate:
+    """构造买入候选。"""
+    return BuyCandidate(
+        symbol=symbol, day=day, close=close, industry=industry, metrics={}, reason="测试买入"
+    )
+
+
+def make_position(
+    symbol: str,
+    shares: float,
+    cost: float,
+    industry: str = "银行",
+    entry_day: date = date(2024, 1, 2),
+) -> Position:
+    """构造持仓。"""
+    return Position(
+        symbol=symbol,
+        shares=shares,
+        cost=cost,
+        entry_day=entry_day,
+        industry=industry,
+        entry_metrics={},
+    )
 
 
 def make_bars(
