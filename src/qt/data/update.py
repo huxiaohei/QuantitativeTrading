@@ -11,7 +11,7 @@ import pandas as pd
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig
 from qt.data.akshare_convert import build_industries
-from qt.data.delist import finalize_delist_dates
+from qt.data.delist import finalize_delist_dates, finalize_securities
 from qt.data.schema import Table
 from qt.data.source import DataSource
 from qt.data.store import ParquetStore
@@ -139,6 +139,10 @@ def merge_st_history(stored: pd.DataFrame, current: pd.DataFrame, as_of: date) -
     """
     stamp = pd.Timestamp(as_of)
     now_st = {str(s) for s in current["symbol"]}
+    if not now_st and stored["end"].isna().any():
+        raise ValueError(
+            "数据源返回的当前 ST 名单为空，但已存储的 st_history 有未结束的区间；拒绝全部关闭"
+        )
     rows: list[tuple[str, Any, Any]] = []
     open_now: set[str] = set()
     for symbol, start, end in zip(stored["symbol"], stored["start"], stored["end"], strict=True):
@@ -160,13 +164,22 @@ def merge_st_history(stored: pd.DataFrame, current: pd.DataFrame, as_of: date) -
     )
 
 
-def _refresh_shared(source: DataSource, store: ParquetStore, cfg: AppConfig, as_of: date) -> None:
-    """每次运行刷新一次的共享表；任何一张失败都抛 SharedTableError。"""
+def _refresh_shared(
+    source: DataSource, store: ParquetStore, cfg: AppConfig, as_of: date
+) -> list[str]:
+    """每次运行刷新一次的共享表；任何一张失败都抛 SharedTableError。
+
+    securities 写盘前就按已存储的日线定稿退市日期：磁盘上的表任何时候都不含未定稿的日期
+    或占位值。返回因退市日期缺失而丢弃的代码。
+    """
+    dropped: list[str] = []
     _shared("trade_days", lambda: store.write(Table.TRADE_DAYS, source.trade_days()))
 
     def write_securities() -> None:
         secs = source.securities()
-        store.write(Table.SECURITIES, secs[secs["board"].isin(cfg.universe.boards)])
+        final, missing = finalize_securities(secs[secs["board"].isin(cfg.universe.boards)], store)
+        dropped.extend(missing)
+        store.write(Table.SECURITIES, final)
 
     _shared("securities", write_securities)
 
@@ -182,12 +195,14 @@ def _refresh_shared(source: DataSource, store: ParquetStore, cfg: AppConfig, as_
             for code in cfg.backtest.benchmarks
         ]
         merged = pd.concat(frames, ignore_index=True)
+        merged = merged[merged["day"] <= pd.Timestamp(as_of)]  # 不依赖数据源遵守 end
         days = store.read(Table.TRADE_DAYS)
         if len(days) > 0:  # 中证指数含非交易日的行（如 2009-01-01），按交易日历过滤
             merged = merged[merged["day"].isin(days["day"])].reset_index(drop=True)
         store.write(Table.BENCHMARKS, merged)
 
     _shared("benchmarks", write_benchmarks)
+    return dropped
 
 
 def _record(failed: dict[str, str], symbol: str, message: str) -> None:
@@ -203,16 +218,25 @@ def _refresh_industries(
     failed: dict[str, str],
     progress: ProgressFn | None,
     progress_every: int,
+    full_run: bool,
 ) -> list[str]:
     """增量更新行业分类，返回需要报告的数据问题。
 
-    只查询 targets（在市股票）里表中缺失的股票；表文件超过 industries_refresh_days 天则全部重查。
-    单只查询失败记入 failed，不中断。不支持逐只查询的数据源退回整表查询。
+    只查询 targets（在市股票）里表中缺失的股票。全量运行（full_run）时，表文件超过
+    industries_refresh_days 天则全部重查；部分运行（--symbols）不做过期重查，
+    且写回后恢复文件原有的修改时间，不重置没有被重新查询的股票的过期时钟。
+    单只查询失败记入 failed，不中断。AKShare 对部分股票用报错而不是空表表示“没有分类”，
+    因此真正没有分类的在市股票会记为“行业查询失败”，并在每次运行时重新查询。
+    不支持逐只查询的数据源退回整表查询。
     """
     stored = store.read(Table.INDUSTRIES)
     if isinstance(source, IndustryLookup):
         stamp = store.modified_time(Table.INDUSTRIES)
-        stale = stamp is not None and (as_of - stamp.date()).days > cfg.data.industries_refresh_days
+        stale = (
+            full_run
+            and stamp is not None
+            and (as_of - stamp.date()).days > cfg.data.industries_refresh_days
+        )
         have = set(stored["symbol"])
         todo = list(targets) if stale else [s for s in targets if s not in have]
         found: dict[str, tuple[str, bool]] = {}
@@ -235,6 +259,8 @@ def _refresh_industries(
         merged.update(found)
         if found or not store.has(Table.INDUSTRIES):
             store.write(Table.INDUSTRIES, build_industries(merged))
+            if stamp is not None and not full_run:
+                store.set_modified_time(Table.INDUSTRIES, None, stamp)
         have = set(merged)
     else:
         full = _shared("industries", source.industries)
@@ -325,7 +351,7 @@ def update_all(
     """
     if isinstance(source, AsOfAware):
         source.set_as_of(as_of)
-    _refresh_shared(source, store, cfg, as_of)
+    dropped_early = _refresh_shared(source, store, cfg, as_of)
     secs = store.read(Table.SECURITIES)
     in_universe = secs[secs["board"].isin(cfg.universe.boards)].set_index("symbol")
     wanted = list(in_universe.index) if symbols is None else list(dict.fromkeys(symbols))
@@ -334,7 +360,7 @@ def update_all(
     is_listed = in_universe["delist_date"].isna().to_dict()
     listed_wanted = [s for s in wanted if is_listed.get(s, False)]
     problems = _refresh_industries(
-        source, store, cfg, listed_wanted, as_of, failed, progress, progress_every
+        source, store, cfg, listed_wanted, as_of, failed, progress, progress_every, symbols is None
     )
 
     calendar_days = store.read(Table.TRADE_DAYS)
@@ -345,26 +371,31 @@ def update_all(
     window_start = pd.Timestamp(first_start) - pd.Timedelta(days=_DELIST_MARGIN_DAYS)
 
     updated = skipped = 0
-    for i, symbol in enumerate(wanted, start=1):
-        try:
-            if symbol not in in_universe.index:
-                raise ValueError("不在配置板块的证券列表中")
-            delist = cast(pd.Timestamp, in_universe.loc[symbol, "delist_date"])
-            delisted = not pd.isna(delist)
-            if delisted and delist < window_start:
-                skipped += 1  # 退市早于下载起点，窗口内不可能有日线
-            else:
-                changed = _update_bars(source, store, cfg, symbol, delisted, as_of, latest)
-                _update_fundamentals(source, store, cfg, symbol, as_of)
-                updated, skipped = (updated + 1, skipped) if changed else (updated, skipped + 1)
-        except _NoBarsError:
-            _record(failed, symbol, f"{NO_BARS_PREFIX}：已退市股票取不到日线")
-        except Exception as exc:  # 单只股票失败不影响其他股票
-            _record(failed, symbol, f"{type(exc).__name__}: {exc}")
-        if progress is not None and i % progress_every == 0:
-            progress("日线", i, len(wanted))
+    try:
+        for i, symbol in enumerate(wanted, start=1):
+            try:
+                if symbol not in in_universe.index:
+                    raise ValueError("不在配置板块的证券列表中")
+                delist = cast(pd.Timestamp, in_universe.loc[symbol, "delist_date"])
+                delisted = not pd.isna(delist)
+                if delisted and delist < window_start:
+                    skipped += 1  # 退市早于下载起点，窗口内不可能有日线
+                else:
+                    changed = _update_bars(source, store, cfg, symbol, delisted, as_of, latest)
+                    _update_fundamentals(source, store, cfg, symbol, as_of)
+                    updated, skipped = (updated + 1, skipped) if changed else (updated, skipped + 1)
+            except _NoBarsError:
+                _record(failed, symbol, f"{NO_BARS_PREFIX}：已退市股票取不到日线")
+            except Exception as exc:  # 单只股票失败不影响其他股票
+                _record(failed, symbol, f"{type(exc).__name__}: {exc}")
+            if progress is not None and i % progress_every == 0:
+                progress("日线", i, len(wanted))
 
-    for symbol in finalize_delist_dates(store):
+    finally:
+        # 即使被中断，也让 securities 反映已经写入的日线
+        late_dropped = finalize_delist_dates(store)
+
+    for symbol in [*dropped_early, *late_dropped]:
         failed[symbol] = (
             f"{DELIST_MISSING_PREFIX}：退市表没有退市日期且无日线，已从 securities 删除"
         )

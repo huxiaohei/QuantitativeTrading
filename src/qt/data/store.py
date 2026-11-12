@@ -153,3 +153,8 @@ class ParquetStore:
         if not path.exists():
             return None
         return datetime.fromtimestamp(path.stat().st_mtime)
+
+    def set_modified_time(self, table: Table, symbol: str | None, when: datetime) -> None:
+        """把文件的修改时间设为 when（用于部分更新后保留原有的“新旧程度”）。"""
+        path = self._path(table, symbol)
+        os.utime(path, (when.timestamp(), when.timestamp()))

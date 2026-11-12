@@ -59,3 +59,25 @@ class LookupSource(FakeSource):
 
     def set_as_of(self, as_of: date) -> None:
         self.as_of_seen = as_of
+
+
+class InterruptingSource(FakeSource):
+    """第 interrupt_on 次 bars() 调用时抛 KeyboardInterrupt（模拟 Ctrl-C）。"""
+
+    def __init__(self, interrupt_on: int, **tables: pd.DataFrame) -> None:
+        super().__init__(**tables)
+        self._interrupt_on = interrupt_on
+        self._bars_calls = 0
+
+    def bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
+        self._bars_calls += 1
+        if self._bars_calls == self._interrupt_on:
+            raise KeyboardInterrupt
+        return super().bars(symbol, start, end)
+
+
+class BrokenBenchmarkSource(FakeSource):
+    """benchmark() 总是失败。"""
+
+    def benchmark(self, code: str, start: date, end: date) -> pd.DataFrame:
+        raise ConnectionError("基准不可用")
