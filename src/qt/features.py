@@ -4,6 +4,14 @@
     - 价格类指标只用 day 及之前的行（滚动窗口向后看）；
     - 分红、财务类指标先在"公告事件"上算出状态，再用 merge_asof(allow_exact_matches=False)
       对齐到每个交易日，公告当天不可见，次日起可见。
+
+分红类指标的财年口径：财年 Y 的分红全部在 Y+1 年 8 月 31 日前除权，故 day > Y+1 年 8 月 31 日
+时财年 Y "已关闭"。Y* 为 day 当天最新已关闭财年（9 月起为 day.year-1，否则 day.year-2）。
+    - dividend_years：自 Y* 起向前、每年派息合计 > 0 的连续财年数（Y* 无分红则为 0）；
+    - dividend_cut：Y*-1 有分红且 Y* 派息合计低于 Y*-1（Y* 无分红也算下调）；
+    - payout_ratio：Y* 派息合计 / Y* 年报每股收益（年报需在 day 前公告且 eps > 0）；
+    - dividend_yield：公告日在 [day-365, day) 的派息合计 / 收盘价，不受财年口径影响。
+未关闭财年的分红（如中期分红）不进入前三项，避免只公告了部分分红就误判下调。
 snapshot 与 bar 只是对预先算好的数据做切片与查表。
 """
 
@@ -149,27 +157,26 @@ def _dividend_yield(panel: pd.DataFrame, dividends: pd.DataFrame) -> Floats:
     return (np.nan_to_num(upper) - np.nan_to_num(lower)) / _floats(panel["close"])
 
 
-def _consecutive_years(joined: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
-    """每个 (symbol, 事件日) 下，以最近一个派息为正的财年结尾的连续财年段长度。"""
-    positive = joined[joined["cash_per_share"] > 0][[*keys, "fiscal_year"]]
-    positive = positive.drop_duplicates().sort_values([*keys, "fiscal_year"])
-    if positive.empty:
-        return pd.DataFrame(
-            {**{k: positive[k] for k in keys}, "div_years": pd.Series(dtype="int64")}
-        )
+def _consecutive_years(positive: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    """对派息为正的 (keys, 财年) 行，算出以该财年结尾的连续财年段长度 run。
+
+    例：某组内财年为 2016、2017、2019、2020，则 run 依次为 1、2、1、2。
+    """
+    out = positive[[*keys, "fiscal_year"]].sort_values([*keys, "fiscal_year"])
+    if out.empty:
+        return out.assign(run=pd.Series(dtype="int64"))
     group: npt.NDArray[np.int64] = np.asarray(
-        cast(Any, positive.groupby(keys, sort=True)).ngroup(), dtype="int64"
+        cast(Any, out.groupby(keys, sort=True)).ngroup(), dtype="int64"
     )
+    idx: npt.NDArray[np.int64] = np.arange(len(group))
     # 同组内财年严格递增，fy - 组内序号在连续段内恒定
-    offset: npt.NDArray[np.int64] = np.arange(len(group)) - np.searchsorted(
-        group, group, side="left"
-    )
-    run_key: npt.NDArray[np.int64] = positive["fiscal_year"].to_numpy(dtype="int64") - offset
-    last: npt.NDArray[np.int64] = np.r_[np.flatnonzero(group[1:] != group[:-1]), len(group) - 1]
-    in_last_run: npt.NDArray[np.bool_] = run_key == run_key[last][group]
-    years: npt.NDArray[np.int64] = np.bincount(group, weights=in_last_run * 1.0).astype("int64")
-    out: pd.DataFrame = positive.iloc[last][keys].reset_index(drop=True)
-    return out.assign(div_years=years)
+    offset: npt.NDArray[np.int64] = idx - np.searchsorted(group, group, side="left")
+    run_key: npt.NDArray[np.int64] = out["fiscal_year"].to_numpy(dtype="int64") - offset
+    new_run: npt.NDArray[np.bool_] = np.r_[
+        True, (group[1:] != group[:-1]) | (run_key[1:] != run_key[:-1])
+    ]
+    start: npt.NDArray[np.int64] = np.maximum.accumulate(np.where(new_run, idx, 0))
+    return out.assign(run=idx - start + 1)
 
 
 def _annual_reports(financials: pd.DataFrame) -> pd.DataFrame:
@@ -178,39 +185,72 @@ def _annual_reports(financials: pd.DataFrame) -> pd.DataFrame:
     return financials[(period.month == 12) & (period.day == 31)]
 
 
-def _dividend_state(dividends: pd.DataFrame) -> pd.DataFrame:
-    """每个公告事件之后的分红状态：连续分红年数、是否下调、最近财年及其派息合计。
+def _dividend_state(dividends: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """分红事件表与事件后的分年状态。
 
-    对 (symbol, 事件日 a) 取公告日 <= a 的全部分红行，状态从 a 之后的交易日起可见。
+    对每个 (symbol, 事件日 a) 取公告日 <= a 的全部分红行，按财年汇总：
+    total 为该财年派息合计，run 为以该财年结尾的连续派息财年数（total 不为正则为 0）。
+    状态从 a 之后的交易日起可见。返回 (事件表[symbol, announce_date], 状态表)。
     """
     events = dividends[["symbol", "announce_date"]].drop_duplicates()
     joined = events.merge(dividends, on="symbol", suffixes=("_ev", ""))
     joined = joined[joined["announce_date"] <= joined["announce_date_ev"]]
     keys = ["symbol", "announce_date_ev"]
-    # 每个财年的派息合计（含 0 元行，用于判断最近财年与下调）
-    totals = joined.groupby([*keys, "fiscal_year"], as_index=False)["cash_per_share"].sum()
-    latest = (
-        totals.groupby(keys, as_index=False)["fiscal_year"]
-        .max()
-        .rename(columns={"fiscal_year": "div_fy"})
+    summed = cast(
+        pd.DataFrame,
+        joined.groupby([*keys, "fiscal_year"], as_index=False)["cash_per_share"].sum(),
     )
-    current = latest.merge(totals, left_on=[*keys, "div_fy"], right_on=[*keys, "fiscal_year"])[
-        [*keys, "div_fy", "cash_per_share"]
-    ].rename(columns={"cash_per_share": "div_total"})
-    previous = totals.assign(div_fy=totals["fiscal_year"] + 1).rename(
-        columns={"cash_per_share": "prev_total"}
-    )[[*keys, "div_fy", "prev_total"]]
-    state = current.merge(previous, on=[*keys, "div_fy"], how="left")
-    state["div_cut"] = state["prev_total"].notna() & (
-        state["div_total"] < state["prev_total"] - _CUT_TOLERANCE
+    totals: pd.DataFrame = summed.rename(columns={"cash_per_share": "total"})
+    runs = _consecutive_years(totals[totals["total"] > 0], keys)
+    state = totals.merge(runs, on=[*keys, "fiscal_year"], how="left")
+    state["run"] = state["run"].fillna(0).astype("int64")
+    return events, state.rename(columns={"announce_date_ev": "announce_date"})
+
+
+def _closed_year(days: "pd.Series[pd.Timestamp]") -> npt.NDArray[np.int64]:
+    """每个 day 的最新已关闭财年 Y*：财年 Y 在 day > Y+1 年 8 月 31 日后关闭。"""
+    index = pd.DatetimeIndex(days)
+    after_august = index.month.to_numpy(dtype="int64") >= 9
+    return index.year.to_numpy(dtype="int64") - np.where(after_august, 1, 2)
+
+
+def _state_at(
+    events: pd.DataFrame,
+    state: pd.DataFrame,
+    event_dates: pd.DataFrame,
+    year: npt.NDArray[np.int64],
+) -> pd.DataFrame:
+    """在每行对应的最近事件上取指定财年的 total 与 run，找不到则为空。"""
+    left = pd.DataFrame(
+        {
+            "symbol": event_dates["symbol"],
+            "announce_date": event_dates["announce_date"],
+            "fiscal_year": year,
+        }
     )
-    # 连续分红年数：只看派息为正的财年，取以最近一个正派息财年结尾的连续段长度
-    state = state.merge(_consecutive_years(joined, keys), on=keys, how="left")
-    state["div_years"] = state["div_years"].fillna(0).astype("int64")
-    state["div_fy"] = state["div_fy"].astype("float64")
-    return state.rename(columns={"announce_date_ev": "announce_date"})[
-        ["symbol", "announce_date", "div_years", "div_cut", "div_fy", "div_total"]
-    ]
+    return left.merge(state, on=["symbol", "announce_date", "fiscal_year"], how="left")
+
+
+def _dividend_columns(
+    keys: pd.DataFrame, dividends: pd.DataFrame
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.bool_], Floats]:
+    """dividend_years、dividend_cut 与 Y* 当年派息合计（均只看已关闭财年，公告日 < day）。"""
+    year = _closed_year(keys["day"])
+    if dividends.empty:
+        return (
+            np.zeros(len(keys), dtype="int64"),
+            np.zeros(len(keys), dtype="bool"),
+            np.zeros(len(keys)),
+        )
+    events, state = _dividend_state(dividends)
+    visible = _asof(keys, events, "announce_date")
+    current = _state_at(events, state, visible, year)
+    previous = _state_at(events, state, visible, year - 1)
+    total = np.nan_to_num(_floats(current["total"]))
+    prev_total = np.nan_to_num(_floats(previous["total"]))
+    cut = (prev_total > 0) & (total < prev_total - _CUT_TOLERANCE)
+    years = current["run"].fillna(0).to_numpy(dtype="int64")
+    return years, cut, total
 
 
 def _latest_report_state(financials: pd.DataFrame) -> pd.DataFrame:
@@ -253,6 +293,29 @@ def _empty_snapshot() -> pd.DataFrame:
     return pd.DataFrame(cols, index=pd.Index([], name="symbol", dtype="str"))
 
 
+def _payout_ratio(keys: pd.DataFrame, total: Floats, annual: pd.DataFrame) -> Floats:
+    """Y* 年派息合计 / Y* 年年报每股收益；该年报未在 day 前公告或 eps<=0 为空。"""
+    eps = pd.DataFrame(
+        {
+            "symbol": annual["symbol"],
+            "fiscal_year": pd.DatetimeIndex(annual["report_period"]).year.to_numpy(dtype="int64"),
+            "eps_announce": annual["announce_date"],
+            "eps": annual["eps"],
+        }
+    )
+    left = pd.DataFrame(
+        {
+            "symbol": keys["symbol"],
+            "day": keys["day"],
+            "fiscal_year": _closed_year(keys["day"]),
+            "total": total,
+        }
+    )
+    joined = left.merge(eps, on=["symbol", "fiscal_year"], how="left")
+    usable = (joined["eps_announce"] < joined["day"]) & (joined["eps"] > 0)
+    return _floats((joined["total"] / joined["eps"]).where(usable))
+
+
 def _compute_panel(
     bars: pd.DataFrame,
     securities: pd.DataFrame,
@@ -284,14 +347,11 @@ def _compute_panel(
     keys = p[["symbol", "day"]]
 
     p["dividend_yield"] = _dividend_yield(p, dividends)
-    p["dividend_years"] = np.zeros(len(p), dtype="int64")
-    p["dividend_cut"] = np.zeros(len(p), dtype="bool")
-    p["payout_ratio"] = np.nan
-    if not dividends.empty:
-        merged = _asof(keys, _dividend_state(dividends), "announce_date")
-        p["dividend_years"] = merged["div_years"].fillna(0).to_numpy(dtype="int64")
-        p["dividend_cut"] = merged["div_cut"].eq(True).to_numpy(dtype="bool")
-        p["payout_ratio"] = _payout_ratio(merged, keys, _annual_reports(financials))
+    years, cut, total = _dividend_columns(keys, dividends)
+    p["dividend_years"] = years
+    p["dividend_cut"] = cut
+    annual = _annual_reports(financials)
+    p["payout_ratio"] = _payout_ratio(keys, total, annual) if not annual.empty else np.nan
 
     p["profit_yoy"] = np.nan
     p["debt_ratio"] = np.nan
@@ -300,7 +360,6 @@ def _compute_panel(
         latest = _asof(keys, _latest_report_state(financials), "announce_date")
         p["profit_yoy"] = _floats(latest["net_profit_yoy"])
         p["debt_ratio"] = _floats(latest["debt_ratio"])
-        annual = _annual_reports(financials)
         if not annual.empty:
             p["roe_avg3"] = _floats(
                 _asof(keys, _roe_avg3_state(annual), "announce_date")["roe_avg3"]
@@ -308,27 +367,10 @@ def _compute_panel(
     return p
 
 
-def _payout_ratio(state: pd.DataFrame, keys: pd.DataFrame, annual: pd.DataFrame) -> Floats:
-    """最近已公告分红财年的派息合计 / 该财年年报每股收益；年报未公告或 eps<=0 为空。"""
-    eps = pd.DataFrame(
-        {
-            "symbol": annual["symbol"],
-            "div_fy": pd.DatetimeIndex(annual["report_period"]).year.to_numpy(dtype="float64"),
-            "eps_announce": annual["announce_date"],
-            "eps": annual["eps"],
-        }
-    )
-    left = pd.DataFrame(
-        {
-            "symbol": keys["symbol"],
-            "day": keys["day"],
-            "div_fy": state["div_fy"],
-            "div_total": state["div_total"],
-        }
-    )
-    joined = left.merge(eps, on=["symbol", "div_fy"], how="left")
-    usable = (joined["eps_announce"] < joined["day"]) & (joined["eps"] > 0)
-    return _floats((joined["div_total"] / joined["eps"]).where(usable))
+def _require_date(day: object) -> None:
+    """只接受 datetime.date；datetime、Timestamp 会被静默当成别的日期，必须拒绝。"""
+    if type(day) is not date:
+        raise TypeError(f"day 必须是 datetime.date，收到 {type(day).__name__}")
 
 
 class FeaturePanel:
@@ -368,6 +410,7 @@ class FeaturePanel:
 
     def snapshot(self, day: date) -> pd.DataFrame:
         """day 当日有成交的股票的指标；区间外或无数据返回列齐全的空表。"""
+        _require_date(day)
         bounds = self._bounds.get(day)
         if bounds is None:
             return self._snapshot.iloc[0:0].copy()
@@ -375,6 +418,7 @@ class FeaturePanel:
 
     def bar(self, day: date, symbol: str) -> Bar | None:
         """当日行情；停牌或无数据返回 None。"""
+        _require_date(day)
         bounds = self._bounds.get(day)
         code = self._code.get(symbol)
         if bounds is None or code is None:
@@ -395,6 +439,7 @@ class FeaturePanel:
 
     def last_close(self, day: date, symbol: str) -> float:
         """截至 day（含）的最后一个收盘价；此前没有任何行情则抛 KeyError。"""
+        _require_date(day)
         code = self._code.get(symbol)
         if code is not None:
             lo = int(np.searchsorted(self._hist_codes, code, side="left"))
@@ -406,6 +451,7 @@ class FeaturePanel:
 
     def delisted_on(self, day: date) -> list[str]:
         """day 当天退市的股票（升序）；非交易日返回空列表。"""
+        _require_date(day)
         if not self._calendar.is_trading_day(day):
             return []
         return list(self._delistings.get(day, []))

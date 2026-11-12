@@ -2,7 +2,7 @@
 
 import math
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import cast
 
@@ -26,7 +26,7 @@ from tests.fakes import (
     weekdays,
 )
 
-D = weekdays(date(2020, 6, 1), 520)
+D = weekdays(date(2020, 6, 1), 700)
 SYMBOL = "600000"
 
 
@@ -251,13 +251,13 @@ def test_dividend_cut_and_consecutive_years(tmp_path: Path) -> None:
         SYMBOL, [(fy, date(fy + 1, 3, 30), date(fy + 1, 6, 1), c) for fy, c in cash.items()]
     )
     panel = _panel(tmp_path, [_flat()], dividends=[div])
-    snap = panel.snapshot(date(2021, 3, 31))
-    assert int(cast(int, snap.at[SYMBOL, "dividend_years"])) == 5
-    assert _b(snap, SYMBOL, "dividend_cut")
-    # 2020 年度分红公告日当天尚不可见：只有 4 年，且无下调
-    before = panel.snapshot(date(2021, 3, 30))
+    # 2021-08-31 之前 2020 财年尚未关闭：只数到 2019，4 年，且无下调
+    before = panel.snapshot(date(2021, 3, 31))
     assert int(cast(int, before.at[SYMBOL, "dividend_years"])) == 4
     assert not _b(before, SYMBOL, "dividend_cut")
+    snap = panel.snapshot(date(2021, 9, 1))
+    assert int(cast(int, snap.at[SYMBOL, "dividend_years"])) == 5
+    assert _b(snap, SYMBOL, "dividend_cut")
 
 
 def test_dividend_years_run_broken_by_gap_or_zero_cash(tmp_path: Path) -> None:
@@ -274,10 +274,10 @@ def test_dividend_years_run_broken_by_gap_or_zero_cash(tmp_path: Path) -> None:
         ],
     )
     panel = _panel(tmp_path, [_flat()], dividends=[div])
-    snap = panel.snapshot(date(2021, 4, 1))
+    snap = panel.snapshot(date(2021, 9, 1))
     assert int(cast(int, snap.at[SYMBOL, "dividend_years"])) == 2
     assert not _b(snap, SYMBOL, "dividend_cut")  # 0.7 > 0.5
-    assert _f(snap, SYMBOL, "dividend_yield") == pytest.approx(0.07)
+    assert _f(panel.snapshot(date(2021, 4, 1)), SYMBOL, "dividend_yield") == pytest.approx(0.07)
 
 
 def test_roe_avg3_needs_three_announced_annual_reports(tmp_path: Path) -> None:
@@ -315,7 +315,13 @@ def test_payout_ratio(tmp_path: Path) -> None:
         div = make_dividends(symbol, [(2020, date(2021, 3, 30), date(2021, 6, 1), 0.5)])
         fin = make_financials(
             symbol,
-            [{"report_period": date(2020, 12, 31), "announce_date": date(2021, 4, 20), "eps": eps}],
+            [
+                {
+                    "report_period": date(2020, 12, 31),
+                    "announce_date": date(2021, 10, 15),
+                    "eps": eps,
+                }
+            ],
         )
         return div, fin
 
@@ -329,9 +335,9 @@ def test_payout_ratio(tmp_path: Path) -> None:
         financials=[a_fin, b_fin, c_fin],
     )
     # 年报尚未公告：空
-    for day in (date(2021, 4, 1), date(2021, 4, 20)):
+    for day in (date(2021, 9, 1), date(2021, 10, 15)):
         assert math.isnan(_f(panel.snapshot(day), "600000", "payout_ratio"))
-    after = panel.snapshot(date(2021, 4, 21))
+    after = panel.snapshot(date(2021, 10, 18))
     assert _f(after, "600000", "payout_ratio") == pytest.approx(0.5)
     assert math.isnan(_f(after, "600001", "payout_ratio"))
     assert math.isnan(_f(after, "600002", "payout_ratio"))
@@ -347,7 +353,7 @@ def test_payout_ratio_needs_annual_report_of_the_dividend_fiscal_year(tmp_path: 
         ],
     )
     panel = _panel(tmp_path, [_flat()], dividends=[div], financials=[fin])
-    assert math.isnan(_f(panel.snapshot(date(2021, 4, 21)), SYMBOL, "payout_ratio"))
+    assert math.isnan(_f(panel.snapshot(date(2021, 9, 1)), SYMBOL, "payout_ratio"))
 
 
 def test_avg_amount_60d(tmp_path: Path) -> None:
@@ -446,8 +452,108 @@ def test_snapshot_contract_and_range(tmp_path: Path) -> None:
 
 
 def test_bars_after_end_are_ignored(tmp_path: Path) -> None:
-    panel = _panel(tmp_path, [_flat()], end=D[400])
+    closes = [10.0 + 0.01 * i if i <= 400 else 1000.0 for i in range(len(D))]
+    panel = _panel(tmp_path, [make_bars(SYMBOL, D, closes)], end=D[400])
     assert not panel.snapshot(D[400]).empty
     assert panel.snapshot(D[450]).empty
     assert panel.bar(D[450], SYMBOL) is None
-    assert panel.last_close(D[450], SYMBOL) == 10.0
+    # 若 end 之后的行泄漏进来，这里会是 1000
+    assert panel.last_close(D[450], SYMBOL) == closes[400]
+
+
+def test_price_position_on_start_day_uses_pre_start_history(tmp_path: Path) -> None:
+    n = 400
+    adj = [10.0 + 0.01 * i + (0.5 if i % 7 == 0 else 0.0) for i in range(n)]
+    panel = _panel(tmp_path, [make_bars(SYMBOL, D[:n], adj)], start=D[300], end=D[399])
+    window = np.array(adj[51:301])
+    expected = (adj[300] - window.min()) / (window.max() - window.min())
+    assert _f(panel.snapshot(D[300]), SYMBOL, "price_position") == pytest.approx(expected)
+
+
+def _years_cut_payout(panel: FeaturePanel, day: date) -> tuple[int, bool, float]:
+    snap = panel.snapshot(day)
+    years = int(cast(int, snap.at[SYMBOL, "dividend_years"]))
+    return years, _b(snap, SYMBOL, "dividend_cut"), _f(snap, SYMBOL, "payout_ratio")
+
+
+def test_partially_announced_fiscal_year_does_not_distort_dividend_features(
+    tmp_path: Path,
+) -> None:
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2020, date(2021, 3, 30), date(2021, 6, 1), 0.5),
+            (2021, date(2021, 8, 20), date(2021, 9, 15), 0.2),  # 2021 财年中期分红
+            (2021, date(2022, 3, 30), date(2022, 6, 15), 0.4),  # 2021 财年期末分红
+        ],
+    )
+    fin = make_financials(
+        SYMBOL,
+        [
+            {"report_period": date(2020, 12, 31), "announce_date": date(2021, 3, 25), "eps": 1.0},
+            {"report_period": date(2021, 12, 31), "announce_date": date(2022, 3, 20), "eps": 1.0},
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div], financials=[fin])
+    nan = math.nan
+
+    def check(day: date, years: int, cut: bool, payout: float) -> None:
+        got = _years_cut_payout(panel, day)
+        assert got[:2] == (years, cut), day
+        if math.isnan(payout):
+            assert math.isnan(got[2]), day
+        else:
+            assert got[2] == pytest.approx(payout), day
+
+    check(date(2021, 8, 23), 0, False, nan)  # Y*=2019，无分红
+    check(date(2021, 8, 31), 0, False, nan)
+    check(date(2021, 9, 1), 1, False, 0.5)  # Y*=2020
+    check(date(2022, 3, 31), 1, False, 0.5)  # 2021 财年已公告但未关闭，不影响
+    check(date(2022, 8, 31), 1, False, 0.5)
+    check(date(2022, 9, 1), 2, False, 0.6)  # Y*=2021，0.6 > 0.5
+
+
+def test_dividend_stop_is_a_cut(tmp_path: Path) -> None:
+    div = make_dividends(SYMBOL, [(2019, date(2020, 3, 30), date(2020, 6, 1), 0.5)])
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    assert _years_cut_payout(panel, date(2021, 8, 31))[:2] == (1, False)
+    assert _years_cut_payout(panel, date(2021, 9, 1))[:2] == (0, True)
+
+
+def test_fiscal_year_closes_after_august_31(tmp_path: Path) -> None:
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2019, date(2020, 3, 30), date(2020, 6, 1), 0.5),
+            (2020, date(2021, 3, 30), date(2021, 6, 1), 0.3),
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    assert _years_cut_payout(panel, date(2021, 8, 31))[:2] == (1, False)  # 最后一个旧口径日
+    assert _years_cut_payout(panel, date(2021, 9, 1))[:2] == (2, True)  # 首个新口径日
+
+
+def test_late_announcement_for_closed_year_counts_from_next_day(tmp_path: Path) -> None:
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2019, date(2020, 3, 30), date(2020, 6, 1), 0.4),
+            (2020, date(2021, 10, 14), date(2021, 11, 1), 0.5),
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    assert _years_cut_payout(panel, date(2021, 10, 14))[:2] == (0, True)  # 公告当天不可见
+    assert _years_cut_payout(panel, date(2021, 10, 15))[:2] == (2, False)
+
+
+def test_non_date_arguments_are_rejected(tmp_path: Path) -> None:
+    panel = _panel(tmp_path, [_flat()])
+    for bad in (datetime(2021, 4, 1), pd.Timestamp("2021-04-01")):
+        with pytest.raises(TypeError, match=r"datetime\.date"):
+            panel.snapshot(bad)
+        with pytest.raises(TypeError, match=r"datetime\.date"):
+            panel.bar(bad, SYMBOL)
+        with pytest.raises(TypeError, match=r"datetime\.date"):
+            panel.last_close(bad, SYMBOL)
+        with pytest.raises(TypeError, match=r"datetime\.date"):
+            panel.delisted_on(bad)
