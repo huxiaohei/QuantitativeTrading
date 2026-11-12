@@ -381,9 +381,7 @@ class FeaturePanel:
         panel: pd.DataFrame,
         history: pd.DataFrame,
         delistings: dict[date, list[str]],
-        calendar: TradingCalendar,
     ) -> None:
-        self._calendar = calendar
         self._delistings = delistings
         symbols = sorted(set(history["symbol"].tolist()) | set(panel["symbol"].tolist()))
         self._code: dict[str, int] = {s: i for i, s in enumerate(symbols)}
@@ -461,6 +459,7 @@ def build_panel(
     """读取全部所需历史并构建 [start, end] 的 FeaturePanel。
 
     日线读到 end 为止的全部历史（保证 start 当天回看窗口有效），分红与财务读全量。
+    calendar 参数目前未使用，仅为保持调用方（命令行、测试）的签名不变而保留。
     """
     securities = store.read(Table.SECURITIES)
     securities = securities[securities["board"].isin(cfg.universe.boards)].reset_index(drop=True)
@@ -484,4 +483,4 @@ def build_panel(
         end,
     )
     history = bars[["symbol", "day", "close"]].sort_values(["symbol", "day"], kind="stable")
-    return FeaturePanel(panel, history, delistings, calendar)
+    return FeaturePanel(panel, history, delistings)

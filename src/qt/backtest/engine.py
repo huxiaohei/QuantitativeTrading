@@ -16,13 +16,11 @@ from qt.calendar import TradingCalendar
 from qt.costs import CostModel
 from qt.features import Bar, FeaturePanel
 from qt.models import BuyCandidate, ExitReason, Order, Position, Side, Trade
-from qt.risk import Rejection, RiskEvent, RiskManager
+from qt.risk import Rejection, RiskEvent, RiskEventKind, RiskManager
 from qt.strategy.base import Strategy
 
 _LOT = 100
 _EPS = 1e-9  # 价格与涨跌停价比较的容差
-_LIMIT_PCT = 0.10  # 普通股票涨跌停幅度
-_LIMIT_PCT_ST = 0.05  # ST 股票涨跌停幅度
 
 
 @dataclass(frozen=True)
@@ -55,18 +53,38 @@ class _State:
     expired_buys: list[Order] = field(default_factory=lambda: [])
 
 
-def _round_price(value: float) -> float:
-    """价格按十进制四舍五入（逢五进一）到分，不用 Python 的银行家舍入。"""
-    return float(Decimal(repr(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+_CENT = Decimal("0.01")
+_MULTIPLIERS = {
+    # (是否 ST, 是否涨停): 乘数。普通股 ±10%，ST ±5%
+    (False, True): Decimal("1.10"),
+    (False, False): Decimal("0.90"),
+    (True, True): Decimal("1.05"),
+    (True, False): Decimal("0.95"),
+}
+
+
+def _cents(value: Decimal) -> Decimal:
+    """按分四舍五入（逢五进一），不用 Python 的银行家舍入。"""
+    return value.quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def limit_prices(prev_close: float, is_st: bool) -> tuple[float, float]:
+    """(涨停价, 跌停价)，全程用十进制精确计算，避免浮点乘积差一分钱。
+
+    交易所的参考价以分为单位：先把前收盘价按分四舍五入（除权日的前收盘价是
+    按复权因子折算过的，不一定恰好是整分），再乘以 1.10 / 0.90（ST 为 1.05 / 0.95），
+    结果同样按分逢五进一。例如前收 7.85：7.85 * 0.9 = 7.065 -> 跌停价 7.07；
+    若直接用浮点乘积 7.0649999999999995 会得到 7.06，让本该跌停打不开的卖单成交。
+    """
+    ref = _cents(Decimal(repr(prev_close)))
+    up = _cents(ref * _MULTIPLIERS[(is_st, True)])
+    down = _cents(ref * _MULTIPLIERS[(is_st, False)])
+    return float(up), float(down)
 
 
 def _limits(bar: Bar) -> tuple[float, float]:
-    """(涨停价, 跌停价)：以前收盘价为基准，ST 为 5%，其余 10%。"""
-    pct = _LIMIT_PCT_ST if bar.is_st else _LIMIT_PCT
-    return (
-        _round_price(bar.prev_close * (1 + pct)),
-        _round_price(bar.prev_close * (1 - pct)),
-    )
+    """某根行情对应的 (涨停价, 跌停价)。"""
+    return limit_prices(bar.prev_close, bar.is_st)
 
 
 def _close_position(
@@ -105,21 +123,24 @@ def _liquidate_delisted(
 ) -> None:
     """第 1 步 退市清算：逐个日历日扫描 (上一交易日, 今天]，因为退市日可能不是交易日。
 
-    持仓按最后收盘价卖出（仍扣除成本模型里的滑点与费用），该股票的挂单一并作废。
-    回测首日没有上一交易日，只扫描当天。
+    退市股票的挂单（买、卖）一律作废，不论是否持有。持仓按上一交易日的收盘价卖出
+    （开盘前已知的最后价格，回收的资金可以用于今天的买入），仍扣除滑点与费用。
+    回测首日没有上一交易日，只扫描当天（此时不可能有持仓）。
     """
     scan = day if prev_day is None else prev_day + timedelta(days=1)
     while scan <= day:
         for symbol in panel.delisted_on(scan):
+            state.sell_orders = [o for o in state.sell_orders if o.symbol != symbol]
+            state.buy_orders = [o for o in state.buy_orders if o.symbol != symbol]
+            state.candidates.pop(symbol, None)
             pos = state.positions.get(symbol)
             if pos is None:
                 continue
-            price = panel.last_close(day, symbol)
+            assert prev_day is not None  # 持仓最早出现在回测第二天，必有上一交易日
+            price = panel.last_close(prev_day, symbol)
             _close_position(
                 state, risk, day, pos, costs.sell_proceeds(price, pos.shares), ExitReason.DELISTED
             )
-            state.sell_orders = [o for o in state.sell_orders if o.symbol != symbol]
-            state.buy_orders = [o for o in state.buy_orders if o.symbol != symbol]
         scan += timedelta(days=1)
 
 
@@ -220,8 +241,17 @@ def _mark_to_market(state: _State, panel: FeaturePanel, day: date) -> float:
 def _update_risk(
     state: _State, risk: RiskManager, day: date, equity: float, initial_cash: float
 ) -> None:
-    """第 5 步 风控记账：用净值（总资产 / 初始资金）驱动回撤预警与暂停。"""
-    state.risk_events.extend(risk.on_day_close(day, equity / initial_cash))
+    """第 5 步 风控记账：用净值（总资产 / 初始资金）驱动回撤预警与暂停。
+
+    暂停买入生效的当晚，所有待成交买单一并作废（记入 expired_buys），
+    保证暂停期间不会有新仓位成交；已持有的仓位和卖单不受影响。
+    """
+    events = risk.on_day_close(day, equity / initial_cash)
+    state.risk_events.extend(events)
+    if any(e.kind is RiskEventKind.PAUSE for e in events):
+        state.expired_buys.extend(state.buy_orders)
+        state.buy_orders = []
+        state.candidates.clear()
 
 
 def _create_sell_orders(
@@ -247,7 +277,11 @@ def _create_buy_orders(
     day: date,
     equity: float,
 ) -> None:
-    """第 7 步 买入候选与定仓：暂停期间不买；持仓与待成交买单的股票都算已持有。"""
+    """第 7 步 买入候选与定仓：持仓与待成交买单的股票都算已持有。
+
+    暂停买入期间直接跳过本步，不向策略要候选，也不调用 size_buys，
+    因此回测结果的 rejections 里不会出现 paused 拒绝记录。
+    """
     if not risk.buying_allowed():
         return
     held = frozenset(state.positions) | frozenset(o.symbol for o in state.buy_orders)

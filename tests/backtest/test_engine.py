@@ -14,7 +14,7 @@ from typing import cast
 import pandas as pd
 import pytest
 
-from qt.backtest.engine import BacktestResult, run_backtest
+from qt.backtest.engine import BacktestResult, limit_prices, run_backtest
 from qt.calendar import TradingCalendar
 from qt.costs import CostModel
 from qt.data.store import ParquetStore
@@ -289,6 +289,24 @@ def test_delisted_position_liquidated_at_last_close(tmp_path: Path) -> None:
     assert _at(result.equity, D[5]) == pytest.approx(_at(result.cash, D[5]))
 
 
+def test_delisting_uses_previous_trading_day_close(tmp_path: Path) -> None:
+    # 退市日 D[5] 当天仍有一根 9.0 的行情：清算价取前一交易日 D[4] 的收盘 10.5，
+    # 因为退市日的收盘价开盘时还不知道
+    bars = _bars(S, {4: 10.5, 5: 9.0}, skip=range(6, N))
+    result = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S)), delist={S: D[5]})
+    (trade,) = result.trades
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.5, 1000))
+
+
+def test_delisting_drops_pending_buy_of_unheld_symbol(tmp_path: Path) -> None:
+    # S 在 D[1] 开盘涨停，买单挂着；D[2] 退市（没有持仓）：买单直接作废，既不成交也不过期记录
+    bars = _bars(S, {1: 11.0}, skip=range(2, N))
+    result = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S)), delist={S: D[2]})
+    assert result.open_positions == []
+    assert result.trades == []
+    assert result.expired_buys == []
+
+
 def test_delist_date_on_non_trading_day_liquidates_next_trading_day(tmp_path: Path) -> None:
     friday, saturday, monday = D[3], date(2024, 1, 6), D[4]
     assert friday == date(2024, 1, 5)
@@ -322,19 +340,50 @@ def test_stop_loss_exit_triggers_cooldown(tmp_path: Path) -> None:
 
 
 def test_paused_risk_blocks_new_buys_but_allows_sells(tmp_path: Path) -> None:
-    # D[2] 收盘 9.0，回撤约 0.9%，超过（测试用的）0.5% 暂停线
+    # D[2] 收盘 9.0，回撤约 0.9%，超过（测试用的）0.5% 暂停线；暂停当天 D[2] 就有候选，
+    # 如果引擎先做第 7 步再做第 5 步，这个候选会变成买单并在 D[3] 成交
     risk_update = {"warn_drawdown": 0.002, "pause_drawdown": 0.005}
     bars = [_bars(S, {2: 9.0, 3: 9.0, 4: 9.0}), _bars(S2)]
-    buys = {**_buy(S), **_buy(S2, day=3)}
+    buys = {**_buy(S), **_buy(S2, day=2), **_buy(S2, day=3)}
     strategy = ScriptedStrategy(buys=buys, sells={D[3]: [(S, ExitReason.TIME_STOP)]})
     result = _run(tmp_path, bars, strategy, risk_update=risk_update)
-    assert [e.kind for e in result.risk_events if e.kind is RiskEventKind.PAUSE] == [
-        RiskEventKind.PAUSE
-    ]
-    assert D[3] not in [day for day, _ in strategy.held_seen]  # 暂停期间不再要买入候选
+    pauses = [e for e in result.risk_events if e.kind is RiskEventKind.PAUSE]
+    assert [e.day for e in pauses] == [D[2]]
+    seen_days = [day for day, _ in strategy.held_seen]
+    assert D[2] not in seen_days
+    assert D[3] not in seen_days  # 暂停期间不再要买入候选
+    assert result.rejections == []  # 暂停时不调用 size_buys，不产生 paused 拒绝记录
     assert [t.symbol for t in result.trades] == [S]  # 卖出照常
     assert result.trades[0].exit_day == D[4]
     assert result.open_positions == []  # S2 没有买入
+
+
+def test_buying_resumes_on_the_evening_of_the_resume_day(tmp_path: Path) -> None:
+    # 暂停 2 个交易日：D[2] 暂停，D[4] 收盘恢复。D[3] 的候选被忽略，D[4] 的候选下单，D[5] 成交
+    risk_update = {"warn_drawdown": 0.002, "pause_drawdown": 0.005, "pause_days": 2}
+    bars = [_bars(S, {i: 9.0 for i in range(2, N)}), _bars(S2)]
+    buys = {**_buy(S), **_buy(S2, day=3)}
+    buys.update(_buy(S2, day=4))
+    strategy = ScriptedStrategy(buys=buys)
+    result = _run(tmp_path, bars, strategy, risk_update=risk_update)
+    kinds = [(e.day, e.kind) for e in result.risk_events if e.kind is not RiskEventKind.WARN]
+    assert kinds == [(D[2], RiskEventKind.PAUSE), (D[4], RiskEventKind.RESUME)]
+    seen_days = [day for day, _ in strategy.held_seen]
+    assert D[3] not in seen_days
+    assert D[4] in seen_days
+    entries = {p.symbol: p.entry_day for p in result.open_positions}
+    assert entries == {S: D[1], S2: D[5]}
+
+
+def test_pause_expires_pending_buys(tmp_path: Path) -> None:
+    # S 在 D[1] 开盘涨停买不到，买单挂着；同日 S2 成交后收盘跌到 9.0，触发暂停。
+    # 暂停开始时所有待成交买单作废：D[2] S 即使可以成交也不买
+    risk_update = {"warn_drawdown": 0.002, "pause_drawdown": 0.005}
+    bars = [_bars(S, {1: 11.0, 2: 10.5}), _bars(S2, {1: 10.0}, {1: 9.0, 2: 9.0})]
+    strategy = ScriptedStrategy(buys=_buy(S, S2))
+    result = _run(tmp_path, bars, strategy, risk_update=risk_update)
+    assert [p.symbol for p in result.open_positions] == [S2]
+    assert [o.symbol for o in result.expired_buys] == [S]
 
 
 # ---------- 账务、确定性 ----------
@@ -394,3 +443,92 @@ def test_same_inputs_give_identical_results(tmp_path: Path) -> None:
     assert first.rejections == second.rejections
     assert first.risk_events == second.risk_events
     assert first.expired_buys == second.expired_buys
+
+
+# ---------- 涨跌停价的精确舍入 ----------
+
+
+def test_limit_prices_match_exact_integer_cent_arithmetic() -> None:
+    # 前收 1.00..100.00 逐分扫描；独立用整数分计算：涨跌停 = 前收 * (100±pct)% 逢五进一
+    mismatches: list[tuple[int, bool, int, int, int, int]] = []
+    for cents in range(100, 10001):
+        for is_st, pct in ((False, 10), (True, 5)):
+            want_up = (cents * (100 + pct) + 50) // 100
+            want_down = (cents * (100 - pct) + 50) // 100
+            up, down = limit_prices(cents / 100, is_st)
+            got_up, got_down = round(up * 100), round(down * 100)
+            if (got_up, got_down) != (want_up, want_down):
+                mismatches.append((cents, is_st, got_up, want_up, got_down, want_down))
+    assert mismatches == []
+
+
+def test_limit_down_price_is_rounded_half_up_not_one_cent_low(tmp_path: Path) -> None:
+    # 前收 7.85：跌停价 7.065 逢五进一为 7.07（浮点乘积 7.0649999999999995 会误得 7.06）
+    # D[3] 开盘 7.07 就是跌停价，卖不出；D[4] 开盘 7.08 才成交
+    bars = _bars(S, {0: 7.85, 1: 7.85, 2: 7.85, 3: 7.07, 4: 7.08})
+    strategy = ScriptedStrategy(buys=_buy(S, close=7.85), sells={D[2]: [(S, ExitReason.STOP_LOSS)]})
+    (trade,) = _run(tmp_path, [bars], strategy).trades
+    assert trade.exit_day == D[4]
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(7.08, 1300))
+
+
+def test_st_limit_down_price_inexact_product_is_deferred(tmp_path: Path) -> None:
+    # ST 前收 1.30：跌停价 1.235 逢五进一为 1.24；开盘 1.24 是跌停价，顺延
+    bars = _bars(S, {0: 1.30, 1: 1.30, 2: 1.30, 3: 1.24, 4: 1.25})
+    st = make_st_history([(S, D[0], None)])
+    strategy = ScriptedStrategy(buys=_buy(S, close=1.30), sells={D[2]: [(S, ExitReason.STOP_LOSS)]})
+    (trade,) = _run(tmp_path, [bars], strategy, st_history=st).trades
+    assert trade.exit_day == D[4]
+
+
+def test_st_limit_up_price_inexact_product_blocks_buy(tmp_path: Path) -> None:
+    # ST 前收 1.90：涨停价 1.995 逢五进一为 2.00（浮点乘积 1.9949999999999999 会误得 1.99）
+    # D[1] 开盘 2.00 就是涨停价，买不到；D[2] 开盘 1.95 成交
+    bars = _bars(S, {0: 1.90, 1: 2.0, 2: 1.95})
+    st = make_st_history([(S, D[0], None)])
+    strategy = ScriptedStrategy(buys=_buy(S, close=1.90))
+    result = _run(tmp_path, [bars], strategy, st_history=st)
+    (pos,) = result.open_positions
+    assert pos.entry_day == D[2]
+
+
+def test_st_limit_up_price_below_inexact_product_still_fills(tmp_path: Path) -> None:
+    # 同上，涨停价应为 2.00；开盘 1.99 低于涨停价，当日即可成交
+    # （浮点乘积会把涨停价算成 1.99，误判为涨停而顺延）
+    bars = _bars(S, {0: 1.90, 1: 1.99})
+    st = make_st_history([(S, D[0], None)])
+    result = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S, close=1.90)), st_history=st)
+    (pos,) = result.open_positions
+    assert pos.entry_day == D[1]
+
+
+# ---------- 除权与停牌的组合 ----------
+
+
+def test_pending_sell_before_ex_dividend_sells_scaled_shares(tmp_path: Path) -> None:
+    # D[1] 买入后发出卖出信号（下单时 1000 股）；D[2] 除权，开盘卖出的是放大后的 1333.33 股
+    bars = _bars(S, {i: 7.5 for i in range(2, N)}, adj={i: 4 / 3 for i in range(2, N)})
+    strategy = ScriptedStrategy(buys=_buy(S), sells={D[1]: [(S, ExitReason.TAKE_PROFIT_FIXED)]})
+    (trade,) = _run(tmp_path, [bars], strategy).trades
+    assert trade.exit_day == D[2]
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(7.5, 1000 * 4 / 3))
+
+
+def test_ex_dividend_during_suspension_applied_once_on_resume_day(tmp_path: Path) -> None:
+    # D[2]..D[4] 停牌，复牌日 D[5] 一次性体现因子变化 4/3；此后因子不变，股数只放大一次
+    bars = _bars(
+        S,
+        {i: 7.5 for i in range(5, N)},
+        skip=[2, 3, 4],
+        adj={i: 4 / 3 for i in range(5, N)},
+    )
+    result = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S)))
+    (pos,) = result.open_positions
+    assert pos.shares == pytest.approx(1000 * 4 / 3)
+
+
+def test_days_held_increments_during_suspension(tmp_path: Path) -> None:
+    # 停牌期间持有天数照常增加：D[1]..D[11] 共 11 个交易日
+    bars = _bars(S, skip=range(3, 8))
+    (pos,) = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S))).open_positions
+    assert pos.days_held == 11
