@@ -1,0 +1,453 @@
+"""FeaturePanel 测试：重点验证时点正确（只能看到 day 之前已公告的信息）。"""
+
+import math
+from collections.abc import Sequence
+from datetime import date
+from pathlib import Path
+from typing import cast
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from qt.calendar import TradingCalendar
+from qt.data.store import ParquetStore
+from qt.features import Bar, FeaturePanel, build_panel
+from tests.fakes import (
+    default_app_config,
+    make_bars,
+    make_dividends,
+    make_financials,
+    make_industries,
+    make_securities,
+    make_snapshot,
+    make_st_history,
+    populate_store,
+    weekdays,
+)
+
+D = weekdays(date(2020, 6, 1), 520)
+SYMBOL = "600000"
+
+
+def _panel(
+    tmp_path: Path,
+    bars: Sequence[pd.DataFrame],
+    *,
+    securities: pd.DataFrame | None = None,
+    dividends: Sequence[pd.DataFrame] = (),
+    financials: Sequence[pd.DataFrame] = (),
+    industries: pd.DataFrame | None = None,
+    st_history: pd.DataFrame | None = None,
+    start: date | None = None,
+    end: date | None = None,
+) -> FeaturePanel:
+    if securities is None:
+        securities = make_securities(
+            [(str(b["symbol"].iloc[0]), "sh_main", date(2010, 1, 1), None) for b in bars]
+        )
+    store = ParquetStore(tmp_path)
+    populate_store(
+        store,
+        securities=securities,
+        bars=bars,
+        dividends=dividends,
+        financials=financials,
+        industries=industries,
+        st_history=st_history,
+    )
+    return build_panel(store, TradingCalendar(D), default_app_config(), start or D[0], end or D[-1])
+
+
+def _flat(symbol: str = SYMBOL, price: float = 10.0, n: int | None = None) -> pd.DataFrame:
+    n = len(D) if n is None else n
+    return make_bars(symbol, D[:n], [price] * n)
+
+
+def _f(snap: pd.DataFrame, symbol: str, col: str) -> float:
+    return float(cast(float, snap.at[symbol, col]))
+
+
+def _b(snap: pd.DataFrame, symbol: str, col: str) -> bool:
+    return bool(cast(bool, snap.at[symbol, col]))
+
+
+def test_financials_invisible_until_day_after_announcement(tmp_path: Path) -> None:
+    fin = make_financials(
+        SYMBOL,
+        [
+            {
+                "report_period": date(2020, 9, 30),
+                "announce_date": date(2020, 10, 28),
+                "net_profit_yoy": 0.2,
+                "debt_ratio": 0.4,
+            },
+            {
+                "report_period": date(2020, 12, 31),
+                "announce_date": date(2021, 4, 28),
+                "net_profit_yoy": 0.3,
+                "debt_ratio": 0.6,
+            },
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], financials=[fin])
+    assert math.isnan(_f(panel.snapshot(date(2020, 10, 28)), SYMBOL, "profit_yoy"))
+    assert _f(panel.snapshot(date(2020, 10, 29)), SYMBOL, "profit_yoy") == 0.2
+    assert _f(panel.snapshot(date(2021, 4, 28)), SYMBOL, "profit_yoy") == 0.2
+    assert _f(panel.snapshot(date(2021, 4, 28)), SYMBOL, "debt_ratio") == 0.4
+    assert _f(panel.snapshot(date(2021, 4, 29)), SYMBOL, "profit_yoy") == 0.3
+    assert _f(panel.snapshot(date(2021, 4, 29)), SYMBOL, "debt_ratio") == 0.6
+
+
+def test_quarterly_report_after_annual_takes_over_profit_yoy(tmp_path: Path) -> None:
+    fin = make_financials(
+        SYMBOL,
+        [
+            {
+                "report_period": date(2020, 12, 31),
+                "announce_date": date(2021, 4, 20),
+                "net_profit_yoy": 0.3,
+            },
+            {
+                "report_period": date(2021, 3, 31),
+                "announce_date": date(2021, 4, 28),
+                "net_profit_yoy": -0.1,
+            },
+            # 迟到的旧报告（期末更早）不能覆盖更新的一期
+            {
+                "report_period": date(2020, 9, 30),
+                "announce_date": date(2021, 5, 20),
+                "net_profit_yoy": 9.9,
+            },
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], financials=[fin])
+    assert _f(panel.snapshot(date(2021, 4, 21)), SYMBOL, "profit_yoy") == 0.3
+    assert _f(panel.snapshot(date(2021, 4, 28)), SYMBOL, "profit_yoy") == 0.3
+    assert _f(panel.snapshot(date(2021, 4, 29)), SYMBOL, "profit_yoy") == -0.1
+    assert _f(panel.snapshot(date(2021, 5, 24)), SYMBOL, "profit_yoy") == -0.1
+
+
+def test_dividend_yield_uses_only_announced_dividends(tmp_path: Path) -> None:
+    div = make_dividends(SYMBOL, [(2020, date(2021, 3, 30), date(2021, 6, 1), 0.5)])
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    assert _f(panel.snapshot(date(2021, 3, 30)), SYMBOL, "dividend_yield") == 0.0
+    assert _f(panel.snapshot(date(2021, 3, 31)), SYMBOL, "dividend_yield") == pytest.approx(0.05)
+
+
+def test_dividend_yield_window_is_365_calendar_days(tmp_path: Path) -> None:
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2019, date(2020, 7, 1), date(2020, 8, 1), 0.3),
+            (2020, date(2021, 3, 30), date(2021, 6, 1), 0.5),
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    # 2021-07-01 的下界恰为 2020-07-01，公告日等于下界仍计入
+    assert _f(panel.snapshot(date(2021, 7, 1)), SYMBOL, "dividend_yield") == pytest.approx(0.08)
+    assert _f(panel.snapshot(date(2021, 7, 2)), SYMBOL, "dividend_yield") == pytest.approx(0.05)
+    assert _f(panel.snapshot(date(2020, 7, 1)), SYMBOL, "dividend_yield") == 0.0
+    assert _f(panel.snapshot(date(2020, 7, 2)), SYMBOL, "dividend_yield") == pytest.approx(0.03)
+
+
+def test_price_position_basic_and_flat(tmp_path: Path) -> None:
+    n = 300
+    closes = [10.0 + i for i in range(n)]
+    rising = make_bars(SYMBOL, D[:n], closes)
+    panel = _panel(tmp_path, [rising, _flat("600001", n=n)])
+    assert math.isnan(_f(panel.snapshot(D[248]), SYMBOL, "price_position"))
+    assert _f(panel.snapshot(D[249]), SYMBOL, "price_position") == 1.0
+    # 窗口 [D[50], D[299]]，最低 60，最高 309，当前 309 → 1；回落后再验证一个中间值
+    snap = panel.snapshot(D[299])
+    assert _f(snap, SYMBOL, "price_position") == 1.0
+    # 最高等于最低：空
+    assert math.isnan(_f(snap, "600001", "price_position"))
+
+
+def test_price_position_unaffected_by_ex_dividend_gap(tmp_path: Path) -> None:
+    n = 400
+    ex = 320
+    adj = [10.0 + 0.01 * i + (0.5 if i % 7 == 0 else 0.0) for i in range(n)]
+    factors = [1.0 if i < ex else 10.0 / 7.0 for i in range(n)]
+    raw = [a / f for a, f in zip(adj, factors, strict=True)]
+    # 除权日未复权价从约 13 跳到约 9，后复权价平稳
+    assert raw[ex] < 0.75 * raw[ex - 1]
+    bars = make_bars(SYMBOL, D[:n], raw, factors)
+    panel = _panel(tmp_path, [bars])
+    adj_arr = np.array(adj) * 1.0
+    for i in (ex - 1, ex, ex + 1):
+        window = adj_arr[i - 249 : i + 1]
+        expected = (adj_arr[i] - window.min()) / (window.max() - window.min())
+        assert _f(panel.snapshot(D[i]), SYMBOL, "price_position") == pytest.approx(expected)
+
+
+def test_price_position_nan_when_history_short(tmp_path: Path) -> None:
+    panel = _panel(tmp_path, [_flat(n=100)])
+    snap = panel.snapshot(D[99])
+    assert math.isnan(_f(snap, SYMBOL, "price_position"))
+    # 缺财务、缺分红也只是空值或 0，不报错
+    for col in ("roe_avg3", "payout_ratio", "profit_yoy", "debt_ratio", "avg_amount_60d"):
+        if col == "avg_amount_60d":
+            assert not math.isnan(_f(snap, SYMBOL, col))
+        else:
+            assert math.isnan(_f(snap, SYMBOL, col))
+    assert _f(snap, SYMBOL, "dividend_yield") == 0.0
+    assert int(cast(int, snap.at[SYMBOL, "dividend_years"])) == 0
+    assert not _b(snap, SYMBOL, "dividend_cut")
+
+
+def test_suspended_symbol_absent_from_snapshot_and_bar_is_none(tmp_path: Path) -> None:
+    other = _flat("600001")
+    full = _flat(SYMBOL)
+    suspended_day = date(2021, 5, 10)
+    bars = full[full["day"] != pd.Timestamp(suspended_day)].reset_index(drop=True)
+    panel = _panel(tmp_path, [bars, other])
+    snap = panel.snapshot(suspended_day)
+    assert SYMBOL not in snap.index
+    assert "600001" in snap.index
+    assert panel.bar(suspended_day, SYMBOL) is None
+    assert panel.last_close(suspended_day, SYMBOL) == 10.0
+    assert panel.bar(date(2021, 5, 11), SYMBOL) is not None
+
+
+def test_last_close_is_latest_on_or_before_day(tmp_path: Path) -> None:
+    n = 50
+    bars = make_bars(SYMBOL, D[10:n], [float(i) for i in range(10, n)])
+    panel = _panel(tmp_path, [bars])
+    assert panel.last_close(D[20], SYMBOL) == 20.0
+    assert panel.last_close(D[200], SYMBOL) == float(n - 1)
+    with pytest.raises(KeyError):
+        panel.last_close(D[5], SYMBOL)
+    with pytest.raises(KeyError):
+        panel.last_close(D[20], "999999")
+
+
+def test_bar_prev_close_adjusted_on_ex_date(tmp_path: Path) -> None:
+    bars = make_bars(SYMBOL, D[:3], [10.0, 10.0, 8.0], [1.0, 1.0, 1.25])
+    panel = _panel(tmp_path, [bars], st_history=make_st_history([(SYMBOL, D[2], None)]))
+    first = panel.bar(D[0], SYMBOL)
+    assert first == Bar(open=10.0, close=10.0, prev_close=10.0, factor_ratio=1.0, is_st=False)
+    ex_day = panel.bar(D[2], SYMBOL)
+    assert ex_day == Bar(open=8.0, close=8.0, prev_close=8.0, factor_ratio=1.25, is_st=True)
+    assert panel.bar(D[1], SYMBOL) == Bar(10.0, 10.0, 10.0, 1.0, False)
+    assert panel.bar(D[3], SYMBOL) is None
+
+
+def test_bar_prev_close_uses_history_before_start(tmp_path: Path) -> None:
+    closes = [10.0 + i for i in range(10)]
+    panel = _panel(tmp_path, [make_bars(SYMBOL, D[:10], closes)], start=D[5], end=D[9])
+    bar = panel.bar(D[5], SYMBOL)
+    assert bar is not None
+    assert bar.prev_close == 14.0
+    assert panel.bar(D[4], SYMBOL) is None
+    assert panel.snapshot(D[4]).empty
+    assert panel.last_close(D[7], SYMBOL) == 17.0
+
+
+def test_dividend_cut_and_consecutive_years(tmp_path: Path) -> None:
+    cash = {2016: 0.5, 2017: 0.5, 2018: 0.5, 2019: 0.5, 2020: 0.3}
+    div = make_dividends(
+        SYMBOL, [(fy, date(fy + 1, 3, 30), date(fy + 1, 6, 1), c) for fy, c in cash.items()]
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    snap = panel.snapshot(date(2021, 3, 31))
+    assert int(cast(int, snap.at[SYMBOL, "dividend_years"])) == 5
+    assert _b(snap, SYMBOL, "dividend_cut")
+    # 2020 年度分红公告日当天尚不可见：只有 4 年，且无下调
+    before = panel.snapshot(date(2021, 3, 30))
+    assert int(cast(int, before.at[SYMBOL, "dividend_years"])) == 4
+    assert not _b(before, SYMBOL, "dividend_cut")
+
+
+def test_dividend_years_run_broken_by_gap_or_zero_cash(tmp_path: Path) -> None:
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2016, date(2017, 3, 30), date(2017, 6, 1), 0.5),
+            (2017, date(2018, 3, 30), date(2018, 6, 1), 0.5),
+            # 2018 年无分红（缺失），2019、2020 恢复
+            (2019, date(2020, 3, 30), date(2020, 6, 1), 0.5),
+            (2020, date(2021, 3, 30), date(2021, 6, 1), 0.6),
+            # 同一财年多笔（中期 + 期末）合并计算
+            (2020, date(2021, 3, 30), date(2021, 7, 1), 0.1),
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    snap = panel.snapshot(date(2021, 4, 1))
+    assert int(cast(int, snap.at[SYMBOL, "dividend_years"])) == 2
+    assert not _b(snap, SYMBOL, "dividend_cut")  # 0.7 > 0.5
+    assert _f(snap, SYMBOL, "dividend_yield") == pytest.approx(0.07)
+
+
+def test_roe_avg3_needs_three_announced_annual_reports(tmp_path: Path) -> None:
+    def annual(year: int, roe: float) -> dict[str, object]:
+        return {
+            "report_period": date(year, 12, 31),
+            "announce_date": date(year + 1, 4, 20),
+            "roe": roe,
+        }
+
+    fin = make_financials(
+        SYMBOL,
+        [
+            annual(2018, 0.2),
+            annual(2019, 0.3),
+            annual(2020, 0.1),
+            annual(2021, 0.9),
+            # 季报不计入
+            {
+                "report_period": date(2020, 9, 30),
+                "announce_date": date(2020, 10, 28),
+                "roe": 5.0,
+            },
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], financials=[fin])
+    assert math.isnan(_f(panel.snapshot(date(2021, 4, 20)), SYMBOL, "roe_avg3"))
+    assert _f(panel.snapshot(date(2021, 4, 21)), SYMBOL, "roe_avg3") == pytest.approx(0.2)
+    assert _f(panel.snapshot(date(2022, 4, 20)), SYMBOL, "roe_avg3") == pytest.approx(0.2)
+    assert _f(panel.snapshot(date(2022, 4, 21)), SYMBOL, "roe_avg3") == pytest.approx(1.3 / 3)
+
+
+def test_payout_ratio(tmp_path: Path) -> None:
+    def case(symbol: str, eps: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+        div = make_dividends(symbol, [(2020, date(2021, 3, 30), date(2021, 6, 1), 0.5)])
+        fin = make_financials(
+            symbol,
+            [{"report_period": date(2020, 12, 31), "announce_date": date(2021, 4, 20), "eps": eps}],
+        )
+        return div, fin
+
+    a_div, a_fin = case("600000", 1.0)
+    b_div, b_fin = case("600001", -0.5)
+    c_div, c_fin = case("600002", 0.0)
+    panel = _panel(
+        tmp_path,
+        [_flat("600000"), _flat("600001"), _flat("600002")],
+        dividends=[a_div, b_div, c_div],
+        financials=[a_fin, b_fin, c_fin],
+    )
+    # 年报尚未公告：空
+    for day in (date(2021, 4, 1), date(2021, 4, 20)):
+        assert math.isnan(_f(panel.snapshot(day), "600000", "payout_ratio"))
+    after = panel.snapshot(date(2021, 4, 21))
+    assert _f(after, "600000", "payout_ratio") == pytest.approx(0.5)
+    assert math.isnan(_f(after, "600001", "payout_ratio"))
+    assert math.isnan(_f(after, "600002", "payout_ratio"))
+
+
+def test_payout_ratio_needs_annual_report_of_the_dividend_fiscal_year(tmp_path: Path) -> None:
+    div = make_dividends(SYMBOL, [(2020, date(2021, 3, 30), date(2021, 6, 1), 0.5)])
+    fin = make_financials(
+        SYMBOL,
+        [
+            {"report_period": date(2019, 12, 31), "announce_date": date(2020, 4, 20), "eps": 1.0},
+            {"report_period": date(2020, 9, 30), "announce_date": date(2020, 10, 28), "eps": 0.8},
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div], financials=[fin])
+    assert math.isnan(_f(panel.snapshot(date(2021, 4, 21)), SYMBOL, "payout_ratio"))
+
+
+def test_avg_amount_60d(tmp_path: Path) -> None:
+    n = 100
+    closes = [10.0 + i for i in range(n)]
+    panel = _panel(tmp_path, [make_bars(SYMBOL, D[:n], closes)])
+    assert math.isnan(_f(panel.snapshot(D[58]), SYMBOL, "avg_amount_60d"))
+    expected = sum(closes[11:71]) / 60 * 1_000_000
+    assert _f(panel.snapshot(D[70]), SYMBOL, "avg_amount_60d") == pytest.approx(expected)
+
+
+def test_is_st_interval_boundaries(tmp_path: Path) -> None:
+    st = make_st_history(
+        [
+            (SYMBOL, date(2020, 8, 10), date(2020, 9, 10)),
+            (SYMBOL, date(2021, 12, 1), None),
+        ]
+    )
+    panel = _panel(tmp_path, [_flat(), _flat("600001")], st_history=st)
+    expected = {
+        date(2020, 8, 7): False,
+        date(2020, 8, 10): True,
+        date(2020, 9, 10): True,
+        date(2020, 9, 11): False,
+        date(2021, 11, 30): False,
+        date(2021, 12, 1): True,
+        date(2022, 3, 1): True,
+    }
+    for day, flag in expected.items():
+        snap = panel.snapshot(day)
+        assert _b(snap, SYMBOL, "is_st") is flag, day
+        assert not _b(snap, "600001", "is_st")
+        bar = panel.bar(day, SYMBOL)
+        assert bar is not None
+        assert bar.is_st is flag
+
+
+def test_delisted_on(tmp_path: Path) -> None:
+    delist = date(2021, 5, 10)
+    saturday = date(2021, 5, 15)
+    sec = make_securities(
+        [
+            ("600002", "sh_main", date(2010, 1, 1), delist),
+            ("600001", "sh_main", date(2010, 1, 1), delist),
+            ("600000", "sh_main", date(2010, 1, 1), None),
+            ("600003", "sh_main", date(2010, 1, 1), saturday),
+        ]
+    )
+    bars = [_flat(s) for s in ("600000", "600001", "600002", "600003")]
+    panel = _panel(tmp_path, bars, securities=sec)
+    assert panel.delisted_on(delist) == ["600001", "600002"]
+    assert panel.delisted_on(date(2021, 5, 11)) == []
+    assert panel.delisted_on(saturday) == []  # 非交易日不报告
+
+
+def test_industry_listed_years_and_missing_industry(tmp_path: Path) -> None:
+    ind = make_industries([(SYMBOL, "银行", True)])
+    panel = _panel(tmp_path, [_flat(), _flat("600001")], industries=ind)
+    day = date(2021, 4, 1)
+    snap = panel.snapshot(day)
+    assert snap.at[SYMBOL, "industry"] == "银行"
+    assert _b(snap, SYMBOL, "is_financial")
+    assert snap.at["600001", "industry"] == ""
+    assert not _b(snap, "600001", "is_financial")
+    assert _f(snap, SYMBOL, "listed_years") == pytest.approx((day - date(2010, 1, 1)).days / 365.25)
+
+
+def test_board_outside_universe_excluded(tmp_path: Path) -> None:
+    sec = make_securities(
+        [
+            (SYMBOL, "sh_main", date(2010, 1, 1), None),
+            ("300001", "chinext", date(2010, 1, 1), None),
+        ]
+    )
+    panel = _panel(tmp_path, [_flat(), _flat("300001")], securities=sec)
+    snap = panel.snapshot(date(2021, 4, 1))
+    assert list(snap.index) == [SYMBOL]
+    assert panel.bar(date(2021, 4, 1), "300001") is None
+
+
+def test_snapshot_contract_and_range(tmp_path: Path) -> None:
+    panel = _panel(tmp_path, [_flat(), _flat("600001")], start=D[10], end=D[300])
+    snap = panel.snapshot(D[100])
+    expected = make_snapshot({"x": {}})
+    assert list(snap.columns) == list(expected.columns)
+    assert snap.index.name == "symbol"
+    assert list(snap.index) == [SYMBOL, "600001"]
+    for col in expected.columns:
+        if col == "industry":
+            continue
+        assert snap[col].dtype == expected[col].dtype, col
+    for empty in (panel.snapshot(D[5]), panel.snapshot(D[301]), panel.snapshot(date(2021, 1, 2))):
+        assert empty.empty
+        assert list(empty.columns) == list(expected.columns)
+        assert empty.index.name == "symbol"
+
+
+def test_bars_after_end_are_ignored(tmp_path: Path) -> None:
+    panel = _panel(tmp_path, [_flat()], end=D[400])
+    assert not panel.snapshot(D[400]).empty
+    assert panel.snapshot(D[450]).empty
+    assert panel.bar(D[450], SYMBOL) is None
+    assert panel.last_close(D[450], SYMBOL) == 10.0

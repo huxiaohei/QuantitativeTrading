@@ -1,16 +1,29 @@
 """测试辅助：假数据与默认配置。"""
 
 from collections.abc import Mapping, Sequence
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 
-from qt.config import CostsConfig, RiskConfig, StrategyConfig, UniverseConfig, load_config
-from qt.data.schema import Table, empty_frame
+from qt.config import (
+    AppConfig,
+    CostsConfig,
+    RiskConfig,
+    StrategyConfig,
+    UniverseConfig,
+    load_config,
+)
+from qt.data.schema import SCHEMAS, Table, empty_frame
+from qt.data.store import ParquetStore
 from qt.models import BuyCandidate, Position
 
 _ROOT = Path(__file__).resolve().parent.parent
+
+
+def default_app_config() -> AppConfig:
+    """返回 config/default.yaml 对应的完整配置。"""
+    return load_config(_ROOT / "config" / "default.yaml")
 
 
 def default_costs() -> CostsConfig:
@@ -186,3 +199,125 @@ class FakeSource:
         self.calls.append(("benchmark", (code, start, end)))
         df = self._get(Table.BENCHMARKS)
         return _by_range(df[df["code"] == code].reset_index(drop=True), "day", start, end)
+
+
+def weekdays(start: date, n: int) -> list[date]:
+    """从 start 起的连续 n 个工作日（周一至周五），测试里当作交易日。"""
+    out: list[date] = []
+    day = start
+    while len(out) < n:
+        if day.weekday() < 5:
+            out.append(day)
+        day += timedelta(days=1)
+    return out
+
+
+def _ts(values: Sequence[date | None]) -> pd.Series:
+    """日期列表转 datetime64[ns] 列，None 变 NaT。"""
+    return pd.Series(
+        [pd.NaT if v is None else pd.Timestamp(v) for v in values], dtype="datetime64[ns]"
+    )
+
+
+def make_securities(rows: Sequence[tuple[str, str, date, date | None]]) -> pd.DataFrame:
+    """构造 SECURITIES 表；每行为 (symbol, board, list_date, delist_date)。"""
+    return pd.DataFrame(
+        {
+            "symbol": pd.Series([r[0] for r in rows], dtype="str"),
+            "name": pd.Series([f"股票{r[0]}" for r in rows], dtype="str"),
+            "board": pd.Series([r[1] for r in rows], dtype="str"),
+            "list_date": _ts([r[2] for r in rows]),
+            "delist_date": _ts([r[3] for r in rows]),
+        }
+    )
+
+
+def make_dividends(symbol: str, rows: Sequence[tuple[int, date, date, float]]) -> pd.DataFrame:
+    """构造 DIVIDENDS 表；每行为 (fiscal_year, announce_date, ex_date, cash_per_share)。"""
+    return pd.DataFrame(
+        {
+            "symbol": pd.Series([symbol] * len(rows), dtype="str"),
+            "fiscal_year": pd.Series([r[0] for r in rows], dtype="int64"),
+            "announce_date": _ts([r[1] for r in rows]),
+            "ex_date": _ts([r[2] for r in rows]),
+            "cash_per_share": pd.Series([r[3] for r in rows], dtype="float64"),
+        }
+    )
+
+
+_FINANCIAL_DEFAULTS: dict[str, float] = {
+    "roe": 0.10,
+    "net_profit": 1e9,
+    "net_profit_yoy": 0.10,
+    "debt_ratio": 0.50,
+    "eps": 1.0,
+}
+
+
+def make_financials(symbol: str, rows: Sequence[Mapping[str, object]]) -> pd.DataFrame:
+    """构造 FINANCIALS 表；每行必须给 report_period 与 announce_date，其余列有默认值。"""
+
+    def num(row: Mapping[str, object], col: str) -> float:
+        return float(str(row.get(col, _FINANCIAL_DEFAULTS[col])))
+
+    def when(row: Mapping[str, object], col: str) -> date:
+        value = row[col]
+        assert isinstance(value, date)
+        return value
+
+    data: dict[str, pd.Series] = {
+        "symbol": pd.Series([symbol] * len(rows), dtype="str"),
+        "report_period": _ts([when(r, "report_period") for r in rows]),
+        "announce_date": _ts([when(r, "announce_date") for r in rows]),
+    }
+    for col in _FINANCIAL_DEFAULTS:
+        data[col] = pd.Series([num(r, col) for r in rows], dtype="float64")
+    return pd.DataFrame(data)[list(SCHEMAS[Table.FINANCIALS])]
+
+
+def make_industries(rows: Sequence[tuple[str, str, bool]]) -> pd.DataFrame:
+    """构造 INDUSTRIES 表；每行为 (symbol, industry, is_financial)。"""
+    return pd.DataFrame(
+        {
+            "symbol": pd.Series([r[0] for r in rows], dtype="str"),
+            "industry": pd.Series([r[1] for r in rows], dtype="str"),
+            "is_financial": pd.Series([r[2] for r in rows], dtype="bool"),
+        }
+    )
+
+
+def make_st_history(rows: Sequence[tuple[str, date, date | None]]) -> pd.DataFrame:
+    """构造 ST_HISTORY 表；每行为 (symbol, start, end)，end 为 None 表示仍在 ST。"""
+    return pd.DataFrame(
+        {
+            "symbol": pd.Series([r[0] for r in rows], dtype="str"),
+            "start": _ts([r[1] for r in rows]),
+            "end": _ts([r[2] for r in rows]),
+        }
+    )
+
+
+def populate_store(
+    store: ParquetStore,
+    *,
+    securities: pd.DataFrame | None = None,
+    bars: Sequence[pd.DataFrame] = (),
+    dividends: Sequence[pd.DataFrame] = (),
+    financials: Sequence[pd.DataFrame] = (),
+    industries: pd.DataFrame | None = None,
+    st_history: pd.DataFrame | None = None,
+) -> None:
+    """把测试表写入 store；bars、dividends、financials 为每只股票一个 DataFrame。"""
+    if securities is not None:
+        store.write(Table.SECURITIES, securities)
+    if industries is not None:
+        store.write(Table.INDUSTRIES, industries)
+    if st_history is not None:
+        store.write(Table.ST_HISTORY, st_history)
+    for table, frames in (
+        (Table.BARS, bars),
+        (Table.DIVIDENDS, dividends),
+        (Table.FINANCIALS, financials),
+    ):
+        for frame in frames:
+            store.write(table, frame, symbol=str(frame["symbol"].iloc[0]))
