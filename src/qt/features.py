@@ -450,10 +450,8 @@ class FeaturePanel:
         raise KeyError(f"{symbol} 在 {day} 及之前没有行情")
 
     def delisted_on(self, day: date) -> list[str]:
-        """day 当天退市的股票（升序）；非交易日返回空列表。"""
+        """退市日等于 day 的股票（升序）；day 可以是非交易日，由调用方逐日扫描。"""
         _require_date(day)
-        if not self._calendar.is_trading_day(day):
-            return []
         return list(self._delistings.get(day, []))
 
 

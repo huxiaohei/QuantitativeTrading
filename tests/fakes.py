@@ -1,6 +1,7 @@
 """测试辅助：假数据与默认配置。"""
 
 from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from qt.config import (
 )
 from qt.data.schema import SCHEMAS, Table, empty_frame
 from qt.data.store import ParquetStore
-from qt.models import BuyCandidate, Position
+from qt.models import BuyCandidate, ExitReason, Position, SellSignal
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -130,6 +131,54 @@ def make_bars(
             "adj_factor": pd.Series(factors, dtype="float64"),
         }
     )
+
+
+def make_ohlc_bars(
+    symbol: str,
+    days: Sequence[date],
+    opens: Sequence[float],
+    closes: Sequence[float],
+    adj_factors: Sequence[float] | None = None,
+) -> pd.DataFrame:
+    """构造开盘价与收盘价可以不同的 BARS 表（回测撮合用开盘价，计值用收盘价）。"""
+    bars = make_bars(symbol, days, closes, adj_factors)
+    bars["open"] = pd.Series([float(o) for o in opens], dtype="float64")
+    return bars
+
+
+class ScriptedStrategy:
+    """脚本化桩策略：只在配置的日期给出买入候选或卖出信号。
+
+    buys: 日期 -> 当日买入候选；sells: 日期 -> [(股票, 卖出原因)]，仅当该股票当时持仓才发信号。
+    held_seen 记录每次 buy_candidates 收到的 held 参数，供测试核对。
+    """
+
+    name = "scripted"
+
+    def __init__(
+        self,
+        buys: Mapping[date, Sequence[BuyCandidate]] | None = None,
+        sells: Mapping[date, Sequence[tuple[str, ExitReason]]] | None = None,
+    ) -> None:
+        self._buys = buys or {}
+        self._sells = sells or {}
+        self.held_seen: list[tuple[date, frozenset[str]]] = []
+
+    def buy_candidates(
+        self, day: date, snapshot: pd.DataFrame, held: AbstractSet[str]
+    ) -> list[BuyCandidate]:
+        self.held_seen.append((day, frozenset(held)))
+        return [c for c in self._buys.get(day, ()) if c.symbol not in held]
+
+    def sell_signals(
+        self, day: date, snapshot: pd.DataFrame, positions: Sequence[Position]
+    ) -> list[SellSignal]:
+        owned = {p.symbol for p in positions}
+        return [
+            SellSignal(symbol, day, reason, "测试卖出")
+            for symbol, reason in self._sells.get(day, ())
+            if symbol in owned
+        ]
 
 
 def _by_symbol(df: pd.DataFrame, symbol: str) -> pd.DataFrame:

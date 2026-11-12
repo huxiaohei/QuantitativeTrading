@@ -406,7 +406,7 @@ def test_delisted_on(tmp_path: Path) -> None:
     panel = _panel(tmp_path, bars, securities=sec)
     assert panel.delisted_on(delist) == ["600001", "600002"]
     assert panel.delisted_on(date(2021, 5, 11)) == []
-    assert panel.delisted_on(saturday) == []  # 非交易日不报告
+    assert panel.delisted_on(saturday) == ["600003"]  # 非交易日也如实返回
 
 
 def test_industry_listed_years_and_missing_industry(tmp_path: Path) -> None:
