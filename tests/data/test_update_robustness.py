@@ -86,15 +86,91 @@ def test_interrupt_in_symbol_loop_finalizes_and_propagates(tmp_path: Path) -> No
     _no_placeholder(store)
 
 
-def test_dropped_placeholder_symbol_is_still_reported(tmp_path: Path) -> None:
-    store = ParquetStore(tmp_path)
+def _placeholder_source(
+    with_bars: bool, listed_bars: bool = True, source_cls: type[FakeSource] = FakeSource
+) -> FakeSource:
     secs = make_securities(
         [("600000", "sh_main", LISTED, None), ("600009", "sh_main", LISTED, PLACEHOLDER)]
     )
-    source = LookupSource({}, trade_days=make_trade_days(DAYS), securities=secs)
-    report = update_all(source, store, CFG, AS_OF)
-    assert report.failed["600009"].startswith("退市日期缺失")
+    frames: list[pd.DataFrame] = []
+    if listed_bars:
+        frames.append(make_bars("600000", DAYS, [10.0] * 10))
+    if with_bars:
+        frames.append(make_bars("600009", DAYS[:4], [3.0] * 4))
+    tables: dict[str, pd.DataFrame] = {}
+    if frames:
+        tables["bars"] = pd.concat(frames)
+    return source_cls(trade_days=make_trade_days(DAYS), securities=secs, **tables)
+
+
+def _bars_requested(source: FakeSource) -> list[str]:
+    return [str(args[0]) for name, args in source.calls if name == "bars"]
+
+
+def test_placeholder_symbol_with_source_bars_is_downloaded_and_finalized(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    for _ in range(2):  # 第二次运行结果相同
+        report = update_all(_placeholder_source(with_bars=True), store, CFG, AS_OF)
+        assert "600009" not in report.failed
+        assert store.last_day(Table.BARS, "600009") == DAYS[3]
+        row = store.read(Table.SECURITIES).set_index("symbol").loc["600009"]
+        assert bool(row["delist_date"] == pd.Timestamp(DAYS[3]) + pd.Timedelta(days=1))
+        _no_placeholder(store)
+
+
+def test_placeholder_symbol_without_bars_is_dropped_once_and_retried_every_run(
+    tmp_path: Path,
+) -> None:
+    store = ParquetStore(tmp_path)
+    for _ in range(2):
+        source = _placeholder_source(with_bars=False)
+        report = update_all(source, store, CFG, AS_OF)
+        assert "600009" in _bars_requested(source)  # 每次运行都重新请求
+        assert store.read(Table.SECURITIES)["symbol"].tolist() == ["600000"]
+        message = report.failed["600009"]
+        assert message.count("退市日期缺失") == 1
+        assert "无日线数据" in message  # 两个事实都保留
+        _no_placeholder(store)
+
+
+def test_interrupt_finalizes_reached_placeholder_symbols_only(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    secs = make_securities(
+        [
+            ("600001", "sh_main", LISTED, PLACEHOLDER),  # 中断前已补到日线
+            ("600002", "sh_main", LISTED, PLACEHOLDER),  # 第 2 次 bars() 调用被中断，没到
+        ]
+    )
+    source = InterruptingSource(
+        2,
+        trade_days=make_trade_days(DAYS),
+        securities=secs,
+        bars=pd.concat([make_bars("600001", DAYS[:4], [3.0] * 4)]),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        update_all(source, store, CFG, AS_OF)
+    stored = store.read(Table.SECURITIES).set_index("symbol")
+    assert stored.index.tolist() == ["600001"]
+    assert bool(stored.loc["600001", "delist_date"] == pd.Timestamp(DAYS[3]) + pd.Timedelta(days=1))
     _no_placeholder(store)
+
+
+def test_symbols_run_keeps_previously_finalized_placeholder_symbol(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    update_all(_placeholder_source(with_bars=True), store, CFG, AS_OF)
+    source = _placeholder_source(with_bars=True)
+    report = update_all(source, store, CFG, AS_OF, symbols=["600000"])
+    assert "600009" not in _bars_requested(source)  # 没被尝试
+    assert "600009" not in report.failed
+    assert store.read(Table.SECURITIES)["symbol"].tolist() == ["600000", "600009"]
+    _no_placeholder(store)
+
+
+def test_symbols_run_does_not_report_unattempted_dropped_symbol(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    report = update_all(_placeholder_source(with_bars=False), store, CFG, AS_OF, symbols=["600000"])
+    assert "600009" not in report.failed
+    assert store.read(Table.SECURITIES)["symbol"].tolist() == ["600000"]
 
 
 def test_benchmarks_after_as_of_are_dropped(tmp_path: Path) -> None:

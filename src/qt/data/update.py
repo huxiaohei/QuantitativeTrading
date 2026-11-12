@@ -11,7 +11,7 @@ import pandas as pd
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig
 from qt.data.akshare_convert import build_industries
-from qt.data.delist import finalize_delist_dates, finalize_securities
+from qt.data.delist import finalize_securities
 from qt.data.schema import Table
 from qt.data.source import DataSource
 from qt.data.store import ParquetStore
@@ -80,12 +80,12 @@ class UpdateReport:
 
 def count_no_bars(failed: Mapping[str, str]) -> int:
     """failed 中“已退市且取不到日线”的股票数。"""
-    return sum(1 for message in failed.values() if message.startswith(NO_BARS_PREFIX))
+    return sum(1 for message in failed.values() if NO_BARS_PREFIX in message)
 
 
 def count_delist_missing(failed: Mapping[str, str]) -> int:
     """failed 中“退市日期缺失而被丢弃”的证券数。"""
-    return sum(1 for message in failed.values() if message.startswith(DELIST_MISSING_PREFIX))
+    return sum(1 for message in failed.values() if DELIST_MISSING_PREFIX in message)
 
 
 class _NoBarsError(Exception):
@@ -166,20 +166,21 @@ def merge_st_history(stored: pd.DataFrame, current: pd.DataFrame, as_of: date) -
 
 def _refresh_shared(
     source: DataSource, store: ParquetStore, cfg: AppConfig, as_of: date
-) -> list[str]:
+) -> pd.DataFrame:
     """每次运行刷新一次的共享表；任何一张失败都抛 SharedTableError。
 
-    securities 写盘前就按已存储的日线定稿退市日期：磁盘上的表任何时候都不含未定稿的日期
-    或占位值。返回因退市日期缺失而丢弃的代码。
+    返回数据源本次给出的 securities（已按配置板块过滤、退市日期未定稿）：下载范围由它决定，
+    而不是由磁盘上的表决定。写盘的 securities 先按已存储的日线定稿退市日期：磁盘上的表任何
+    时候都不含未定稿的日期或占位值；退市日期缺失且暂无日线的证券暂不写入（本次运行可能补到日线）。
     """
-    dropped: list[str] = []
+    universe: list[pd.DataFrame] = []
     _shared("trade_days", lambda: store.write(Table.TRADE_DAYS, source.trade_days()))
 
     def write_securities() -> None:
         secs = source.securities()
-        final, missing = finalize_securities(secs[secs["board"].isin(cfg.universe.boards)], store)
-        dropped.extend(missing)
-        store.write(Table.SECURITIES, final)
+        in_boards = secs[secs["board"].isin(cfg.universe.boards)].reset_index(drop=True)
+        universe.append(in_boards)
+        store.write(Table.SECURITIES, finalize_securities(in_boards, store)[0])
 
     _shared("securities", write_securities)
 
@@ -202,7 +203,7 @@ def _refresh_shared(
         store.write(Table.BENCHMARKS, merged)
 
     _shared("benchmarks", write_benchmarks)
-    return dropped
+    return universe[0]
 
 
 def _record(failed: dict[str, str], symbol: str, message: str) -> None:
@@ -351,9 +352,8 @@ def update_all(
     """
     if isinstance(source, AsOfAware):
         source.set_as_of(as_of)
-    dropped_early = _refresh_shared(source, store, cfg, as_of)
-    secs = store.read(Table.SECURITIES)
-    in_universe = secs[secs["board"].isin(cfg.universe.boards)].set_index("symbol")
+    source_secs = _refresh_shared(source, store, cfg, as_of)
+    in_universe = source_secs.set_index("symbol")
     wanted = list(in_universe.index) if symbols is None else list(dict.fromkeys(symbols))
 
     failed: dict[str, str] = {}
@@ -392,13 +392,15 @@ def update_all(
                 progress("日线", i, len(wanted))
 
     finally:
-        # 即使被中断，也让 securities 反映已经写入的日线
-        late_dropped = finalize_delist_dates(store)
+        # 即使被中断，也按数据源本次的证券表和现已存储的日线重新定稿 securities
+        final, dropped = finalize_securities(source_secs, store)
+        store.write(Table.SECURITIES, final)
 
-    for symbol in [*dropped_early, *late_dropped]:
-        failed[symbol] = (
-            f"{DELIST_MISSING_PREFIX}：退市表没有退市日期且无日线，已从 securities 删除"
-        )
+    attempted = set(wanted)
+    for symbol in dropped:
+        if symbol in attempted:  # 本次没有尝试下载的不记失败
+            message = f"{DELIST_MISSING_PREFIX}：退市表没有退市日期且无日线，未写入 securities"
+            failed[symbol] = f"{message}；{failed[symbol]}" if symbol in failed else message
     return UpdateReport(updated=updated, skipped=skipped, failed=failed, problems=problems)
 
 
