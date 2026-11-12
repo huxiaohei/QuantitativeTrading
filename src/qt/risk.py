@@ -41,7 +41,8 @@ class RiskEvent:
 class Rejection:
     """被拒绝的买入候选。
 
-    rule 取值：paused、cooldown、max_positions、industry_cap、lot_too_expensive、no_cash。
+    rule 取值：paused、already_held、cooldown、max_positions、industry_cap、
+    lot_too_expensive、no_cash。
     """
 
     candidate: BuyCandidate
@@ -60,6 +61,7 @@ class RiskManager:
         self._warned = False
         self._paused = False
         self._pause_day: date | None = None
+        self._pause_drawdown = 0.0
         self._pause_days = cfg.pause_days
         self._exits: dict[str, date] = {}
 
@@ -98,6 +100,7 @@ class RiskManager:
         if drawdown <= -self._cfg.pause_drawdown + _EPS:
             self._paused = True
             self._pause_day = day
+            self._pause_drawdown = drawdown
             self._pause_days = self._cfg.pause_days
             self._warned = True
             return [
@@ -130,7 +133,11 @@ class RiskManager:
         return self._reset_after_resume(day, nav)
 
     def extend_pause(self, days: int) -> None:
-        """手动延长暂停天数（交易日）。"""
+        """手动延长暂停天数（交易日）；days 须为正，且当前必须处于暂停状态。"""
+        if not self._paused:
+            raise ValueError("当前未处于暂停状态，无法延长")
+        if days <= 0:
+            raise ValueError(f"延长天数必须为正数，收到 {days}")
         self._pause_days += days
 
     def note_exit(self, symbol: str, day: date, reason: ExitReason) -> None:
@@ -168,6 +175,9 @@ class RiskManager:
             value = p.shares * closes[p.symbol] if p.symbol in closes else p.cost
             industry_mv[p.industry] = industry_mv.get(p.industry, 0.0) + value
         count = len(positions) + len(pending_buys)
+        held: dict[str, str] = {p.symbol: "已在持仓中" for p in positions}
+        for o in pending_buys:
+            held.setdefault(o.symbol, "已有待成交买单")
         free_cash = cash
         for o in pending_buys:
             if o.symbol in closes:
@@ -178,7 +188,7 @@ class RiskManager:
 
         for c in candidates:
             rule, message, shares = self._decide(
-                c, day, closes, budget, industry_limit, industry_mv, free_cash, count
+                c, day, closes, budget, industry_limit, industry_mv, free_cash, count, held
             )
             if rule is not None:
                 rejections.append(Rejection(c, rule, message))
@@ -186,6 +196,7 @@ class RiskManager:
             price = closes.get(c.symbol, c.close)
             orders.append(Order(c.symbol, Side.BUY, shares, day, c.reason, None))
             count += 1
+            held[c.symbol] = "本次已通过买入"
             free_cash -= self._costs.buy_cost(price, shares)
             industry_mv[c.industry] = industry_mv.get(c.industry, 0.0) + shares * price
         return orders, rejections
@@ -200,10 +211,20 @@ class RiskManager:
         industry_mv: Mapping[str, float],
         free_cash: float,
         count: int,
+        held: Mapping[str, str],
     ) -> tuple[str | None, str, int]:
         """对单个候选依次检查各规则，返回 (拒绝规则或 None, 说明, 股数)。"""
         if not self.buying_allowed():
-            return "paused", "暂停买入期间不开新仓", 0
+            assert self._pause_day is not None
+            return (
+                "paused",
+                f"暂停买入期间不开新仓：{self._pause_day} 起暂停，"
+                f"触发时回撤 {self._pause_drawdown:.2%}",
+                0,
+            )
+        case = held.get(c.symbol)
+        if case is not None:
+            return "already_held", f"{c.symbol} {case}，不重复买入", 0
         elapsed = self._in_cooldown(c.symbol, day)
         if elapsed is not None:
             return (

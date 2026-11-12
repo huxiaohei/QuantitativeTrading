@@ -231,3 +231,67 @@ def test_delisted_no_cooldown_and_zero_days_disables() -> None:
     mgr.note_exit("A", DAYS[0], ExitReason.STOP_LOSS)
     orders, _ = mgr.size_buys(DAYS[1], [make_candidate("A")], 150_000, 150_000, [], {})
     assert len(orders) == 1
+
+
+def test_already_held_in_positions() -> None:
+    held = [make_position("A", 100, 1000, industry="X")]
+    orders, rej = _mgr().size_buys(
+        DAYS[0], [make_candidate("A", industry="X")], 150_000, 150_000, held, {"A": 10.0}
+    )
+    assert orders == [] and [r.rule for r in rej] == ["already_held"]
+    assert "A" in rej[0].message and "持仓" in rej[0].message
+
+
+def test_already_held_in_pending_buys() -> None:
+    pend = [Order("A", Side.BUY, 100, DAYS[0], "x")]
+    orders, rej = _mgr().size_buys(DAYS[1], [make_candidate("A")], 150_000, 150_000, [], {}, pend)
+    assert orders == [] and [r.rule for r in rej] == ["already_held"]
+    assert "待成交" in rej[0].message
+
+
+def test_duplicate_candidate_in_one_call() -> None:
+    cands = [make_candidate("A"), make_candidate("A")]
+    orders, rej = _mgr().size_buys(DAYS[0], cands, 150_000, 150_000, [], {})
+    assert [o.symbol for o in orders] == ["A"]
+    assert [r.rule for r in rej] == ["already_held"]
+    assert "本次" in rej[0].message
+
+
+def test_already_held_checked_before_cooldown_after_paused() -> None:
+    mgr = _mgr()
+    mgr.note_exit("A", DAYS[0], ExitReason.STOP_LOSS)
+    held = [make_position("A", 100, 1000)]
+    _, rej = mgr.size_buys(DAYS[1], [make_candidate("A")], 150_000, 150_000, held, {"A": 10.0})
+    assert [r.rule for r in rej] == ["already_held"]
+    mgr.on_day_close(DAYS[1], 1.0)
+    mgr.on_day_close(DAYS[2], 0.8)
+    _, rej = mgr.size_buys(DAYS[3], [make_candidate("A")], 150_000, 150_000, held, {"A": 10.0})
+    assert [r.rule for r in rej] == ["paused"]
+
+
+def test_max_positions_limits_orders_in_one_call() -> None:
+    cands = [make_candidate(f"S{i}", industry=f"I{i}") for i in range(12)]
+    orders, rej = _mgr().size_buys(DAYS[0], cands, 1_000_000, 1_000_000, [], {})
+    assert len(orders) == 10
+    assert [r.rule for r in rej] == ["max_positions"] * 2
+
+
+def test_extend_pause_validation() -> None:
+    mgr = _mgr()
+    with pytest.raises(ValueError):
+        mgr.extend_pause(5)  # 未暂停
+    mgr.on_day_close(DAYS[0], 1.0)
+    mgr.on_day_close(DAYS[1], 0.8)
+    with pytest.raises(ValueError):
+        mgr.extend_pause(0)
+    with pytest.raises(ValueError):
+        mgr.extend_pause(-3)
+
+
+def test_paused_message_has_pause_day_and_drawdown() -> None:
+    mgr = _mgr()
+    mgr.on_day_close(DAYS[0], 1.0)
+    mgr.on_day_close(DAYS[1], 0.8)
+    _, rej = mgr.size_buys(DAYS[2], [make_candidate("A")], 150_000, 150_000, [], {})
+    assert str(DAYS[1]) in rej[0].message
+    assert "20.00%" in rej[0].message
