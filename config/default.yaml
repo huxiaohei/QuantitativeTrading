@@ -1,0 +1,42 @@
+universe:
+  boards: [sh_main, sz_main]      # 可选值另有 chinext；科创板、北交所不支持
+  min_listed_years: 3
+  min_avg_amount_60d: 50000000
+strategy:
+  min_dividend_yield: 0.04
+  max_price_position: 0.2
+  lookback_days: 250
+  min_dividend_years: 5
+  min_roe_avg3: 0.08
+  max_payout_ratio: 0.80
+  min_profit_yoy: -0.20
+  max_debt_ratio: 0.70
+  take_profit_mode: fixed          # fixed | trailing
+  take_profit_fixed: 0.12
+  trailing_activate: 0.10
+  trailing_drawdown: 0.08
+  stop_loss: 0.15
+  time_stop_days: 250
+  fundamental_profit_yoy: -0.30
+risk:
+  max_position_pct: 0.10
+  max_positions: 10
+  max_industry_pct: 0.30
+  warn_drawdown: 0.15
+  pause_drawdown: 0.20
+  pause_days: 60
+  cooldown_days: 60
+costs:
+  commission_rate: 0.00025
+  min_commission: 5.0
+  stamp_tax_rate: 0.0005
+  transfer_fee_rate: 0.00001
+  slippage: 0.001
+backtest:
+  initial_cash: 150000
+  data_start: 2009-01-01           # 财务和分红数据起点，满足"连续分红 5 年"
+  in_sample_start: 2015-01-01
+  in_sample_end: 2021-12-31
+  out_sample_start: 2022-01-01
+  buy_order_valid_days: 3
+  benchmarks: [H00300, "510880"]

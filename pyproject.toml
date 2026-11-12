@@ -1,0 +1,55 @@
+[project]
+name = "qt"
+version = "0.1.0"
+description = "A 股个人量化回测项目"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "akshare",
+    "duckdb",
+    "pyarrow",
+    "pandas",
+    "pydantic",
+    "pyyaml",
+    "typer",
+    "jinja2",
+    "matplotlib",
+]
+
+[project.scripts]
+qt = "qt.cli:app"
+
+[dependency-groups]
+dev = [
+    "pandas-stubs",
+    "types-PyYAML",
+    "pytest",
+    "ruff",
+    "pyright",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qt"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+include = ["src", "tests", "scripts"]
+pythonVersion = "3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["docs", ".superpowers"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ANN", "SIM", "RUF"]
+# 注释与文档字符串使用中文全角标点
+allowed-confusables = ["：", "，", "（", "）", "；", "、"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = ["error"]
