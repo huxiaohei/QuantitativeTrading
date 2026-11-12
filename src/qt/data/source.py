@@ -1,0 +1,26 @@
+"""数据源协议：真实数据源（AKShare）与测试假数据源都实现它。"""
+
+from datetime import date
+from typing import Protocol
+
+import pandas as pd
+
+
+class DataSource(Protocol):
+    """返回的 DataFrame 列与类型须符合 schema 中对应表的定义。"""
+
+    def trade_days(self) -> pd.DataFrame: ...
+
+    def securities(self) -> pd.DataFrame: ...
+
+    def bars(self, symbol: str, start: date, end: date) -> pd.DataFrame: ...
+
+    def dividends(self, symbol: str) -> pd.DataFrame: ...
+
+    def financials(self, symbol: str) -> pd.DataFrame: ...
+
+    def industries(self) -> pd.DataFrame: ...
+
+    def st_history(self) -> pd.DataFrame: ...
+
+    def benchmark(self, code: str, start: date, end: date) -> pd.DataFrame: ...
