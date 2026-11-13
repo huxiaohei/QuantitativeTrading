@@ -57,6 +57,7 @@ _SNAPSHOT_DEFAULTS: dict[str, object] = {
     "dividend_cut": False,
     "dividend_fy_total": 0.52,
     "dividend_prev_fy_total": 0.5,
+    "dividend_open_fy_total": 0.0,
     "roe_avg3": 0.12,
     "payout_ratio": 0.5,
     "profit_yoy": 0.05,

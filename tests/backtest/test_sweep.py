@@ -85,6 +85,7 @@ def test_override_unknown_path_raises(path: str) -> None:
         ("strategy.min_dividend_years", "7", 7),
         ("strategy.take_profit_mode", "trailing", "trailing"),
         ("universe.min_listed_years", "5", 5),
+        ("strategy.exclude_dividend_cut", "false", False),
     ],
 )
 def test_parse_param_coerces_by_field_type(path: str, raw: str, expected: object) -> None:
@@ -97,6 +98,15 @@ def test_parse_param_coerces_by_field_type(path: str, raw: str, expected: object
 def test_parse_param_splits_on_commas_in_order() -> None:
     name, values = parse_param(default_app_config(), "strategy.stop_loss=0.2, 0.1,0.15")
     assert (name, values) == ("strategy.stop_loss", [0.2, 0.1, 0.15])
+
+
+def test_parse_param_coerces_bool_field() -> None:
+    name, values = parse_param(default_app_config(), "strategy.exclude_dividend_cut=true,false")
+    assert name == "strategy.exclude_dividend_cut"
+    assert values == [True, False]
+    assert all(type(v) is bool for v in values)
+    with pytest.raises(ValueError, match=r"strategy\.exclude_dividend_cut"):
+        parse_param(default_app_config(), "strategy.exclude_dividend_cut=true,maybe")
 
 
 def test_override_invalid_literal_raises_naming_path() -> None:

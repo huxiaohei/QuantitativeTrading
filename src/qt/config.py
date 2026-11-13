@@ -47,6 +47,7 @@ class StrategyConfig(_Frozen):
     max_price_position: Share
     lookback_days: PositiveInt
     min_dividend_years: NonNegativeInt
+    exclude_dividend_cut: bool  # 为真时 dividend_cut 为真的股票不作为买入候选
     min_roe_avg3: float
     max_payout_ratio: PositiveFloat
     min_profit_yoy: float

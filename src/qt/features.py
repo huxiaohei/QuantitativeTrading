@@ -11,14 +11,20 @@
 Π(1 + 送转比例)，连乘范围是同一股票除权日在 [d 的除权日, day] 内的全部送转（含 d 自身的送转；
 除权日晚于 day 的送转不计，因为 day 的价格尚未反映它）。total(Y, day) 为财年 Y 中公告日 < day
 的各笔分红按当前股本口径的合计。
+当前分红水平 L(day) = max(total(Y*), total(Y*+1))，即"最近完整财年"与"当前财年已公告"两者中的
+较大者。
     - dividend_years：自 Y* 起向前、每年 total > 0 的连续财年数（Y* 无分红则为 0）；
-    - dividend_cut：total(Y*-1) > 0 且 total(Y*) 低于 total(Y*-1)（Y* 无分红也算下调）；
+    - dividend_cut：total(Y*-1) > 0 且 L 低于 total(Y*-1)（L 为 0 也算下调）。
+      后果：最近完整财年的下调，一旦当前财年已公告的分红回到上一年度的水平即解除；
+      下调仍要到被削减的财年在次年 9 月 1 日关闭时才被识别；
     - payout_ratio：Y* 的原始每股派息合计（不折算）/ Y* 年报每股收益
       （年报需在 day 前公告且 eps > 0）；
-    - dividend_yield：max(total(Y*), total(Y*+1)) / 收盘价，即"最近完整财年"与"当前财年已公告"
-      两者中的较大者；削减分红的公司要到被削减的财年关闭后才反映出来（与 dividend_cut 同样滞后）；
-    - dividend_fy_total、dividend_prev_fy_total：total(Y*) 与 total(Y*-1)，供卖出说明使用。
-未关闭财年的分红（如中期分红）只进入股息率，不进入前三项，避免只公告了部分分红就误判下调。
+    - dividend_yield：L / 收盘价；削减分红的公司要到被削减的财年关闭后才反映出来
+      （与 dividend_cut 同样滞后）；
+    - dividend_fy_total、dividend_prev_fy_total、dividend_open_fy_total：total(Y*)、total(Y*-1)
+      与 total(Y*+1)（没有则为 0），供卖出说明使用。
+未关闭财年的分红（如中期分红）只进入 L（股息率与下调判断），不进入 dividend_years 与
+payout_ratio，避免只公告了部分分红就误判连续年数或分红率。
 snapshot 与 bar 只是对预先算好的数据做切片与查表。
 """
 
@@ -46,6 +52,7 @@ SNAPSHOT_COLUMNS: list[str] = [
     "dividend_cut",
     "dividend_fy_total",
     "dividend_prev_fy_total",
+    "dividend_open_fy_total",
     "roe_avg3",
     "payout_ratio",
     "profit_yoy",
@@ -297,12 +304,15 @@ def _dividend_columns(keys: pd.DataFrame, dividends: pd.DataFrame) -> _DividendC
     upcoming = _state_at(state, visible, year + 1)
     total = np.nan_to_num(_floats(current["total"]))
     prev_total = np.nan_to_num(_floats(previous["total"]))
+    open_total = np.nan_to_num(_floats(upcoming["total"]))
+    # 当前分红水平 L = max(total(Y*), total(Y*+1))，与股息率的分子相同
+    level = np.maximum(total, open_total)
     return _DividendColumns(
         years=current["run"].fillna(0).to_numpy(dtype="int64"),
-        cut=(prev_total > 0) & (total < prev_total - _CUT_TOLERANCE),
+        cut=(prev_total > 0) & (level < prev_total - _CUT_TOLERANCE),
         fy_total=total,
         prev_fy_total=prev_total,
-        open_total=np.nan_to_num(_floats(upcoming["total"])),
+        open_total=open_total,
         raw_fy_total=np.nan_to_num(_floats(current["raw"])),
     )
 
@@ -414,6 +424,7 @@ def _compute_panel(
     p["dividend_cut"] = div.cut
     p["dividend_fy_total"] = div.fy_total
     p["dividend_prev_fy_total"] = div.prev_fy_total
+    p["dividend_open_fy_total"] = div.open_total
     annual = _annual_reports(financials)
     # 分红率按 Y* 自身的原始每股口径：每股收益是年报原值，若财年内有送转，两者股本口径可能不一致，
     # 此时分红率只是近似

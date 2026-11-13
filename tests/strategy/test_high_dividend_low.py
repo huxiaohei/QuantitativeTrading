@@ -3,6 +3,7 @@
 import math
 from datetime import date
 
+import pandas as pd
 import pytest
 
 from qt.config import StrategyConfig
@@ -125,6 +126,34 @@ def test_nan_metric_is_rejected_not_error() -> None:
 def test_any_nan_metric_rejects(column: str) -> None:
     snap = make_snapshot({"600000": {column: math.nan}})
     assert _strategy().buy_candidates(DAY, snap, set()) == []
+
+
+def _exclude_cut(enabled: bool) -> HighDividendLow:
+    cfg = default_strategy_config().model_copy(update={"exclude_dividend_cut": enabled})
+    return _strategy(cfg)
+
+
+def test_default_config_excludes_dividend_cut() -> None:
+    assert default_strategy_config().exclude_dividend_cut is True
+
+
+def test_dividend_cut_candidate_rejected_when_switch_on() -> None:
+    snap = make_snapshot({"600000": {"dividend_cut": True}, "600001": {}})
+    result = _exclude_cut(True).buy_candidates(DAY, snap, set())
+    assert [c.symbol for c in result] == ["600001"]
+
+
+def test_dividend_cut_candidate_accepted_when_switch_off() -> None:
+    snap = make_snapshot({"600000": {"dividend_cut": True}, "600001": {}})
+    result = _exclude_cut(False).buy_candidates(DAY, snap, set())
+    assert [c.symbol for c in result] == ["600000", "600001"]
+
+
+def test_missing_dividend_cut_flag_does_not_pass_as_no_cut() -> None:
+    snap = make_snapshot({"600000": {}, "600001": {}})
+    snap["dividend_cut"] = pd.Series([math.nan, False], index=snap.index, dtype="object")
+    result = _exclude_cut(True).buy_candidates(DAY, snap, set())
+    assert [c.symbol for c in result] == ["600001"]
 
 
 def test_financial_stock_exempt_from_debt_ratio() -> None:
@@ -271,14 +300,16 @@ def test_fundamental_stop_on_dividend_cut_or_profit_drop() -> None:
                 "dividend_cut": True,
                 "dividend_fy_total": 0.3,
                 "dividend_prev_fy_total": 0.5,
+                "dividend_open_fy_total": 0.0,
             }
         }
     )
     (sig,) = s.sell_signals(DAY, cut, [_pos()])
-    assert "0.30" in sig.detail
-    assert "0.50" in sig.detail
     assert sig.reason is ExitReason.FUNDAMENTAL
-    assert "分红" in sig.detail
+    assert sig.detail == (
+        "当前分红水平每股 0.30 元（最近完整年度 0.30 元，本年度已公告 0.00 元），"
+        "低于上一年度的 0.50 元（均按当前股本折算）"
+    )
 
     drop = make_snapshot({"600000": {"profit_yoy": -0.31}})
     (sig,) = s.sell_signals(DAY, drop, [_pos()])

@@ -7,6 +7,7 @@ strategy:
   max_price_position: 0.2
   lookback_days: 250
   min_dividend_years: 5
+  exclude_dividend_cut: true       # 为 true 时，已被判定削减分红（dividend_cut 为真）的股票不买入
   min_roe_avg3: 0.08
   max_payout_ratio: 0.80
   min_profit_yoy: -0.20

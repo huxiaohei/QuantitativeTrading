@@ -369,6 +369,79 @@ def test_dividend_cut_and_consecutive_years(tmp_path: Path) -> None:
     assert _b(snap, SYMBOL, "dividend_cut")
 
 
+def _cut_state(panel: FeaturePanel, day: date) -> tuple[bool, float, float, float]:
+    """(dividend_cut, total(Y*), total(Y*-1), total(Y*+1))。"""
+    snap = panel.snapshot(day)
+    return (
+        _b(snap, SYMBOL, "dividend_cut"),
+        _f(snap, SYMBOL, "dividend_fy_total"),
+        _f(snap, SYMBOL, "dividend_prev_fy_total"),
+        _f(snap, SYMBOL, "dividend_open_fy_total"),
+    )
+
+
+def test_cut_cleared_once_current_year_announced_dividends_reach_earlier_level(
+    tmp_path: Path,
+) -> None:
+    # 真实案例 600398：FY2014 0.38、FY2015 0.33、FY2016 0.49
+    days = weekdays(date(2016, 1, 4), 500)
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2013, date(2014, 5, 15), date(2014, 6, 16), 0.19),
+            (2014, date(2015, 4, 24), date(2015, 6, 15), 0.38),
+            (2015, date(2016, 5, 25), date(2016, 6, 20), 0.33),
+            (2016, date(2017, 4, 13), date(2017, 6, 15), 0.49),
+        ],
+    )
+    bars = make_bars(SYMBOL, days, [10.0] * len(days))
+    panel = _panel(tmp_path, [bars], dividends=[div], start=days[0], end=days[-1])
+    approx = pytest.approx
+    # Y*=2014：0.38 对 FY2013 的 0.19，不是下调
+    assert _cut_state(panel, date(2016, 8, 31)) == (False, approx(0.38), approx(0.19), approx(0.33))
+    # Y*=2015：当前水平 max(0.33, 0) 低于 0.38
+    assert _cut_state(panel, date(2016, 9, 1)) == (True, approx(0.33), approx(0.38), 0.0)
+    # FY2016 公告当天不可见
+    assert _cut_state(panel, date(2017, 4, 13)) == (True, approx(0.33), approx(0.38), 0.0)
+    # 次日起当前水平 max(0.33, 0.49) = 0.49，不低于 0.38
+    assert _cut_state(panel, date(2017, 4, 14)) == (
+        False,
+        approx(0.33),
+        approx(0.38),
+        approx(0.49),
+    )
+    observed = panel.snapshot(date(2017, 5, 2))
+    assert not _b(observed, SYMBOL, "dividend_cut")
+    assert _f(observed, SYMBOL, "dividend_yield") == approx(0.049)
+    # Y*=2016：0.49 对上一年度 0.33
+    assert _cut_state(panel, date(2017, 9, 1)) == (False, approx(0.49), approx(0.33), 0.0)
+
+
+def test_sustained_cut_stays_until_reduced_year_becomes_previous_year(tmp_path: Path) -> None:
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2018, date(2019, 5, 15), date(2019, 6, 17), 0.50),
+            (2019, date(2020, 5, 15), date(2020, 6, 15), 0.30),
+            (2020, date(2021, 5, 14), date(2021, 6, 15), 0.30),
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    approx = pytest.approx
+    assert _cut_state(panel, date(2020, 9, 1)) == (True, approx(0.30), approx(0.50), 0.0)
+    assert _cut_state(panel, date(2021, 5, 14)) == (True, approx(0.30), approx(0.50), 0.0)
+    # FY2020 的 0.30 已公告：当前水平 max(0.30, 0.30) 仍低于 0.50
+    assert _cut_state(panel, date(2021, 5, 17)) == (
+        True,
+        approx(0.30),
+        approx(0.50),
+        approx(0.30),
+    )
+    assert _cut_state(panel, date(2021, 8, 31))[0]
+    # Y*=2020：0.30 对 FY2019 的 0.30
+    assert _cut_state(panel, date(2021, 9, 1)) == (False, approx(0.30), approx(0.30), 0.0)
+
+
 def test_dividend_years_run_broken_by_gap_or_zero_cash(tmp_path: Path) -> None:
     div = make_dividends(
         SYMBOL,
@@ -719,9 +792,10 @@ def test_dividend_features_match_brute_force_definition(tmp_path: Path) -> None:
                 run += 1
             assert _f(snap, symbol, "dividend_fy_total") == pytest.approx(fy, abs=1e-12)
             assert _f(snap, symbol, "dividend_prev_fy_total") == pytest.approx(prev, abs=1e-12)
-            expected_yield = max(fy, current) / closes[k]
-            assert _f(snap, symbol, "dividend_yield") == pytest.approx(expected_yield, abs=1e-12)
-            assert _b(snap, symbol, "dividend_cut") is (prev > 0 and fy < prev - 1e-9)
+            assert _f(snap, symbol, "dividend_open_fy_total") == pytest.approx(current, abs=1e-12)
+            level = max(fy, current)
+            assert _f(snap, symbol, "dividend_yield") == pytest.approx(level / closes[k], abs=1e-12)
+            assert _b(snap, symbol, "dividend_cut") is (prev > 0 and level < prev - 1e-9)
             assert int(cast(int, snap.at[symbol, "dividend_years"])) == run, (day, symbol)
 
 

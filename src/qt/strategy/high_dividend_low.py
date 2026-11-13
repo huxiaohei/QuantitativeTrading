@@ -67,6 +67,7 @@ class HighDividendLow:
         """按股票池与买入条件筛选，股息率从高到低、同值按代码升序。
 
         任何指标为空值即不通过（NaN 的比较结果为假）；金融股豁免资产负债率。
+        exclude_dividend_cut 为真时，dividend_cut 为真的股票不通过（标志缺失同样不通过）。
         """
         if snapshot.empty:
             return []
@@ -86,6 +87,9 @@ class HighDividendLow:
                 | _bool_column(snapshot, "is_financial")
             )
         )
+        if cfg.exclude_dividend_cut:
+            # 空值转 bool 为真，缺失的标志按"已削减"处理，不会被当成未削减
+            passes &= ~_bool_column(snapshot, "dividend_cut")
         # 一次性取出通过筛选的行，避免逐个单元格查表
         picked = snapshot.loc[passes.to_numpy(), [*_METRIC_COLUMNS, "close", "industry"]]
         records = picked.to_dict("records")
@@ -136,11 +140,13 @@ class HighDividendLow:
 
         # 1. 基本面
         if bool(_cell(snapshot, symbol, "dividend_cut")):
-            current = _float_at(snapshot, symbol, "dividend_fy_total")
+            closed = _float_at(snapshot, symbol, "dividend_fy_total")
+            announced = _float_at(snapshot, symbol, "dividend_open_fy_total")
             previous = _float_at(snapshot, symbol, "dividend_prev_fy_total")
             return (
                 ExitReason.FUNDAMENTAL,
-                f"分红被削减：最近完整年度每股分红 {current:.2f} 元，"
+                f"当前分红水平每股 {max(closed, announced):.2f} 元"
+                f"（最近完整年度 {closed:.2f} 元，本年度已公告 {announced:.2f} 元），"
                 f"低于上一年度的 {previous:.2f} 元（均按当前股本折算）",
             )
         profit_yoy = _float_at(snapshot, symbol, "profit_yoy")
