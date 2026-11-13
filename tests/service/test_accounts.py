@@ -1,0 +1,157 @@
+"""使用者与订阅：创建、参数校验、参数历史、配置合并、审计。"""
+
+from datetime import date
+from pathlib import Path
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from qt.config import AppConfig, load_config
+from qt.db import repo
+from qt.db.models import AuditLog
+from qt.service.accounts import (
+    close_subscription,
+    create_subscription,
+    create_user,
+    pause_subscription,
+    resume_subscription,
+    subscription_config,
+    update_params,
+)
+from qt.service.errors import ValidationError
+
+CFG: AppConfig = load_config(Path("config/default.yaml"))
+DAY = date(2026, 11, 16)
+
+
+def _user_and_sub(db: Session) -> tuple[int, int]:
+    u = create_user(db, "a@example.com")
+    sub = create_subscription(db, u.id, CFG, 150_000.0, DAY)
+    return u.id, sub.id
+
+
+def test_create_subscription_creates_two_books_with_default_params(db: Session) -> None:
+    u = create_user(db, "A@Example.com")
+    assert u.email == "a@example.com"
+    sub = create_subscription(db, u.id, CFG, 150_000.0, DAY)
+    assert sub.params["strategy"]["take_profit_fixed"] == 0.20
+    assert sub.params["risk"]["max_positions"] == 10
+    assert {b.kind for b in repo.list_books(db, u.id, sub.id)} == {"system", "manual"}
+    assert sub.status == "active"
+    assert sub.initial_cash == 150_000.0
+
+
+def test_duplicate_email_rejected(db: Session) -> None:
+    create_user(db, "a@example.com")
+    with pytest.raises(ValidationError, match="已注册"):
+        create_user(db, "A@example.com")
+
+
+def test_invalid_email_rejected(db: Session) -> None:
+    with pytest.raises(ValidationError, match="邮箱"):
+        create_user(db, "not-an-email")
+
+
+def test_only_one_active_subscription_per_user(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    with pytest.raises(ValidationError, match="已有生效的订阅"):
+        create_subscription(db, uid, CFG, 1e5, DAY)
+    close_subscription(db, uid, sid)
+    again = create_subscription(db, uid, CFG, 1e5, DAY)
+    assert again.id != sid
+
+
+def test_paused_subscription_still_counts_as_active_slot(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    pause_subscription(db, uid, sid)
+    with pytest.raises(ValidationError, match="已有生效的订阅"):
+        create_subscription(db, uid, CFG, 1e5, DAY)
+
+
+def test_lookback_days_and_site_sections_cannot_be_overridden(db: Session) -> None:
+    uid = create_user(db, "a@example.com").id
+    for path in ("strategy.lookback_days", "universe.min_listed_years", "costs.slippage"):
+        with pytest.raises(ValidationError, match="全站统一"):
+            create_subscription(db, uid, CFG, 1e5, DAY, {path: 1})
+
+
+def test_invalid_param_value_rejected_with_same_rules_as_config(db: Session) -> None:
+    uid = create_user(db, "a@example.com").id
+    with pytest.raises(ValidationError):
+        create_subscription(db, uid, CFG, 1e5, DAY, {"strategy.stop_loss": 1.5})
+    with pytest.raises(ValidationError):
+        create_subscription(db, uid, CFG, 1e5, DAY, {"strategy.no_such": 1})
+
+
+def test_initial_cash_must_be_positive(db: Session) -> None:
+    uid = create_user(db, "a@example.com").id
+    with pytest.raises(ValidationError, match="本金"):
+        create_subscription(db, uid, CFG, 0.0, DAY)
+
+
+def test_overrides_at_creation_are_stored(db: Session) -> None:
+    uid = create_user(db, "a@example.com").id
+    sub = create_subscription(db, uid, CFG, 1e5, DAY, {"risk.max_positions": 5})
+    assert sub.params["risk"]["max_positions"] == 5
+
+
+def test_update_params_records_history_and_keeps_books(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    update_params(db, uid, sid, CFG, {"strategy.stop_loss": 0.10}, date(2026, 11, 17))
+    (change,) = repo.list_param_changes(db, uid, sid)
+    assert change.old["strategy"]["stop_loss"] == 0.15
+    assert change.new["strategy"]["stop_loss"] == 0.10
+    assert change.effective_day == date(2026, 11, 17)
+    assert len(repo.list_books(db, uid, sid)) == 2
+
+
+def test_update_params_rejects_closed_subscription_and_bad_values(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    with pytest.raises(ValidationError, match="全站统一"):
+        update_params(db, uid, sid, CFG, {"strategy.lookback_days": 100}, DAY)
+    close_subscription(db, uid, sid)
+    with pytest.raises(ValidationError, match="已关闭"):
+        update_params(db, uid, sid, CFG, {"strategy.stop_loss": 0.1}, DAY)
+
+
+def test_subscription_config_merges_user_params_over_site_config(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    sub = update_params(db, uid, sid, CFG, {"strategy.stop_loss": 0.10}, DAY)
+    merged = subscription_config(CFG, sub)
+    assert merged.strategy.stop_loss == 0.10
+    assert merged.costs == CFG.costs and merged.universe == CFG.universe
+    assert merged.service == CFG.service
+
+
+def test_pause_resume_close_transitions(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    pause_subscription(db, uid, sid)
+    assert repo.get_subscription(db, uid, sid).status == "paused"
+    resume_subscription(db, uid, sid)
+    assert repo.get_subscription(db, uid, sid).status == "active"
+    close_subscription(db, uid, sid)
+    sub = repo.get_subscription(db, uid, sid)
+    assert sub.status == "closed" and sub.closed_at is not None
+    assert sub.closed_at.tzinfo is not None
+    with pytest.raises(ValidationError):
+        resume_subscription(db, uid, sid)
+    with pytest.raises(ValidationError):
+        pause_subscription(db, uid, sid)
+
+
+def test_mutations_write_audit_log(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    update_params(db, uid, sid, CFG, {"strategy.stop_loss": 0.10}, DAY)
+    pause_subscription(db, uid, sid)
+    resume_subscription(db, uid, sid)
+    close_subscription(db, uid, sid)
+    actions = [a.action for a in db.scalars(select(AuditLog).order_by(AuditLog.id))]
+    assert actions == [
+        "user.create",
+        "subscription.create",
+        "subscription.update_params",
+        "subscription.pause",
+        "subscription.resume",
+        "subscription.close",
+    ]

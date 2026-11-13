@@ -3,7 +3,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session
 
 from qt.db.engine import database_url, session_scope
-from tests.db.conftest import truncate_all
+from tests.conftest import truncate_all
 
 
 def test_session_scope_commits_and_rolls_back(db_engine: Engine) -> None:

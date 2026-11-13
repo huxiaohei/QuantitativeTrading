@@ -39,6 +39,13 @@ def test_default_config_matches_spec() -> None:
     assert cfg.data.retries == 3
     assert cfg.data.industries_refresh_days == 30
     assert cfg.data.min_industry_coverage == 0.9
+    assert cfg.service.run_time == "18:00"
+    assert cfg.service.run_deadline == "08:30"
+    assert cfg.service.signal_valid_days == 3
+    assert cfg.service.abandon_resignal_days == 20
+    assert cfg.service.rejection_episode_gap_days == 20
+    assert cfg.service.backdate_limit_days == 10
+    assert cfg.service.followup_days == [20, 60]
 
 
 def test_unknown_key_rejected(tmp_path: Path) -> None:

@@ -129,6 +129,18 @@ class DataConfig(_Frozen):
     max_securities_shrink: Rate
 
 
+class ServiceConfig(_Frozen):
+    """站点服务参数：每日运行时点、信号有效期、拒绝记录与补记窗口、跟踪回看天数。"""
+
+    run_time: Annotated[str, Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]  # 每日运行时刻 HH:MM
+    run_deadline: Annotated[str, Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]  # 次日最晚完成 HH:MM
+    signal_valid_days: PositiveInt  # 信号自生成日起的有效交易日数
+    abandon_resignal_days: NonNegativeInt  # 放弃信号后多少个交易日内不再重复出同一只
+    rejection_episode_gap_days: PositiveInt  # 同一只股票被拒绝记录相隔多少天算一次新事件
+    backdate_limit_days: NonNegativeInt  # 补记成交最多可回溯的天数
+    followup_days: Annotated[list[PositiveInt], Field(min_length=1)]  # 离场/放弃后的跟踪天数
+
+
 class AppConfig(_Frozen):
     """应用总配置。"""
 
@@ -138,6 +150,7 @@ class AppConfig(_Frozen):
     costs: CostsConfig
     backtest: BacktestConfig
     data: DataConfig
+    service: ServiceConfig
 
 
 def load_config(path: Path) -> AppConfig:

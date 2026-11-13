@@ -1,7 +1,6 @@
 """数据库测试夹具：对测试库执行迁移；每个测试结束后清空所有表。
 
-数据库连不上时测试直接报错，不跳过。其他测试目录需要时在各自 conftest 中
-`pytest_plugins = ["tests.db.conftest"]` 复用。
+数据库连不上时测试直接报错，不跳过。放在 tests 根目录，各子目录共用。
 """
 
 import os
@@ -16,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from qt.db.engine import make_engine
 
-_ROOT = Path(__file__).resolve().parents[2]
+_ROOT = Path(__file__).resolve().parents[1]
 TEST_DATABASE_URL = "postgresql+psycopg://qt:qt@127.0.0.1:54329/qt_test"
 # 迁移版本记录表不清空
 _KEEP_TABLES = {"alembic_version"}

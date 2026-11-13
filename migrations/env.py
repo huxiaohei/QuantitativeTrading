@@ -4,9 +4,9 @@ from alembic import context
 from sqlalchemy import Connection
 
 from qt.db.engine import database_url, make_engine
+from qt.db.models import Base
 
-# 后续任务在此挂上 ORM 元数据；基线迁移没有表
-target_metadata = None
+target_metadata = Base.metadata
 
 
 def _url() -> str:

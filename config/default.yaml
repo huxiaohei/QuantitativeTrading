@@ -52,3 +52,11 @@ data:
   industries_refresh_days: 30      # 行业分类文件超过此天数才对全部在市股票重新查询
   min_industry_coverage: 0.9       # 在市股票中有行业分类的最低比例，低于此值视为数据问题
   max_securities_shrink: 0.02      # 数据源证券数比已存储的少超过此比例视为数据问题
+service:
+  run_time: "18:00"                # 每个交易日收盘后开始每日运行的时刻（Asia/Shanghai）
+  run_deadline: "08:30"            # 次日此刻前仍未完成则报警
+  signal_valid_days: 3             # 信号自生成日起有效的交易日数
+  abandon_resignal_days: 20        # 放弃某信号后，这么多个交易日内不再对同一只重复出信号
+  rejection_episode_gap_days: 20   # 同一只股票的拒绝记录相隔超过此天数算一次新事件
+  backdate_limit_days: 10          # 补记成交最多可回溯的天数
+  followup_days: [20, 60]          # 离场、放弃、被拒后跟踪收益的天数
