@@ -26,8 +26,15 @@ uv run qt data update
 
 - 想试一下、只更新几只股票：`uv run qt data update --symbols 600000,600036`
 - 想让当天的数据也进来，请在交易日 16:00 之后运行；16:00 之前运行，数据只更新到上一个交易日。
-- 更新结束后会自动做一次数据完整性检查，有问题会逐条打印，并以非零状态退出。
+- 每处理 20 只股票打印一行带时间的进度。每次网络请求最多等 `data.request_timeout_seconds`（默认 90 秒），超时算一次失败并重试；连续 `data.max_consecutive_failures`（默认 20）只股票因网络错误失败，会判断为断网并中止，网络恢复后重新运行即可续传。
+- 更新结束后会自动对最新一个交易日做一次数据完整性检查，有问题会逐条打印，并以非零状态退出。数据源这次返回的证券明显少于已存储的（少 2% 以上）也算问题；已存储的证券不会因此被删除。
 - 其他选项：`--config` 指定配置文件，`--data-dir` 指定数据目录（默认 `data`）。
+
+全部历史日线的完整性扫描（价格不为正、最高价低于最低价、复权因子不为正、复权收盘价单日涨跌超过 21%）单独运行，只读不写原始数据，结果供参考，回测报告会显示各类异常的数量：
+
+```bash
+uv run qt data check
+```
 
 ### 2. 回测并生成报告
 
@@ -57,12 +64,14 @@ uv run qt backtest sweep \
 | 位置 | 内容 |
 |---|---|
 | `data/` | 下载的数据（Parquet 文件），不进入 git |
-| `data/update-failures.json` | 最近一次更新中失败的股票及原因 |
+| `data/update-failures.json` | 最近一次全量更新中失败的股票及原因（回测报告据此统计取不到日线的退市股票） |
+| `data/update-failures-partial.json` | 最近一次 `--symbols` 部分更新的失败明细（不覆盖全量记录） |
+| `data/history-anomalies.csv` | `qt data check` 发现的历史行情异常明细 |
 | `reports/` | 回测 HTML 报告与参数对比 CSV，不进入 git |
 
 ## 如何修改参数
 
-所有数值参数都在 `config/default.yaml` 里，代码里没有写死的数字。直接编辑它，或者复制一份、改完后用 `--config` 指定：
+策略、风控、成本、回测区间和数据下载的数值参数都在 `config/default.yaml` 里。直接编辑它，或者复制一份、改完后用 `--config` 指定：
 
 ```bash
 cp config/default.yaml config/my.yaml
@@ -76,7 +85,9 @@ uv run qt backtest run --period in --config config/my.yaml
 - `risk`：风控，单只仓位上限、最大持仓数、行业集中度上限、回撤预警与暂停线、冷却期。
 - `costs`：交易成本，佣金、最低佣金、印花税、过户费、滑点。印花税按历史税率分段（`stamp_tax_schedule`，每段写起始日和税率，按起始日升序）：默认 2008-09-19 起 0.1%，2023-08-28 起 0.05%，每笔卖出按成交当天有效的税率计算。
 - `backtest`：回测本金、数据起点、样本内外的日期分界、买单有效天数、对比基准。
-- `data`：数据下载，刷新间隔、请求间隔、重试次数、行业覆盖率下限。
+- `data`：数据下载，刷新间隔、请求间隔、重试次数、单次请求时限、断网熔断的连续失败只数、行业覆盖率下限、证券表缩水的报警比例。
+
+另有少量属于市场规则或数据校验口径的数字写在代码里，不在配置中：一手 100 股（`src/qt/costs.py`）；主板涨跌停 ±10%、ST ±5%（`src/qt/backtest/engine.py`）；财年 Y 的分红在次年 8 月 31 日后才算完整（`src/qt/features.py`）；数据检查的单日涨跌阈值 21%、新股上市前 5 个交易日不查、当日日线覆盖率下限 80%、16:00 视为收盘（`src/qt/data/update.py`）；夏普比率按一年 244 个交易日年化（`src/qt/backtest/metrics.py`）；报告里最大回撤达 40% 的红色提示（`src/qt/backtest/report.py`）。
 
 每个概念的含义与例子见 [docs/concepts.md](docs/concepts.md)。配置文件不允许出现未知的键，拼错会报错而不是被悄悄忽略；每个数值也有取值范围（比例在 0 到 1 之间、天数和个数为正、不接受 NaN 与无穷大，`in_sample_start < in_sample_end < out_sample_start`），超出范围同样报错，`--param` 的取值也按同样的规则检查。
 

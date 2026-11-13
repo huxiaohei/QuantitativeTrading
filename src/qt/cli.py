@@ -18,6 +18,8 @@ from qt.data.source import DataSource
 from qt.data.store import ParquetStore
 from qt.data.update import (
     DEFAULT_PROGRESS_EVERY,
+    FAILURES_FILE,
+    FAILURES_PARTIAL_FILE,
     DataIntegrityError,
     NetworkOutageError,
     SharedTableError,
@@ -98,7 +100,7 @@ def run_update(
         typer.echo(f"数据不完整，无法更新：{exc}")
         return 1
 
-    name = "update-failures.json" if symbols is None else "update-failures-partial.json"
+    name = FAILURES_FILE if symbols is None else FAILURES_PARTIAL_FILE
     failures = data_dir / name
     failures.parent.mkdir(parents=True, exist_ok=True)
     failures.write_text(

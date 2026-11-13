@@ -1,5 +1,6 @@
 """HTML 报告、周期解析、run_period 与命令行测试。"""
 
+import json
 import re
 from datetime import date
 from pathlib import Path
@@ -18,9 +19,12 @@ from qt.backtest.engine import BacktestResult
 from qt.backtest.metrics import Metrics, benchmark_metrics, compute_metrics
 from qt.backtest.report import (
     BenchmarkSet,
+    DataChecks,
     chart_svg,
     common_curves,
+    limitation_statements,
     load_benchmarks,
+    load_data_checks,
     normalised_curves,
     render_report,
     resolve_period,
@@ -28,6 +32,7 @@ from qt.backtest.report import (
     verdict_sentence,
 )
 from qt.calendar import TradingCalendar
+from qt.config import StampTaxPeriod
 from qt.costs import CostModel
 from qt.data.schema import Table
 from qt.data.store import ParquetStore
@@ -186,17 +191,131 @@ def test_missing_benchmark_is_omitted_with_note(tmp_path: Path) -> None:
     assert "无法比较" in html
 
 
+LIMITATIONS = (
+    "分红按除权价再投资，未扣红利税（持股不足一年实际税率 10% 至 20%）——偏乐观",
+    "分红再投资产生的不足一股的零碎股数在回测中被保留——影响很小",
+    "股息率取“最近完整分红年度”与“当前年度已公告分红”中较大者（每股金额按当前股本折算）；"
+    "削减分红的公司要到次年 9 月 1 日才被识别——对削减分红的公司偏乐观",
+    "财务指标为最新口径，被追溯调整过的历史数值可能与当时公布的不同——方向不定",
+    "没有实际披露日期的财报按法定披露截止日使用——对延迟披露的公司偏乐观",
+    "退市股票按最后一个交易日收盘价清算，退市后无法卖出或价值归零的情况未计——偏乐观",
+    "涨跌停与停牌按日线开盘价近似判断；ST 股票涨跌幅一律按 5% 处理，"
+    "无涨跌幅限制的交易日未单独建模——方向不定",
+    "印花税按历史税率分段计算（2023-08-28 前 0.1%，2023-08-28 起 0.05%）；佣金与滑点为固定假设",
+    "期末仍持有的股票按最后收盘价计值，未扣卖出成本——略偏乐观",
+    "历史 ST 状态与历史行业分类无法还原，使用当前信息——偏乐观",
+    "回测结果不代表未来收益",
+)
+
+
 def test_all_fixed_limitation_statements_present(tmp_path: Path) -> None:
     html = _render(tmp_path)
-    for text in (
-        "分红按除权价再投资且未扣红利税",
-        "财务指标为最新口径，已被追溯调整的历史数值可能与当时公布的不同",
-        "没有实际披露日期的财报按法定披露截止日使用，对延迟披露的公司偏乐观",
-        "退市股票按最后一个交易日收盘价清算",
-        "涨跌停与停牌按日线开盘价近似判断",
-        "回测结果不代表未来收益",
-    ):
-        assert f"<li>{text}</li>" in html
+    for text in LIMITATIONS:
+        assert f"<li>{escape(text)}</li>" in html, text
+
+
+def test_stamp_tax_limitation_follows_the_configured_schedule() -> None:
+    cfg = default_app_config()
+    costs = cfg.costs.model_copy(
+        update={"stamp_tax_schedule": [StampTaxPeriod(start=date(2008, 9, 19), rate=0.001)]}
+    )
+    (text,) = [
+        t for t in limitation_statements(cfg.model_copy(update={"costs": costs})) if "印花税" in t
+    ]
+    assert "（0.1%）" in text
+
+
+# ---------- 幸存者偏差与历史行情扫描 ----------
+
+
+def _checks_store(tmp_path: Path) -> tuple[ParquetStore, Path]:
+    root = tmp_path / "checks"
+    store = ParquetStore(root)
+    populate_store(
+        store,
+        securities=make_securities(
+            [
+                ("600000", "sh_main", date(2010, 1, 1), None),
+                ("600001", "sh_main", date(2010, 1, 1), date(2020, 1, 1)),
+                ("600002", "sh_main", date(2010, 1, 1), date(2021, 1, 1)),
+                ("000003", "sz_main", date(2010, 1, 1), date(2022, 1, 1)),
+                ("300004", "chinext", date(2010, 1, 1), date(2022, 1, 1)),  # 不在股票池板块
+            ]
+        ),
+        bars=[make_bars(s, D[:3], [5.0] * 3) for s in ("600000", "600001", "000003", "300004")],
+    )
+    return store, root
+
+
+def test_data_checks_counts_delisted_symbols_and_failures(tmp_path: Path) -> None:
+    store, root = _checks_store(tmp_path)
+    cfg = default_app_config()
+    none_yet = load_data_checks(store, cfg, root)
+    assert (none_yet.delisted, none_yet.delisted_with_bars) == (3, 2)
+    assert none_yet.no_bars is None and none_yet.delist_missing is None
+    assert none_yet.anomalies is None
+    (root / "update-failures.json").write_text(
+        json.dumps(
+            {
+                "600002": "无日线数据：已退市股票取不到日线",
+                "600007": "退市日期缺失：退市表没有退市日期且无日线，未写入 securities",
+                "600008": "ConnectionError: 断线",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "symbol": ["600000", "600000", "600001"],
+            "day": [D[0], D[1], D[1]],
+            "kind": ["price_jump", "price_jump", "non_positive_open"],
+            "detail": ["x", "y", "z"],
+        }
+    ).to_csv(root / "history-anomalies.csv", index=False)
+    found = load_data_checks(store, cfg, root)
+    assert (found.no_bars, found.delist_missing) == (1, 1)
+    assert found.anomalies == {"price_jump": 2, "non_positive_open": 1}
+
+
+def _render_checks(tmp_path: Path, checks: DataChecks) -> str:
+    result = _result()
+    out = render_report(
+        result,
+        compute_metrics(result.equity, result.trades),
+        _benchmarks(),
+        default_app_config(),
+        "in",
+        GAPS,
+        tmp_path / "r.html",
+        data_checks=checks,
+    )
+    return out.read_text(encoding="utf-8")
+
+
+def test_report_shows_survivorship_table_and_anomaly_counts(tmp_path: Path) -> None:
+    html = _render_checks(tmp_path, DataChecks(3, 2, 1, 4, {"price_jump": 2}))
+    section = html[html.index("<h2>8.") :]
+    assert "幸存者偏差相关统计" in section
+    for cell in ("<td>3</td>", "<td>2</td>", "<td>1</td>", "<td>4</td>"):
+        assert cell in section
+    assert "复权收盘价单日涨跌超过 21%" in section and "<td>2</td>" in section
+    assert "尚未做完整性扫描" not in section
+
+
+def test_report_without_failures_file_or_scan_says_so(tmp_path: Path) -> None:
+    html = _render_checks(tmp_path, DataChecks(3, 2, None, None, None))
+    section = html[html.index("<h2>8.") :]
+    assert "update-failures.json" in section
+    assert "历史行情尚未做完整性扫描（运行 qt data check）" in section
+    clean = _render_checks(tmp_path, DataChecks(0, 0, 0, 0, {}))
+    assert "未发现异常" in clean[clean.index("<h2>8.") :]
+
+
+def test_truncated_window_note_refers_to_the_table_above(tmp_path: Path) -> None:
+    result = _result([150_000.0, 165_000.0, 135_000.0, 148_500.0, 181_500.0])
+    html = _render(tmp_path, result=result, benchmarks={"H00300": _mid_bench(), ETF: _mid_bench()})
+    assert "上表策略与各基准均只按该区间计算" in _section1(html)
 
 
 def test_data_gaps_embedded_verbatim(tmp_path: Path) -> None:
@@ -236,10 +355,8 @@ def test_open_position_without_close_shows_dash(tmp_path: Path) -> None:
 
 def test_nan_entry_metric_renders_dash(tmp_path: Path) -> None:
     result = _result()
-    bad = Trade(
-        "600001", D[1], D[10], 10_000.0, 11_000.0, ExitReason.TIME_STOP, 9,
-        {"dividend_yield": float("nan"), "price_position": 0.12},
-    )  # fmt: skip
+    metrics = {"dividend_yield": float("nan"), "price_position": 0.12}
+    bad = Trade("600001", D[1], D[10], 10_000.0, 11_000.0, ExitReason.TIME_STOP, 9, metrics)
     result = BacktestResult(result.equity, result.cash, [bad], [], [], [], [])
     html = _render(tmp_path, result=result)
     assert "股息率 —" in html

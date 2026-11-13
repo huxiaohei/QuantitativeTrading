@@ -32,7 +32,8 @@ class BacktestResult:
     open_positions: list[Position]  # 回测结束时仍持有的仓位
     rejections: list[Rejection]
     risk_events: list[RiskEvent]
-    expired_buys: list[Order]  # 超过有效期仍未成交（或买不起一手）的买单
+    # 作废的买单：超过有效期仍未成交、现金不足买不起一手，或暂停买入生效当晚被一并取消
+    expired_buys: list[Order]
 
 
 @dataclass

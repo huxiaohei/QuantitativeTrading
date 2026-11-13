@@ -17,6 +17,9 @@ from qt.data.schema import Table
 from qt.data.source import DataSource
 from qt.data.store import ParquetStore
 
+# 全量更新的失败明细文件名（在数据目录下）；--symbols 部分运行写 FAILURES_PARTIAL_FILE
+FAILURES_FILE = "update-failures.json"
+FAILURES_PARTIAL_FILE = "update-failures-partial.json"
 # 已退市股票取不到日线时，failed 里的错误信息以此开头，便于统计
 NO_BARS_PREFIX = "无日线数据"
 # 退市表没有退市日期且没有日线、因此被丢弃的证券
@@ -28,9 +31,9 @@ _LOOKBACK_YEARS = 2
 # 当日有日线的股票占在市股票的最低比例
 _MIN_COVERAGE = 0.8
 # 复权后收盘价单日涨跌幅的上限
-_MAX_JUMP = 0.21
+MAX_JUMP = 0.21
 # 上市后前 N 个交易日不检查涨跌幅（新股上市初期涨跌幅限制不同）
-_IPO_EXEMPT_DAYS = 5
+IPO_EXEMPT_DAYS = 5
 # 已退市股票最后一根日线早于 as_of 超过这么多天，视为早已结束，不再请求
 _LONG_DEAD_DAYS = 365
 # 沪市退市表的日期是“暂停上市日期”，可能早于最后交易日约一个月；判断“退市早于下载窗口”时留出余量
@@ -513,7 +516,7 @@ def _ipo_exempt_until(calendar: TradingCalendar, list_date: pd.Timestamp) -> dat
     if pd.isna(list_date):
         return None
     listed = list_date.date()
-    steps = _IPO_EXEMPT_DAYS - 1 if calendar.is_trading_day(listed) else _IPO_EXEMPT_DAYS
+    steps = IPO_EXEMPT_DAYS - 1 if calendar.is_trading_day(listed) else IPO_EXEMPT_DAYS
     try:
         return calendar.offset(listed, steps)
     except ValueError:  # 超出日历范围
@@ -575,6 +578,6 @@ def check_integrity(
         if exempt_until is not None and day <= exempt_until:
             continue
         change = now_hfq[symbol] / old_hfq[symbol] - 1 if old_hfq[symbol] != 0 else float("inf")
-        if abs(change) > _MAX_JUMP:
+        if abs(change) > MAX_JUMP:
             problems.append(f"{symbol} 在 {day} 复权收盘价单日变动 {change:+.1%}")
     return problems

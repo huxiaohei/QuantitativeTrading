@@ -3,6 +3,7 @@
 报告是单个自包含 HTML 文件：图用 matplotlib（Agg 后端）生成 SVG 后内嵌，不引用任何外部资源。
 """
 
+import json
 import math
 import re
 from collections.abc import Mapping
@@ -28,9 +29,11 @@ from qt.backtest.metrics import (
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig
 from qt.costs import CostModel
+from qt.data.check import ANOMALY_FILE
+from qt.data.check import KIND_LABELS as ANOMALY_LABELS
 from qt.data.schema import Table
 from qt.data.store import ParquetStore
-from qt.data.update import load_calendar
+from qt.data.update import FAILURES_FILE, count_delist_missing, count_no_bars, load_calendar
 from qt.features import FeaturePanel, build_panel
 from qt.risk import RiskManager
 from qt.strategy.high_dividend_low import HighDividendLow
@@ -58,14 +61,23 @@ RULE_LABELS = {
     "no_cash": "现金不足",
 }
 KIND_LABELS = {"warn": "回撤预警", "pause": "暂停买入", "resume": "恢复买入"}
+# 每条都写明对回测结果的偏差方向；印花税一条由 limitation_statements 按配置生成
 FIXED_LIMITATIONS = [
-    "分红按除权价再投资且未扣红利税",
-    "财务指标为最新口径，已被追溯调整的历史数值可能与当时公布的不同",
-    "没有实际披露日期的财报按法定披露截止日使用，对延迟披露的公司偏乐观",
-    "退市股票按最后一个交易日收盘价清算",
-    "涨跌停与停牌按日线开盘价近似判断",
+    "分红按除权价再投资，未扣红利税（持股不足一年实际税率 10% 至 20%）——偏乐观",
+    "分红再投资产生的不足一股的零碎股数在回测中被保留——影响很小",
+    "股息率取“最近完整分红年度”与“当前年度已公告分红”中较大者（每股金额按当前股本折算）；"
+    "削减分红的公司要到次年 9 月 1 日才被识别——对削减分红的公司偏乐观",
+    "财务指标为最新口径，被追溯调整过的历史数值可能与当时公布的不同——方向不定",
+    "没有实际披露日期的财报按法定披露截止日使用——对延迟披露的公司偏乐观",
+    "退市股票按最后一个交易日收盘价清算，退市后无法卖出或价值归零的情况未计——偏乐观",
+    "涨跌停与停牌按日线开盘价近似判断；ST 股票涨跌幅一律按 5% 处理，"
+    "无涨跌幅限制的交易日未单独建模——方向不定",
+    "期末仍持有的股票按最后收盘价计值，未扣卖出成本——略偏乐观",
+    "历史 ST 状态与历史行业分类无法还原，使用当前信息——偏乐观",
     "回测结果不代表未来收益",
 ]
+# 印花税一条插在 FIXED_LIMITATIONS 中的位置（第 8 条）
+_STAMP_TAX_POSITION = 7
 DRAWDOWN_BANNER = "最大回撤接近 50% 上限，按设计文档策略需要重做"
 DRAWDOWN_BANNER_LEVEL = -0.40
 TIE_THRESHOLD = 0.0005  # 年化收益或回撤幅度相差不足 0.05 个百分点视为持平
@@ -84,6 +96,22 @@ CJK_FONTS = ("PingFang SC", "Heiti TC", "Songti SC", "Arial Unicode MS")
 
 class BacktestInputError(ValueError):
     """回测输入（日期区间、已存数据）不满足要求。"""
+
+
+@dataclass(frozen=True)
+class DataChecks:
+    """报告第 8 节用到的数据检查结果。
+
+    delisted 为股票池板块内已退市的证券数，delisted_with_bars 为其中有日线的数量；
+    no_bars、delist_missing 取自最近一次全量更新的 update-failures.json（没有该文件为 None）；
+    anomalies 为 qt data check 的异常数量（按类型），尚未扫描为 None。
+    """
+
+    delisted: int
+    delisted_with_bars: int
+    no_bars: int | None
+    delist_missing: int | None
+    anomalies: dict[str, int] | None
 
 
 @dataclass(frozen=True)
@@ -198,6 +226,44 @@ def load_last_closes(store: ParquetStore, symbols: list[str], end: date) -> dict
     bars = store.read(Table.BARS, symbols=symbols, end=end).sort_values("day")
     last = bars.groupby("symbol")["close"].last()
     return {str(s): float(c) for s, c in last.items()}
+
+
+def load_data_checks(store: ParquetStore, cfg: AppConfig, data_dir: Path) -> DataChecks:
+    """统计幸存者偏差相关数字，并读取 data_dir 下的 update-failures.json 与历史行情扫描结果。"""
+    secs = store.read(Table.SECURITIES)
+    delisted = secs[secs["board"].isin(cfg.universe.boards) & secs["delist_date"].notna()]
+    with_bars = sum(1 for s in delisted["symbol"] if store.has(Table.BARS, str(s)))
+    no_bars: int | None = None
+    delist_missing: int | None = None
+    failures_path = data_dir / FAILURES_FILE
+    if failures_path.is_file():
+        failed = cast("dict[str, str]", json.loads(failures_path.read_text(encoding="utf-8")))
+        no_bars, delist_missing = count_no_bars(failed), count_delist_missing(failed)
+    anomalies: dict[str, int] | None = None
+    anomalies_path = data_dir / ANOMALY_FILE
+    if anomalies_path.is_file():
+        kinds = pd.read_csv(anomalies_path, usecols=["kind"], dtype={"kind": "str"})["kind"]
+        anomalies = {str(k): int(n) for k, n in kinds.value_counts(sort=False).items()}
+    return DataChecks(len(delisted), with_bars, no_bars, delist_missing, anomalies)
+
+
+def limitation_statements(cfg: AppConfig) -> list[str]:
+    """报告第 8 节逐条列出的局限；印花税一条按配置的税率分段生成。"""
+    schedule = cfg.costs.stamp_tax_schedule
+
+    def rate(value: float) -> str:
+        return f"{value * 100:g}%"
+
+    if len(schedule) == 1:
+        segments = rate(schedule[0].rate)
+    else:
+        parts = [f"{schedule[1].start} 前 {rate(schedule[0].rate)}"]
+        parts += [f"{p.start} 起 {rate(p.rate)}" for p in schedule[1:]]
+        segments = "，".join(parts)
+    stamp = f"印花税按历史税率分段计算（{segments}）；佣金与滑点为固定假设"
+    out = list(FIXED_LIMITATIONS)
+    out.insert(_STAMP_TAX_POSITION, stamp)
+    return out
 
 
 # ---------- 文字与格式 ----------
@@ -370,6 +436,17 @@ def _summary_rows(
     return rows, etf
 
 
+def _anomaly_rows(checks: DataChecks | None) -> list[tuple[str, int]] | None:
+    """历史行情异常按类型的 (中文说明, 数量)；尚未扫描返回 None。"""
+    if checks is None or checks.anomalies is None:
+        return None
+    known = [
+        (ANOMALY_LABELS[k], checks.anomalies[k]) for k in ANOMALY_LABELS if k in checks.anomalies
+    ]
+    other = [(k, n) for k, n in checks.anomalies.items() if k not in ANOMALY_LABELS]
+    return known + other
+
+
 def render_report(
     result: BacktestResult,
     metrics: Metrics,
@@ -379,11 +456,13 @@ def render_report(
     data_gaps: Path,
     out: Path,
     last_closes: Mapping[str, float] | None = None,
+    data_checks: DataChecks | None = None,
 ) -> Path:
     """渲染单文件 HTML 报告并写到 out，返回 out。
 
     benchmarks 为已对齐回测交易日的收盘价；配置里有但这里没有的基准在报告中给出缺失说明。
     last_closes 为期末持仓的最后收盘价，用于计算浮动收益（缺失显示为 —）。
+    data_checks 为幸存者偏差统计与历史行情扫描结果（见 load_data_checks），不提供时报告注明未统计。
     """
     closes = last_closes or {}
     cc = common_curves(result.equity, benchmarks)
@@ -444,7 +523,9 @@ def render_report(
             held=held,
             params=_flatten(cfg.model_dump(mode="json")),
             gaps=data_gaps.read_text(encoding="utf-8"),
-            limitations=FIXED_LIMITATIONS,
+            limitations=limitation_statements(cfg),
+            checks=data_checks,
+            anomaly_rows=_anomaly_rows(data_checks),
         )
     )
     out.parent.mkdir(parents=True, exist_ok=True)

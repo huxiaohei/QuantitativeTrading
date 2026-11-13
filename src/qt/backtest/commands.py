@@ -14,6 +14,7 @@ from qt.backtest.report import (
     BacktestInputError,
     last_bar_day,
     load_benchmarks,
+    load_data_checks,
     load_last_closes,
     render_report,
     resolve_period,
@@ -85,6 +86,7 @@ def run(
         data_gaps,
         out / name,
         last_closes=closes,
+        data_checks=load_data_checks(store, cfg, data_dir),
     )
     typer.echo(f"报告已生成：{path}")
     typer.echo(

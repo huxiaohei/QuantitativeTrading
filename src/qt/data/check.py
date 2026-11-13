@@ -13,6 +13,7 @@ import pandas as pd
 from qt.calendar import TradingCalendar
 from qt.data.schema import Table
 from qt.data.store import ParquetStore
+from qt.data.update import IPO_EXEMPT_DAYS, MAX_JUMP
 
 ANOMALY_COLUMNS = ["symbol", "day", "kind", "detail"]
 # qt data check 写在数据目录下的明细文件名；回测报告据此显示异常数量
@@ -25,10 +26,6 @@ KIND_LABELS: dict[str, str] = {
     "non_positive_adj_factor": "复权因子不为正",
     "price_jump": "复权收盘价单日涨跌超过 21%",
 }
-# 复权后收盘价单日涨跌幅的上限（与 update.check_integrity 相同）
-_MAX_JUMP = 0.21
-# 上市后前 N 个交易日（含上市日）不检查涨跌幅
-_IPO_EXEMPT_DAYS = 5
 
 
 def _empty() -> pd.DataFrame:
@@ -124,9 +121,9 @@ def scan_history(store: ParquetStore, calendar: TradingCalendar) -> pd.DataFrame
 
     secs = store.read(Table.SECURITIES).set_index("symbol")
     first = _first_trading_index(calendar, secs["list_date"])
-    exempt_until = bars["symbol"].map(first) + (_IPO_EXEMPT_DAYS - 1)
+    exempt_until = bars["symbol"].map(first) + (IPO_EXEMPT_DAYS - 1)
     exempt = position <= exempt_until  # 上市日缺失（NaN）时比较为假，不豁免
-    jump = (change.abs() > _MAX_JUMP) & ~exempt
+    jump = (change.abs() > MAX_JUMP) & ~exempt
     detail = "复权收盘价单日变动 " + change.map("{:+.1%}".format)
     found.append(_rows(bars, jump, "price_jump", detail))
 

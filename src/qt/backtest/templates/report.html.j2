@@ -28,7 +28,7 @@ th { background: #f3f3f3; } td.l, th.l { text-align: left; }
 <tr><th class="l">对象</th><th>年化收益</th><th>最大回撤</th><th>夏普</th></tr>
 {% for r in summary %}<tr><td class="l">{{ r.name }}</td><td>{{ r.m.annual_return | pct }}</td><td>{{ r.m.max_drawdown | pct }}</td><td>{{ "%.2f" | format(r.m.sharpe) }}</td></tr>
 {% endfor %}</table>
-{% if truncated %}<p class="note">基准数据自 {{ win_start }} 起，对比区间短于回测区间；下表策略与各基准均只按该区间计算。</p>
+{% if truncated %}<p class="note">基准数据自 {{ win_start }} 起，对比区间短于回测区间；上表策略与各基准均只按该区间计算。</p>
 {% endif %}<p class="verdict">{{ verdict }}</p>
 {% for name in missing %}<p class="note">基准 {{ name }} 缺少数据，已从报告中省略。</p>
 {% endfor %}
@@ -79,7 +79,28 @@ th { background: #f3f3f3; } td.l, th.l { text-align: left; }
 {% endfor %}</table>
 
 <h2>8. 数据局限与近似处理</h2>
+<h3>幸存者偏差相关统计</h3>
+{% if checks %}<table>
+<tr><th class="l">项目</th><th>数量</th></tr>
+<tr><td class="l">股票池板块内已退市的证券（证券表中）</td><td>{{ checks.delisted }}</td></tr>
+<tr><td class="l">其中有日线、能参与回测的</td><td>{{ checks.delisted_with_bars }}</td></tr>
+{% if checks.no_bars is none %}<tr><td class="l" colspan="2">未找到最近一次全量更新的失败明细 update-failures.json，无法统计取不到日线与退市日期缺失的证券</td></tr>
+{% else %}<tr><td class="l">已退市但取不到日线的证券（无日线数据）</td><td>{{ checks.no_bars }}</td></tr>
+<tr><td class="l">退市表缺少退市日期且无日线、未进入证券表的（退市日期缺失）</td><td>{{ checks.delist_missing }}</td></tr>
+{% endif %}</table>
+<p>取不到日线或未进入证券表的退市股票不参与回测，结果因此偏乐观，幅度未知。</p>
+{% else %}<p>本次报告未统计幸存者偏差相关数字。</p>
+{% endif %}<h3>历史行情完整性扫描</h3>
+{% if anomaly_rows is none %}<p>历史行情尚未做完整性扫描（运行 qt data check）。</p>
+{% elif anomaly_rows %}<table>
+<tr><th class="l">异常类型</th><th>条数</th></tr>
+{% for label, count in anomaly_rows %}<tr><td class="l">{{ label }}</td><td>{{ count }}</td></tr>
+{% endfor %}</table>
+<p>开盘价或收盘价不为正的日线在回测中按当天无日线处理；其余异常未做处理，明细见数据目录下的 history-anomalies.csv。</p>
+{% else %}<p>历史行情完整性扫描未发现异常。</p>
+{% endif %}<h3>数据缺口文档原文</h3>
 <pre>{{ gaps }}</pre>
+<h3>主要局限与偏差方向</h3>
 <ul>
 {% for text in limitations %}<li>{{ text }}</li>
 {% endfor %}</ul>
