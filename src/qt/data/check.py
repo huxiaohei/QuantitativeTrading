@@ -20,6 +20,7 @@ ANOMALY_COLUMNS = ["symbol", "day", "kind", "detail"]
 ANOMALY_FILE = "history-anomalies.csv"
 # 异常类型 -> 中文说明（命令行与报告共用）
 KIND_LABELS: dict[str, str] = {
+    "non_finite_value": "价格或复权因子缺失或非有限",
     "non_positive_open": "开盘价不为正",
     "non_positive_close": "收盘价不为正",
     "high_below_low": "最高价低于最低价",
@@ -83,6 +84,21 @@ def scan_history(store: ParquetStore, calendar: TradingCalendar) -> pd.DataFrame
         return _empty()
     bars = bars.sort_values(["symbol", "day"], kind="stable").reset_index(drop=True)
     found: list[pd.DataFrame] = []
+    fields = ["open", "high", "low", "close", "adj_factor"]
+    finite = pd.DataFrame(
+        {c: np.isfinite(bars[c].to_numpy(dtype="float64", na_value=np.nan)) for c in fields},
+        index=bars.index,
+    )
+    non_finite = ~finite.all(axis=1)
+    # 只对少数坏行逐行拼出字段名
+    bad_rows = finite[non_finite]
+    labels = [
+        ", ".join(c for c, ok in zip(fields, flags, strict=True) if not ok)
+        for flags in bad_rows.to_numpy(dtype="bool")
+    ]
+    names = pd.Series("", index=bars.index, dtype="str")
+    names.loc[bad_rows.index] = pd.Series(labels, index=bad_rows.index, dtype="str")
+    found.append(_rows(bars, non_finite, "non_finite_value", "缺失或非有限的字段：" + names))
     for col, kind in (
         ("open", "non_positive_open"),
         ("close", "non_positive_close"),
@@ -115,7 +131,13 @@ def scan_history(store: ParquetStore, calendar: TradingCalendar) -> pd.DataFrame
     prev_hfq = grouped["close"].shift(1) * grouped["adj_factor"].shift(1)
     prev_pos = position.groupby(bars["symbol"], sort=False).shift(1)
     consecutive = (position - prev_pos == 1) & in_calendar
-    valid = consecutive & (hfq > 0) & (prev_hfq > 0)
+    valid = (
+        consecutive
+        & (hfq > 0)
+        & (prev_hfq > 0)
+        & np.isfinite(hfq.to_numpy(dtype="float64", na_value=np.nan))
+        & np.isfinite(prev_hfq.to_numpy(dtype="float64", na_value=np.nan))
+    )
     change = pd.Series(np.nan, index=bars.index)
     change[valid] = hfq[valid] / prev_hfq[valid] - 1
 

@@ -415,6 +415,8 @@ def test_round_trip_cash_and_equity_to_the_cent(tmp_path: Path) -> None:
     for i, day in enumerate(D[:N]):
         market_value = 1000 * closes[i] if i in closes else 0.0
         assert _at(result.equity, day) == pytest.approx(_at(result.cash, day) + market_value)
+    assert not result.equity.isna().any()
+    assert not result.cash.isna().any()
 
 
 def test_held_includes_pending_buys(tmp_path: Path) -> None:
@@ -569,3 +571,57 @@ def test_delisting_charged_stamp_tax_in_force_on_liquidation_day(tmp_path: Path)
     assert trade.exit_day == D[5]
     assert trade.proceeds == pytest.approx(model.sell_proceeds(10.5, 1000, D[5]))
     assert trade.proceeds != pytest.approx(model.sell_proceeds(10.5, 1000, D[4]))
+
+
+# ---------- 坏数据日线（价格或复权因子非有限或不为正）----------
+
+
+def _with_bad(bars: pd.DataFrame, i: int, col: str, value: float) -> pd.DataFrame:
+    """把 D[i] 那根日线的 col 改成 value。"""
+    bad = bars.copy()
+    bad.loc[bad["day"] == pd.Timestamp(D[i]), col] = value
+    return bad
+
+
+def test_nan_open_on_sell_fill_day_defers_sell_and_keeps_equity_finite(tmp_path: Path) -> None:
+    # D[2] 收盘发出卖出信号；D[3] 开盘价缺失（NaN），当天视同停牌，D[4] 开盘 10.5 成交
+    bars = _with_bad(_bars(S, {4: 10.5}), 3, "open", float("nan"))
+    strategy = ScriptedStrategy(buys=_buy(S), sells={D[2]: [(S, ExitReason.STOP_LOSS)]})
+    result = _run(tmp_path, [bars], strategy)
+    (trade,) = result.trades
+    assert trade.exit_day == D[4]
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.5, 1000, D[4]))
+    assert not result.equity.isna().any()
+    assert not result.cash.isna().any()
+
+
+def test_nan_open_on_buy_fill_day_carries_the_order_over(tmp_path: Path) -> None:
+    bars = _with_bad(_bars(S, {2: 10.2}), 1, "open", float("nan"))
+    result = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S)))
+    assert result.expired_buys == []
+    (pos,) = result.open_positions
+    assert pos.entry_day == D[2]
+    assert pos.cost == pytest.approx(COSTS.buy_cost(10.2, 1000))
+    assert not result.equity.isna().any()
+
+
+@pytest.mark.parametrize(
+    ("col", "value"),
+    [
+        ("high", float("nan")),
+        ("low", float("inf")),
+        ("close", float("nan")),
+        ("adj_factor", float("nan")),
+        ("adj_factor", 0.0),
+        ("high", -1.0),
+    ],
+)
+def test_bar_with_unusable_field_is_treated_as_no_bar(
+    tmp_path: Path, col: str, value: float
+) -> None:
+    bars = _with_bad(_bars(S, {2: 10.2}), 1, col, value)
+    result = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S)))
+    (pos,) = result.open_positions
+    assert pos.entry_day == D[2]
+    assert not result.equity.isna().any()
+    assert not result.cash.isna().any()

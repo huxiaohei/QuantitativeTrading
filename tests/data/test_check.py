@@ -75,3 +75,29 @@ def test_scan_of_empty_store_is_empty(tmp_path: Path) -> None:
     found = scan_history(ParquetStore(tmp_path), CAL)
     assert found.empty
     assert list(found.columns) == ANOMALY_COLUMNS
+
+
+def test_scan_flags_non_finite_price_and_factor_fields(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    bad = make_bars("600000", DAYS[:8], [10.0] * 8)
+    bad.loc[1, "open"] = float("nan")
+    bad.loc[2, "high"] = float("nan")
+    bad.loc[3, "low"] = float("nan")
+    bad.loc[4, "close"] = float("inf")
+    bad.loc[5, "adj_factor"] = float("nan")
+    populate_store(
+        store,
+        securities=make_securities([("600000", "sh_main", date(2010, 1, 1), None)]),
+        bars=[bad],
+    )
+    found = scan_history(store, CAL)
+    assert _found(found) == {
+        ("600000", DAYS[1], "non_finite_value"),
+        ("600000", DAYS[2], "non_finite_value"),
+        ("600000", DAYS[3], "non_finite_value"),
+        ("600000", DAYS[4], "non_finite_value"),
+        ("600000", DAYS[5], "non_finite_value"),
+    }
+    details = dict(zip(found["day"], found["detail"], strict=True))
+    assert "open" in details[pd.Timestamp(DAYS[1])]
+    assert "adj_factor" in details[pd.Timestamp(DAYS[5])]
