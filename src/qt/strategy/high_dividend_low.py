@@ -137,7 +137,13 @@ class HighDividendLow:
 
         # 1. 基本面
         if bool(_cell(snapshot, symbol, "dividend_cut")):
-            return ExitReason.FUNDAMENTAL, "最近一个财年每股派息低于上一财年，分红被削减"
+            current = _float_at(snapshot, symbol, "dividend_fy_total")
+            previous = _float_at(snapshot, symbol, "dividend_prev_fy_total")
+            return (
+                ExitReason.FUNDAMENTAL,
+                f"分红被削减：最近完整年度每股分红 {current:.2f} 元，"
+                f"低于上一年度的 {previous:.2f} 元（均按当前股本折算）",
+            )
         profit_yoy = _float_at(snapshot, symbol, "profit_yoy")
         if profit_yoy < cfg.fundamental_profit_yoy:  # NaN 比较为假，不触发
             return (

@@ -265,8 +265,18 @@ def test_time_stop_triggers_at_zero_return() -> None:
 
 def test_fundamental_stop_on_dividend_cut_or_profit_drop() -> None:
     s = _strategy()
-    cut = make_snapshot({"600000": {"dividend_cut": True}})
+    cut = make_snapshot(
+        {
+            "600000": {
+                "dividend_cut": True,
+                "dividend_fy_total": 0.3,
+                "dividend_prev_fy_total": 0.5,
+            }
+        }
+    )
     (sig,) = s.sell_signals(DAY, cut, [_pos()])
+    assert "0.30" in sig.detail
+    assert "0.50" in sig.detail
     assert sig.reason is ExitReason.FUNDAMENTAL
     assert "分红" in sig.detail
 

@@ -94,13 +94,17 @@ def test_normalize_bars_before_first_event_uses_one_and_empty_input() -> None:
 # ---------------------------------------------------------------- dividends
 
 
-def _raw_dividends(rows: list[tuple[str, float, str, str | None]]) -> pd.DataFrame:
-    """新浪分红表；行内为 (公告日期, 派息, 进度, 除权除息日)。"""
+def _raw_dividends(
+    rows: list[tuple[str, float, str, str | None]],
+    bonus: list[tuple[float, float]] | None = None,
+) -> pd.DataFrame:
+    """新浪分红表；行内为 (公告日期, 派息, 进度, 除权除息日)，bonus 为每行的 (送股, 转增)。"""
+    pairs = bonus if bonus is not None else [(0.0, 0.0)] * len(rows)
     return pd.DataFrame(
         {
             "公告日期": [pd.Timestamp(r[0]).date() for r in rows],
-            "送股": [0] * len(rows),
-            "转增": [0] * len(rows),
+            "送股": [p[0] for p in pairs],
+            "转增": [p[1] for p in pairs],
             "派息": [r[1] for r in rows],
             "进度": [r[2] for r in rows],
             "除权除息日": [None if r[3] is None else pd.Timestamp(r[3]).date() for r in rows],
@@ -168,6 +172,42 @@ def test_normalize_dividends_merges_same_ex_date() -> None:
     assert len(out) == 1
     assert out["cash_per_share"].iloc[0] == pytest.approx(0.4)
     assert out["announce_date"].iloc[0] == pd.Timestamp("2024-06-01")
+    assert out["bonus_per_share"].iloc[0] == 0.0
+
+
+def test_normalize_dividends_keeps_bonus_shares() -> None:
+    raw = _raw_dividends(
+        [
+            ("2020-07-10", 5.0, "实施", "2020-07-17"),  # 10 派 5 + 10 转 10
+            ("2021-06-01", 0.0, "实施", "2021-06-10"),  # 纯送转：10 送 2 转 3
+            ("2022-06-01", 0.0, "实施", "2022-06-10"),  # 既无派息也无送转：丢弃
+            ("2023-06-01", 2.0, "实施", "2023-06-10"),
+        ],
+        bonus=[(0.0, 10.0), (2.0, 3.0), (0.0, 0.0), (float("nan"), float("nan"))],
+    )
+    out = normalize_dividends("600000", raw)
+    validate(Table.DIVIDENDS, out)
+    assert out["ex_date"].tolist() == [
+        pd.Timestamp("2020-07-17"),
+        pd.Timestamp("2021-06-10"),
+        pd.Timestamp("2023-06-10"),
+    ]
+    assert out["cash_per_share"].tolist() == pytest.approx([0.5, 0.0, 0.2])
+    assert out["bonus_per_share"].tolist() == pytest.approx([1.0, 0.5, 0.0])
+
+
+def test_normalize_dividends_sums_bonus_on_same_ex_date() -> None:
+    raw = _raw_dividends(
+        [
+            ("2024-06-01", 3.0, "实施", "2024-06-20"),
+            ("2024-06-05", 0.0, "实施", "2024-06-20"),
+        ],
+        bonus=[(1.0, 0.0), (0.0, 4.0)],
+    )
+    out = normalize_dividends("600036", raw)
+    assert len(out) == 1
+    assert out["cash_per_share"].iloc[0] == pytest.approx(0.3)
+    assert out["bonus_per_share"].iloc[0] == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------- financials

@@ -2,16 +2,23 @@
 
 回测某一天只能看到公告日严格早于该日的信息。本模块一次性按全区间向量化计算所有指标：
     - 价格类指标只用 day 及之前的行（滚动窗口向后看）；
-    - 分红、财务类指标先在"公告事件"上算出状态，再用 merge_asof(allow_exact_matches=False)
-      对齐到每个交易日，公告当天不可见，次日起可见。
+    - 分红、财务类指标先在"事件"上算出状态，再用 merge_asof 对齐到每个交易日，
+      公告当天不可见，次日起可见。
 
 分红类指标的财年口径：财年 Y 的分红全部在 Y+1 年 8 月 31 日前除权，故 day > Y+1 年 8 月 31 日
 时财年 Y "已关闭"。Y* 为 day 当天最新已关闭财年（9 月起为 day.year-1，否则 day.year-2）。
-    - dividend_years：自 Y* 起向前、每年派息合计 > 0 的连续财年数（Y* 无分红则为 0）；
-    - dividend_cut：Y*-1 有分红且 Y* 派息合计低于 Y*-1（Y* 无分红也算下调）；
-    - payout_ratio：Y* 派息合计 / Y* 年报每股收益（年报需在 day 前公告且 eps > 0）；
-    - dividend_yield：公告日在 [day-365, day) 的派息合计 / 收盘价，不受财年口径影响。
-未关闭财年的分红（如中期分红）不进入前三项，避免只公告了部分分红就误判下调。
+每股分红一律折算到 day 当天的股本（"当前股本口径"）：一笔分红 d 的每股金额除以
+Π(1 + 送转比例)，连乘范围是同一股票除权日在 [d 的除权日, day] 内的全部送转（含 d 自身的送转；
+除权日晚于 day 的送转不计，因为 day 的价格尚未反映它）。total(Y, day) 为财年 Y 中公告日 < day
+的各笔分红按当前股本口径的合计。
+    - dividend_years：自 Y* 起向前、每年 total > 0 的连续财年数（Y* 无分红则为 0）；
+    - dividend_cut：total(Y*-1) > 0 且 total(Y*) 低于 total(Y*-1)（Y* 无分红也算下调）；
+    - payout_ratio：Y* 的原始每股派息合计（不折算）/ Y* 年报每股收益
+      （年报需在 day 前公告且 eps > 0）；
+    - dividend_yield：max(total(Y*), total(Y*+1)) / 收盘价，即"最近完整财年"与"当前财年已公告"
+      两者中的较大者；削减分红的公司要到被削减的财年关闭后才反映出来（与 dividend_cut 同样滞后）；
+    - dividend_fy_total、dividend_prev_fy_total：total(Y*) 与 total(Y*-1)，供卖出说明使用。
+未关闭财年的分红（如中期分红）只进入股息率，不进入前三项，避免只公告了部分分红就误判下调。
 snapshot 与 bar 只是对预先算好的数据做切片与查表。
 """
 
@@ -37,6 +44,8 @@ SNAPSHOT_COLUMNS: list[str] = [
     "dividend_yield",
     "dividend_years",
     "dividend_cut",
+    "dividend_fy_total",
+    "dividend_prev_fy_total",
     "roe_avg3",
     "payout_ratio",
     "profit_yoy",
@@ -48,7 +57,7 @@ SNAPSHOT_COLUMNS: list[str] = [
     "avg_amount_60d",
 ]
 _AMOUNT_WINDOW = 60
-_DIVIDEND_WINDOW_DAYS = 365
+_ONE_DAY = pd.Timedelta(days=1)
 # 判断"下调"时的容差（元/股），避免 0.1+0.2 与 0.3 的浮点误差误判为下调
 _CUT_TOLERANCE = 1e-9
 
@@ -139,24 +148,6 @@ def _asof(left: pd.DataFrame, right: pd.DataFrame, key: str, left_on: str = "day
     )
 
 
-def _dividend_yield(panel: pd.DataFrame, dividends: pd.DataFrame) -> Floats:
-    """公告日在 [day-365, day) 内的每股派息合计 / 收盘价；用公告日累计和做两次 asof 相减。"""
-    if dividends.empty:
-        return np.zeros(len(panel))
-    ordered = dividends.sort_values(["symbol", "announce_date"], kind="stable")
-    cumulative = ordered.assign(cum=ordered.groupby("symbol")["cash_per_share"].cumsum())
-    # 同一公告日多笔时保留累计到最后一笔的值
-    table = cumulative.drop_duplicates(["symbol", "announce_date"], keep="last")[
-        ["symbol", "announce_date", "cum"]
-    ]
-    upper = _floats(_asof(panel[["symbol", "day"]], table, "announce_date")["cum"])
-    lower_left = panel[["symbol"]].assign(
-        lb=panel["day"] - pd.Timedelta(days=_DIVIDEND_WINDOW_DAYS)
-    )
-    lower = _floats(_asof(lower_left, table, "announce_date", "lb")["cum"])
-    return (np.nan_to_num(upper) - np.nan_to_num(lower)) / _floats(panel["close"])
-
-
 def _consecutive_years(positive: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     """对派息为正的 (keys, 财年) 行，算出以该财年结尾的连续财年段长度 run。
 
@@ -186,25 +177,57 @@ def _annual_reports(financials: pd.DataFrame) -> pd.DataFrame:
 
 
 def _dividend_state(dividends: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """分红事件表与事件后的分年状态。
+    """分红事件表与事件后的分年状态（每股金额按事件当天的股本折算）。
 
-    对每个 (symbol, 事件日 a) 取公告日 <= a 的全部分红行，按财年汇总：
-    total 为该财年派息合计，run 为以该财年结尾的连续派息财年数（total 不为正则为 0）。
-    状态从 a 之后的交易日起可见。返回 (事件表[symbol, announce_date], 状态表)。
+    事件有两类，均以"从哪一天起生效"（effective）表示：公告日的次日（该行分红可见），
+    以及有送转的行的除权日（股本变化，此前各笔分红需要重新折算）。两次事件之间状态不变。
+    对每个 (symbol, effective)，取公告日 < effective 的分红行按财年汇总：
+    total 为按当前股本口径折算后的合计，raw 为未折算的原始合计，
+    run 为以该财年结尾的连续派息财年数（total 不为正则为 0）。
+    返回 (事件表[symbol, effective]，状态表[symbol, effective, fiscal_year, total, raw, run])。
     """
-    events = dividends[["symbol", "announce_date"]].drop_duplicates()
-    joined = events.merge(dividends, on="symbol", suffixes=("_ev", ""))
-    joined = joined[joined["announce_date"] <= joined["announce_date_ev"]]
-    keys = ["symbol", "announce_date_ev"]
-    summed = cast(
-        pd.DataFrame,
-        joined.groupby([*keys, "fiscal_year"], as_index=False)["cash_per_share"].sum(),
+    div = dividends.sort_values(["symbol", "ex_date"], kind="stable").reset_index(drop=True)
+    growth = 1.0 + div["bonus_per_share"].fillna(0.0)
+    # 截至各行除权日（含）的送转连乘；除以本行自身的 (1 + 送转) 得到本行除权日之前的连乘
+    cum = growth.groupby(div["symbol"], sort=False).cumprod()
+    div = div.assign(f_before=cum / growth, visible_from=div["announce_date"] + _ONE_DAY)
+
+    bonus_days = div.loc[div["bonus_per_share"] > 0, ["symbol", "ex_date"]]
+    events = (
+        pd.concat(
+            [
+                div[["symbol", "visible_from"]].rename(columns={"visible_from": "effective"}),
+                bonus_days.rename(columns={"ex_date": "effective"}),
+            ],
+            ignore_index=True,
+        )
+        .dropna(subset=["effective"])
+        .drop_duplicates()
+        .sort_values("effective", kind="stable")
+        .reset_index(drop=True)
     )
-    totals: pd.DataFrame = summed.rename(columns={"cash_per_share": "total"})
+    factors = pd.DataFrame({"symbol": div["symbol"], "factor_day": div["ex_date"], "f_at": cum})
+    factors = factors.dropna(subset=["factor_day"]).sort_values("factor_day", kind="stable")
+    # 事件当天（含）以前全部送转的连乘；此前没有任何除权则为 1
+    at_event = pd.merge_asof(
+        events, factors, left_on="effective", right_on="factor_day", by="symbol"
+    ).drop(columns=["factor_day"])
+    at_event["f_at"] = at_event["f_at"].fillna(1.0)
+
+    joined = at_event.merge(div, on="symbol")
+    joined = joined[joined["visible_from"] <= joined["effective"]]
+    applied = (joined["ex_date"] <= joined["effective"]).to_numpy(dtype="bool")
+    scale = np.where(applied, _floats(joined["f_before"]) / _floats(joined["f_at"]), 1.0)
+    joined = joined.assign(adjusted=_floats(joined["cash_per_share"]) * scale)
+
+    keys = ["symbol", "effective"]
+    totals = joined.groupby([*keys, "fiscal_year"], as_index=False).agg(
+        total=("adjusted", "sum"), raw=("cash_per_share", "sum")
+    )
     runs = _consecutive_years(totals[totals["total"] > 0], keys)
     state = totals.merge(runs, on=[*keys, "fiscal_year"], how="left")
     state["run"] = state["run"].fillna(0).astype("int64")
-    return events, state.rename(columns={"announce_date_ev": "announce_date"})
+    return events, state
 
 
 def _closed_year(days: "pd.Series[pd.Timestamp]") -> npt.NDArray[np.int64]:
@@ -215,42 +238,66 @@ def _closed_year(days: "pd.Series[pd.Timestamp]") -> npt.NDArray[np.int64]:
 
 
 def _state_at(
-    events: pd.DataFrame,
-    state: pd.DataFrame,
-    event_dates: pd.DataFrame,
-    year: npt.NDArray[np.int64],
+    state: pd.DataFrame, event_dates: pd.DataFrame, year: npt.NDArray[np.int64]
 ) -> pd.DataFrame:
-    """在每行对应的最近事件上取指定财年的 total 与 run，找不到则为空。"""
+    """在每行对应的最近事件上取指定财年的 total、raw 与 run，找不到则为空。"""
     left = pd.DataFrame(
         {
             "symbol": event_dates["symbol"],
-            "announce_date": event_dates["announce_date"],
+            "effective": event_dates["effective"],
             "fiscal_year": year,
         }
     )
-    return left.merge(state, on=["symbol", "announce_date", "fiscal_year"], how="left")
+    return left.merge(state, on=["symbol", "effective", "fiscal_year"], how="left")
 
 
-def _dividend_columns(
-    keys: pd.DataFrame, dividends: pd.DataFrame
-) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.bool_], Floats]:
-    """dividend_years、dividend_cut 与 Y* 当年派息合计（均只看已关闭财年，公告日 < day）。"""
-    year = _closed_year(keys["day"])
+@dataclass(frozen=True)
+class _DividendColumns:
+    """分红类指标（每行对应 keys 的一行）。"""
+
+    years: npt.NDArray[np.int64]
+    cut: npt.NDArray[np.bool_]
+    fy_total: Floats  # total(Y*)，当前股本口径
+    prev_fy_total: Floats  # total(Y*-1)
+    open_total: Floats  # total(Y*+1)：当前未关闭财年已公告的分红
+    raw_fy_total: Floats  # Y* 的原始每股派息合计（不折算），用于分红率
+
+
+def _dividend_columns(keys: pd.DataFrame, dividends: pd.DataFrame) -> _DividendColumns:
+    """按 Y* 计算分红类指标；keys 为 (symbol, day)，须按 day 排序。"""
+    n = len(keys)
     if dividends.empty:
-        return (
-            np.zeros(len(keys), dtype="int64"),
-            np.zeros(len(keys), dtype="bool"),
-            np.zeros(len(keys)),
+        zeros = np.zeros(n)
+        return _DividendColumns(
+            np.zeros(n, dtype="int64"), np.zeros(n, dtype="bool"), zeros, zeros, zeros, zeros
         )
+    year = _closed_year(keys["day"])
     events, state = _dividend_state(dividends)
-    visible = _asof(keys, events, "announce_date")
-    current = _state_at(events, state, visible, year)
-    previous = _state_at(events, state, visible, year - 1)
+    # 生效日 <= day 的最近一次事件（公告事件的生效日已是公告日次日）
+    visible = pd.merge_asof(
+        keys, events, left_on="day", right_on="effective", by="symbol", allow_exact_matches=True
+    )
+    current = _state_at(state, visible, year)
+    previous = _state_at(state, visible, year - 1)
+    upcoming = _state_at(state, visible, year + 1)
     total = np.nan_to_num(_floats(current["total"]))
     prev_total = np.nan_to_num(_floats(previous["total"]))
-    cut = (prev_total > 0) & (total < prev_total - _CUT_TOLERANCE)
-    years = current["run"].fillna(0).to_numpy(dtype="int64")
-    return years, cut, total
+    return _DividendColumns(
+        years=current["run"].fillna(0).to_numpy(dtype="int64"),
+        cut=(prev_total > 0) & (total < prev_total - _CUT_TOLERANCE),
+        fy_total=total,
+        prev_fy_total=prev_total,
+        open_total=np.nan_to_num(_floats(upcoming["total"])),
+        raw_fy_total=np.nan_to_num(_floats(current["raw"])),
+    )
+
+
+def _dividend_yield(cols: _DividendColumns, close: Floats) -> Floats:
+    """max(total(Y*), total(Y*+1)) / 收盘价；收盘价缺失或不为正时为空。"""
+    out = np.full(len(close), np.nan)
+    valid = np.isfinite(close) & (close > 0)
+    np.divide(np.maximum(cols.fy_total, cols.open_total), close, out=out, where=valid)
+    return out
 
 
 def _latest_report_state(financials: pd.DataFrame) -> pd.DataFrame:
@@ -346,12 +393,18 @@ def _compute_panel(
     financials = financials.dropna(subset=["announce_date"])
     keys = p[["symbol", "day"]]
 
-    p["dividend_yield"] = _dividend_yield(p, dividends)
-    years, cut, total = _dividend_columns(keys, dividends)
-    p["dividend_years"] = years
-    p["dividend_cut"] = cut
+    div = _dividend_columns(keys, dividends)
+    p["dividend_yield"] = _dividend_yield(div, _floats(p["close"]))
+    p["dividend_years"] = div.years
+    p["dividend_cut"] = div.cut
+    p["dividend_fy_total"] = div.fy_total
+    p["dividend_prev_fy_total"] = div.prev_fy_total
     annual = _annual_reports(financials)
-    p["payout_ratio"] = _payout_ratio(keys, total, annual) if not annual.empty else np.nan
+    # 分红率按 Y* 自身的原始每股口径：每股收益是年报原值，若财年内有送转，两者股本口径可能不一致，
+    # 此时分红率只是近似
+    p["payout_ratio"] = (
+        _payout_ratio(keys, div.raw_fy_total, annual) if not annual.empty else np.nan
+    )
 
     p["profit_yoy"] = np.nan
     p["debt_ratio"] = np.nan

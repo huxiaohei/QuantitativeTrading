@@ -50,7 +50,8 @@ SCHEMAS: dict[Table, dict[str, str]] = {
         "fiscal_year": "int64",
         "announce_date": DATE,
         "ex_date": DATE,
-        "cash_per_share": "float64",
+        "cash_per_share": "float64",  # 每股税前现金分红（元，按除权前股本）
+        "bonus_per_share": "float64",  # 每股送转股数：(送股 + 转增) / 10，没有为 0.0
     },
     Table.FINANCIALS: {
         "symbol": "str",

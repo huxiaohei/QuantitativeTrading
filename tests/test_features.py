@@ -2,7 +2,7 @@
 
 import math
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -135,7 +135,7 @@ def test_dividend_yield_uses_only_announced_dividends(tmp_path: Path) -> None:
     assert _f(panel.snapshot(date(2021, 3, 31)), SYMBOL, "dividend_yield") == pytest.approx(0.05)
 
 
-def test_dividend_yield_window_is_365_calendar_days(tmp_path: Path) -> None:
+def test_dividend_yield_is_larger_of_closed_and_current_fiscal_year(tmp_path: Path) -> None:
     div = make_dividends(
         SYMBOL,
         [
@@ -144,11 +144,120 @@ def test_dividend_yield_window_is_365_calendar_days(tmp_path: Path) -> None:
         ],
     )
     panel = _panel(tmp_path, [_flat()], dividends=[div])
-    # 2021-07-01 的下界恰为 2020-07-01，公告日等于下界仍计入
-    assert _f(panel.snapshot(date(2021, 7, 1)), SYMBOL, "dividend_yield") == pytest.approx(0.08)
+    # 2021 年 7 月：Y*=2019（0.3），当前年度 2020 已公告 0.5，取较大者，两年不相加
+    assert _f(panel.snapshot(date(2021, 7, 1)), SYMBOL, "dividend_yield") == pytest.approx(0.05)
     assert _f(panel.snapshot(date(2021, 7, 2)), SYMBOL, "dividend_yield") == pytest.approx(0.05)
-    assert _f(panel.snapshot(date(2020, 7, 1)), SYMBOL, "dividend_yield") == 0.0
+    assert _f(panel.snapshot(date(2021, 9, 1)), SYMBOL, "dividend_yield") == pytest.approx(0.05)
+    assert _f(panel.snapshot(date(2020, 7, 1)), SYMBOL, "dividend_yield") == 0.0  # 公告当天
     assert _f(panel.snapshot(date(2020, 7, 2)), SYMBOL, "dividend_yield") == pytest.approx(0.03)
+
+
+def _yield(panel: FeaturePanel, day: date, symbol: str = SYMBOL) -> float:
+    return _f(panel.snapshot(day), symbol, "dividend_yield")
+
+
+def test_announcement_drift_does_not_double_count(tmp_path: Path) -> None:
+    """评审场景 A：今年的实施公告比去年早 20 天，旧口径下两年分红在窗口里叠加。"""
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2019, date(2020, 7, 10), date(2020, 7, 17), 0.30),
+            (2020, date(2021, 6, 20), date(2021, 6, 28), 0.30),
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    assert _yield(panel, date(2020, 7, 13)) == pytest.approx(0.03)
+    assert _yield(panel, date(2021, 6, 21)) == pytest.approx(0.03)
+    assert _yield(panel, date(2021, 7, 12)) == pytest.approx(0.03)
+    for day in D:
+        assert _yield(panel, day) <= 0.03 + 1e-12, day
+
+
+def _scenario_b(tmp_path: Path) -> FeaturePanel:
+    """评审场景 B：2020-07-17 实施 10 派 5 + 10 转 10，价格 20 → 10；
+    2020 财年每股（新股）派 0.30。"""
+    split = date(2020, 7, 17)
+    closes = [20.0 if d < split else 10.0 for d in D]
+    factors = [1.0 if d < split else 2.05 for d in D]
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2018, date(2019, 7, 10), date(2019, 7, 17), 0.50),
+            (2019, date(2020, 7, 10), date(2020, 7, 17), 0.50, 1.0),
+            (2020, date(2021, 7, 10), date(2021, 7, 17), 0.30),
+        ],
+    )
+    return _panel(tmp_path, [make_bars(SYMBOL, D, closes, factors)], dividends=[div])
+
+
+def test_bonus_shares_rescale_past_dividends_to_current_share_count(tmp_path: Path) -> None:
+    panel = _scenario_b(tmp_path)
+    assert _yield(panel, date(2020, 7, 16)) == pytest.approx(0.025)  # 除权前：0.50 / 20
+    assert _yield(panel, date(2020, 7, 17)) == pytest.approx(0.025)  # 除权日：0.25 / 10
+    assert _yield(panel, date(2020, 7, 20)) == pytest.approx(0.025)
+    assert _yield(panel, date(2021, 6, 1)) == pytest.approx(0.025)
+    assert not _b(panel.snapshot(date(2020, 7, 20)), SYMBOL, "dividend_cut")
+    sept = panel.snapshot(date(2020, 9, 1))  # Y*=2019：0.25 对 2018 年的 0.25
+    assert not _b(sept, SYMBOL, "dividend_cut")
+    assert _f(sept, SYMBOL, "dividend_fy_total") == pytest.approx(0.25)
+    assert _f(sept, SYMBOL, "dividend_prev_fy_total") == pytest.approx(0.25)
+    snap = panel.snapshot(date(2021, 9, 1))  # 每股（新股）0.30 是加息，不是削减
+    assert not _b(snap, SYMBOL, "dividend_cut")
+    assert _f(snap, SYMBOL, "dividend_fy_total") == pytest.approx(0.30)
+    assert _f(snap, SYMBOL, "dividend_prev_fy_total") == pytest.approx(0.25)
+    assert _f(snap, SYMBOL, "dividend_yield") == pytest.approx(0.03)
+    assert int(cast(int, snap.at[SYMBOL, "dividend_years"])) == 3
+
+
+def test_bonus_with_ex_date_after_day_is_not_applied(tmp_path: Path) -> None:
+    panel = _scenario_b(tmp_path)
+    # 2020-07-10 公告、07-17 除权：除权前价格仍是旧股本口径，送转不能提前生效
+    before = panel.snapshot(date(2020, 7, 16))
+    assert _f(before, SYMBOL, "dividend_fy_total") == pytest.approx(0.50)  # Y*=2018
+    after = panel.snapshot(date(2020, 7, 17))
+    assert _f(after, SYMBOL, "dividend_fy_total") == pytest.approx(0.25)
+
+
+def test_bonus_only_row_rescales_without_adding_cash(tmp_path: Path) -> None:
+    ex = date(2020, 10, 15)
+    closes = [10.0 if d < ex else 8.0 for d in D]
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2019, date(2020, 3, 30), date(2020, 6, 1), 0.5),
+            (2020, date(2020, 9, 30), ex, 0.0, 0.25),  # 纯送转：10 送 2.5
+        ],
+    )
+    panel = _panel(tmp_path, [make_bars(SYMBOL, D, closes)], dividends=[div])
+    day_before = panel.snapshot(date(2020, 10, 14))
+    assert _f(day_before, SYMBOL, "dividend_fy_total") == pytest.approx(0.5)
+    assert _f(day_before, SYMBOL, "dividend_yield") == pytest.approx(0.05)
+    on_ex = panel.snapshot(ex)
+    assert _f(on_ex, SYMBOL, "dividend_fy_total") == pytest.approx(0.4)
+    assert _f(on_ex, SYMBOL, "dividend_yield") == pytest.approx(0.05)
+    # 2020 财年只有送转、没有现金：关闭后视为停止分红
+    closed = panel.snapshot(date(2021, 9, 1))
+    assert _f(closed, SYMBOL, "dividend_fy_total") == 0.0
+    assert _f(closed, SYMBOL, "dividend_prev_fy_total") == pytest.approx(0.4)
+    assert _b(closed, SYMBOL, "dividend_cut")
+
+
+def test_interim_dividend_raises_yield_only_when_it_exceeds_closed_year(
+    tmp_path: Path,
+) -> None:
+    div = make_dividends(
+        SYMBOL,
+        [
+            (2020, date(2021, 3, 30), date(2021, 6, 1), 0.3),
+            (2021, date(2021, 8, 20), date(2021, 9, 15), 0.2),  # 2021 中期
+            (2022, date(2022, 8, 20), date(2022, 9, 15), 0.5),  # 2022 中期
+        ],
+    )
+    panel = _panel(tmp_path, [_flat()], dividends=[div])
+    assert _yield(panel, date(2021, 9, 1)) == pytest.approx(0.03)  # 0.3 对 0.2
+    assert _yield(panel, date(2022, 3, 1)) == pytest.approx(0.03)
+    assert _yield(panel, date(2022, 8, 22)) == pytest.approx(0.03)  # 2022 年尚不是当前年度
+    assert _yield(panel, date(2022, 9, 1)) == pytest.approx(0.05)  # Y*=2021 0.2 对 0.5
 
 
 def test_price_position_basic_and_flat(tmp_path: Path) -> None:
@@ -557,3 +666,60 @@ def test_non_date_arguments_are_rejected(tmp_path: Path) -> None:
             panel.last_close(bad, SYMBOL)
         with pytest.raises(TypeError, match=r"datetime\.date"):
             panel.delisted_on(bad)
+
+
+def _brute_total(rows: Sequence[tuple[int, date, date, float, float]], fy: int, day: date) -> float:
+    """按定义逐笔计算 total(fy, day)：公告日 < day，按 day 当天的股本折算。"""
+    out = 0.0
+    for year, announced, ex, cash, _ in rows:
+        if year != fy or announced >= day:
+            continue
+        factor = 1.0
+        for _, _, other_ex, _, bonus in rows:
+            if ex <= other_ex <= day:
+                factor *= 1 + bonus
+        out += cash / factor
+    return out
+
+
+def test_dividend_features_match_brute_force_definition(tmp_path: Path) -> None:
+    rng = np.random.default_rng(7)
+    days = D[:650]
+    symbols = [f"60000{i}" for i in range(4)]
+    divs: dict[str, list[tuple[int, date, date, float, float]]] = {}
+    for symbol in symbols:
+        ex_days = sorted({days[int(i)] for i in rng.integers(0, len(days), size=8)})
+        rows: list[tuple[int, date, date, float, float]] = []
+        for ex in ex_days:
+            announced = ex - timedelta(days=int(rng.integers(0, 40)))
+            cash = float(rng.choice([0.0, 0.1, 0.2, 0.35]))
+            bonus = float(rng.choice([0.0, 0.0, 0.3, 1.0]))
+            cash = 0.15 if cash == 0 and bonus == 0 else cash
+            rows.append((ex.year - 1 if ex.month <= 8 else ex.year, announced, ex, cash, bonus))
+        divs[symbol] = rows
+    closes = [5 + (i % 37) * 0.1 for i in range(len(days))]
+    panel = _panel(
+        tmp_path,
+        [make_bars(s, days, closes) for s in symbols],
+        dividends=[make_dividends(s, divs[s]) for s in symbols],
+        start=days[0],
+        end=days[-1],
+    )
+    for k in range(0, len(days), 3):
+        day = days[k]
+        snap = panel.snapshot(day)
+        closed = day.year - (1 if day.month >= 9 else 2)
+        for symbol in symbols:
+            rows = divs[symbol]
+            fy = _brute_total(rows, closed, day)
+            prev = _brute_total(rows, closed - 1, day)
+            current = _brute_total(rows, closed + 1, day)
+            run = 0
+            while _brute_total(rows, closed - run, day) > 0:
+                run += 1
+            assert _f(snap, symbol, "dividend_fy_total") == pytest.approx(fy, abs=1e-12)
+            assert _f(snap, symbol, "dividend_prev_fy_total") == pytest.approx(prev, abs=1e-12)
+            expected_yield = max(fy, current) / closes[k]
+            assert _f(snap, symbol, "dividend_yield") == pytest.approx(expected_yield, abs=1e-12)
+            assert _b(snap, symbol, "dividend_cut") is (prev > 0 and fy < prev - 1e-9)
+            assert int(cast(int, snap.at[symbol, "dividend_years"])) == run, (day, symbol)

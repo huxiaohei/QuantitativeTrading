@@ -55,6 +55,8 @@ _SNAPSHOT_DEFAULTS: dict[str, object] = {
     "dividend_yield": 0.052,
     "dividend_years": 8,
     "dividend_cut": False,
+    "dividend_fy_total": 0.52,
+    "dividend_prev_fy_total": 0.5,
     "roe_avg3": 0.12,
     "payout_ratio": 0.5,
     "profit_yoy": 0.05,
@@ -282,8 +284,13 @@ def make_securities(rows: Sequence[tuple[str, str, date, date | None]]) -> pd.Da
     )
 
 
-def make_dividends(symbol: str, rows: Sequence[tuple[int, date, date, float]]) -> pd.DataFrame:
-    """构造 DIVIDENDS 表；每行为 (fiscal_year, announce_date, ex_date, cash_per_share)。"""
+DividendRow = tuple[int, date, date, float] | tuple[int, date, date, float, float]
+
+
+def make_dividends(symbol: str, rows: Sequence[DividendRow]) -> pd.DataFrame:
+    """构造 DIVIDENDS 表；每行为 (fiscal_year, announce_date, ex_date, cash_per_share)，
+    可选第 5 项 bonus_per_share（每股送转股数，省略时为 0.0）。"""
+    bonus = [r[4] if len(r) == 5 else 0.0 for r in rows]
     return pd.DataFrame(
         {
             "symbol": pd.Series([symbol] * len(rows), dtype="str"),
@@ -291,6 +298,7 @@ def make_dividends(symbol: str, rows: Sequence[tuple[int, date, date, float]]) -
             "announce_date": _ts([r[1] for r in rows]),
             "ex_date": _ts([r[2] for r in rows]),
             "cash_per_share": pd.Series([r[3] for r in rows], dtype="float64"),
+            "bonus_per_share": pd.Series(bonus, dtype="float64"),
         }
     )
 

@@ -227,34 +227,38 @@ def fiscal_year_of(ex_date: date) -> int:
 def normalize_dividends(symbol: str, raw: pd.DataFrame) -> pd.DataFrame:
     """新浪分红表 → dividends。
 
-    只保留 `进度=="实施"`、`除权除息日` 非空、`派息>0` 的行；`派息` 是元/10 股（税前），除以 10
-    得每股元。announce_date 取 `公告日期`（实施公告日，晚于预案日），缺失时退回除权日（更保守）。
-    同一除权日有多行（例如年报分红加特别分红）时合并：派息相加，公告日取最早。
+    只保留 `进度=="实施"`、`除权除息日` 非空，且 `派息>0` 或有送转（`送股`+`转增`>0）的行；
+    两者皆为 0 的行丢弃。`派息` 是元/10 股（税前），除以 10 得每股元；`送股`、`转增` 是每 10 股
+    的股数，(送股 + 转增) / 10 得 bonus_per_share（每股送转股数，缺失按 0）。
+    announce_date 取 `公告日期`（实施公告日，晚于预案日），缺失时退回除权日（更保守）。
+    同一除权日有多行（例如年报分红加特别分红）时合并：派息、送转相加，公告日取最早。
     """
     ex = to_dates(raw["除权除息日"])
-    cash = to_numbers(raw["派息"])
-    keep = (as_type(raw["进度"], "str").str.strip() == "实施") & ex.notna() & (cash > 0)
+    cash = to_numbers(raw["派息"]).fillna(0.0)
+    bonus = to_numbers(raw["送股"]).fillna(0.0) + to_numbers(raw["转增"]).fillna(0.0)
+    implemented = as_type(raw["进度"], "str").str.strip() == "实施"
+    keep = implemented & ex.notna() & ((cash > 0) | (bonus > 0))
     announce = to_dates(raw["公告日期"])
     frame = pd.DataFrame(
         {
             "announce_date": announce.where(announce.notna(), ex)[keep],
             "ex_date": ex[keep],
             "cash_per_share": (cash / 10)[keep],
+            "bonus_per_share": (bonus / 10)[keep],
         }
     )
     if len(frame) == 0:
         return empty_frame(Table.DIVIDENDS)
     grouped = frame.groupby("ex_date", as_index=False).agg(
-        announce_date=("announce_date", "min"), cash_per_share=("cash_per_share", "sum")
+        announce_date=("announce_date", "min"),
+        cash_per_share=("cash_per_share", "sum"),
+        bonus_per_share=("bonus_per_share", "sum"),
     )
     grouped["fiscal_year"] = [fiscal_year_of(ts.date()) for ts in grouped["ex_date"]]
     grouped["symbol"] = symbol
     out = grouped[list(SCHEMAS[Table.DIVIDENDS])].copy()
-    out["symbol"] = as_type(out["symbol"], "str")
-    out["fiscal_year"] = as_type(out["fiscal_year"], "int64")
-    out["announce_date"] = as_type(out["announce_date"], "datetime64[ns]")
-    out["ex_date"] = as_type(out["ex_date"], "datetime64[ns]")
-    out["cash_per_share"] = as_type(out["cash_per_share"], "float64")
+    for col, dtype in SCHEMAS[Table.DIVIDENDS].items():
+        out[col] = as_type(out[col], dtype)
     validate(Table.DIVIDENDS, out)
     return out
 
