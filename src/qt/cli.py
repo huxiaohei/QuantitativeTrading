@@ -13,7 +13,7 @@ from qt.backtest.commands import backtest_app
 from qt.config import AppConfig, load_config
 from qt.data.akshare_source import AkshareSource
 from qt.data.check import ANOMALY_FILE, KIND_LABELS, scan_history
-from qt.data.schema import Table
+from qt.data.schema import SchemaError, Table
 from qt.data.source import DataSource
 from qt.data.store import ParquetStore
 from qt.data.update import (
@@ -142,10 +142,10 @@ def run_check(data_dir: Path) -> int:
     store = ParquetStore(data_dir)
     try:
         calendar = load_calendar(store)
-    except DataIntegrityError as exc:
+        found = scan_history(store, calendar)
+    except (DataIntegrityError, SchemaError) as exc:  # SchemaError：旧版本写入的文件
         typer.echo(f"无法检查：{exc}")
         return 1
-    found = scan_history(store, calendar)
     path = data_dir / ANOMALY_FILE
     found.to_csv(path, index=False, encoding="utf-8")
     if found.empty:

@@ -8,8 +8,8 @@ import pandas as pd
 import pytest
 
 from qt.data.schema import SchemaError, Table, empty_frame
-from qt.data.store import ParquetStore
-from tests.fakes import make_bars
+from qt.data.store import ParquetStore, StoredSchemaError
+from tests.fakes import make_bars, make_dividends
 
 D = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)]
 
@@ -122,3 +122,48 @@ def test_modified_time(tmp_path: Path) -> None:
     stamp = store.modified_time(Table.BARS, "600000")
     assert stamp is not None
     assert stamp.timestamp() == 1_700_000_000
+
+
+# ---------------------------------------------------------------- 旧版本写入的文件
+
+
+def _write_old_dividends(root: Path, symbol: str) -> None:
+    """手写一个缺少 bonus_per_share 列的旧格式分红文件。"""
+    old = make_dividends(symbol, [(2020, D[0], D[1], 0.3)]).drop(columns=["bonus_per_share"])
+    (root / "dividends").mkdir(parents=True, exist_ok=True)
+    old.to_parquet(root / "dividends" / f"{symbol}.parquet", index=False)
+
+
+def _assert_outdated_message(exc: pytest.ExceptionInfo[StoredSchemaError]) -> None:
+    text = str(exc.value)
+    assert "dividends" in text
+    assert "bonus_per_share" in text
+    assert "删除该目录后重新运行 qt data update" in text
+
+
+def test_reading_old_schema_file_raises_clear_chinese_error(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    _write_old_dividends(tmp_path, "600000")
+    with pytest.raises(StoredSchemaError) as exc:
+        store.read(Table.DIVIDENDS, symbols=["600000"])
+    _assert_outdated_message(exc)
+    with pytest.raises(StoredSchemaError) as exc:
+        store.read(Table.DIVIDENDS)
+    _assert_outdated_message(exc)
+
+
+@pytest.mark.parametrize("order", [("000001", "600000"), ("600000", "000001")])
+def test_mixed_old_and_new_files_raise_the_same_error(
+    tmp_path: Path, order: tuple[str, str]
+) -> None:
+    store = ParquetStore(tmp_path)
+    store.write(Table.DIVIDENDS, make_dividends("000001", [(2020, D[0], D[1], 0.3)]), "000001")
+    _write_old_dividends(tmp_path, "600000")
+    with pytest.raises(StoredSchemaError) as exc:
+        store.read(Table.DIVIDENDS, symbols=list(order))
+    _assert_outdated_message(exc)
+    assert "600000" in str(exc.value)
+    with pytest.raises(StoredSchemaError) as exc:
+        store.read(Table.DIVIDENDS)
+    _assert_outdated_message(exc)
+    assert isinstance(exc.value, SchemaError)

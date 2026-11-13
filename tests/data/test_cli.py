@@ -248,3 +248,16 @@ def test_data_check_clean_store_and_empty_store(tmp_path: Path) -> None:
     empty = CliRunner().invoke(qt.cli.app, ["data", "check", "--data-dir", str(tmp_path / "no")])
     assert empty.exit_code == 1
     assert "trade_days 表为空" in empty.output
+
+
+def test_data_check_reports_old_schema_file(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    store.write(Table.TRADE_DAYS, make_trade_days(DAYS))
+    (tmp_path / "bars").mkdir()
+    old = make_bars("600000", DAYS, [10.0] * 10).drop(columns=["adj_factor"])
+    old.to_parquet(tmp_path / "bars" / "600000.parquet", index=False)
+    result = CliRunner().invoke(qt.cli.app, ["data", "check", "--data-dir", str(tmp_path)])
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "bars" in result.output and "adj_factor" in result.output
+    assert "删除该目录后重新运行 qt data update" in result.output

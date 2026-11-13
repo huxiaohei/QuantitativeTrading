@@ -17,10 +17,15 @@ from qt.data.schema import (
     PER_SYMBOL_TABLES,
     PRIMARY_KEYS,
     SCHEMAS,
+    SchemaError,
     Table,
     empty_frame,
     validate,
 )
+
+
+class StoredSchemaError(SchemaError):
+    """已存储的文件缺少当前表定义里的列（由旧版本写入），需要删除后重新下载。"""
 
 
 def _as_type(series: pd.Series, dtype: str) -> pd.Series:
@@ -124,8 +129,37 @@ class ParquetStore:
                 conds.append("day <= ?")
                 params.append(end)
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
-        df = _query(f"SELECT * FROM read_parquet(?){where}", params)
+        try:
+            df = _query(f"SELECT * FROM read_parquet(?){where}", params)
+        except duckdb.Error:
+            # 多个文件列不一致时 DuckDB 报错；若是旧格式文件，换成说明清楚的错误
+            self._raise_if_outdated(table, source)
+            raise
+        if any(c not in df.columns for c in SCHEMAS[table]):
+            self._raise_if_outdated(table, source)
         return _normalize(table, df)
+
+    def _raise_if_outdated(self, table: Table, source: str | list[str]) -> None:
+        """source 中有文件缺少表定义里的列时抛 StoredSchemaError（中文说明与处理办法）。"""
+        listing = _query("SELECT file_name, name FROM parquet_schema(?)", [source])
+        required = list(SCHEMAS[table])
+        have: dict[str, set[str]] = {}
+        for file_name, name in zip(listing["file_name"], listing["name"], strict=True):
+            have.setdefault(str(file_name), set()).add(str(name))
+        bad = sorted(f for f, cols in have.items() if any(c not in cols for c in required))
+        if not bad:
+            return
+        missing = sorted({c for f in bad for c in required if c not in have[f]})
+        if table in PER_SYMBOL_TABLES:
+            where = self._root / table.value
+            remedy = f"请删除该目录后重新运行 qt data update（目录：{where}）"
+        else:
+            where = self._path(table, None)
+            remedy = f"请删除该文件后重新运行 qt data update（文件：{where}）"
+        raise StoredSchemaError(
+            f"{table.value} 表有 {len(bad)} 个已存储文件缺少列 {missing}"
+            f"（由旧版本写入，如 {Path(bad[0]).name}）。{remedy}"
+        )
 
     def last_day(self, table: Table, symbol: str) -> date | None:
         """某只股票在该表中的最大 day；没有数据返回 None。"""

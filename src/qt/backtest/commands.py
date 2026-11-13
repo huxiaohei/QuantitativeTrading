@@ -22,6 +22,7 @@ from qt.backtest.report import (
 )
 from qt.backtest.sweep import parse_param, run_sweep
 from qt.config import load_config
+from qt.data.schema import SchemaError
 from qt.data.store import ParquetStore
 from qt.data.update import DataIntegrityError
 
@@ -61,21 +62,22 @@ def run(
         typer.echo(f"找不到数据局限文档 {data_gaps}，请用 --data-gaps 指定")
         raise typer.Exit(code=1)
     store = ParquetStore(data_dir)
-    last = last_bar_day(store)  # 只查一次，传给下面两步
-    if last is None:
-        typer.echo("无法回测：存储中没有日线数据，请先运行 qt data update")
-        raise typer.Exit(code=1)
     try:
+        last = last_bar_day(store)  # 只查一次，传给下面两步
+        if last is None:
+            raise BacktestInputError("存储中没有日线数据，请先运行 qt data update")
         start, end = resolve_period(cfg, store, period.value, last_day=last)
         result = run_period(cfg, store, start, end, last_day=last)
-    except (BacktestInputError, DataIntegrityError) as exc:
+        benchmarks = load_benchmarks(store, cfg, result.equity.index)
+        held = [p.symbol for p in result.open_positions]
+        closes = load_last_closes(store, held, result.equity.index[-1])
+        checks = load_data_checks(store, cfg, data_dir)
+    except (BacktestInputError, DataIntegrityError, SchemaError) as exc:
+        # SchemaError：存储里有旧版本写入的文件，提示删除后重新下载
         typer.echo(f"无法回测：{exc}")
         raise typer.Exit(code=1) from exc
 
-    benchmarks = load_benchmarks(store, cfg, result.equity.index)
     metrics = compute_metrics(result.equity, result.trades)
-    held = [p.symbol for p in result.open_positions]
-    closes = load_last_closes(store, held, result.equity.index[-1])
     name = f"backtest-{period.value}-{datetime.now():%Y%m%d-%H%M%S}.html"
     path = render_report(
         result,
@@ -86,7 +88,7 @@ def run(
         data_gaps,
         out / name,
         last_closes=closes,
-        data_checks=load_data_checks(store, cfg, data_dir),
+        data_checks=checks,
     )
     typer.echo(f"报告已生成：{path}")
     typer.echo(
