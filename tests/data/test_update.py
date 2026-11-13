@@ -21,9 +21,11 @@ from qt.data.update import (
     SharedTableError,
     check_integrity,
     count_no_bars,
+    fundamentals_due,
     latest_closed_day,
     load_calendar,
     merge_st_history,
+    refresh_fundamentals,
     update_all,
 )
 from tests.data.helpers import (
@@ -152,23 +154,66 @@ def test_fundamentals_are_refreshed_only_when_missing_or_stale(tmp_path: Path) -
         dividends=[div],
         financials=[fin],
     )
+    # 滚动刷新：每只股票每 7 天里恰有一天轮到；找出今天轮不到的最近一天作为“不轮到”的日子
+    off_day = next(d for d in DAYS if not fundamentals_due("600000", 3, d, 7))
+    on_day = next(d for d in DAYS if fundamentals_due("600000", 3, d, 7))
 
-    def fetched() -> set[str]:
+    def fetched(today: date) -> set[str]:
         source = _fake(dividends=div, financials=fin)
-        update_all(source, store, CFG, TODAY)
+        update_all(source, store, CFG, today)
         return {name for name, _ in source.calls if name in ("dividends", "financials")}
 
-    set_file_age(tmp_path, Table.DIVIDENDS, "600000", TODAY, 3)
-    set_file_age(tmp_path, Table.FINANCIALS, "600000", TODAY, 3)
-    assert fetched() == set()  # 都不足 7 天
-    set_file_age(tmp_path, Table.DIVIDENDS, "600000", TODAY, 7)
-    assert fetched() == set()  # 恰好 7 天不算“超过”
-    set_file_age(tmp_path, Table.DIVIDENDS, "600000", TODAY, 8)
-    assert fetched() == {"dividends"}
-    set_file_age(tmp_path, Table.FINANCIALS, "600000", TODAY, 30)
-    assert fetched() == {"financials"}  # 分红在上一次刷新后已是新文件，只剩财务过期
-    (tmp_path / "dividends" / "600000.parquet").unlink()
-    assert "dividends" in fetched()  # 文件缺失
+    set_file_age(tmp_path, Table.DIVIDENDS, "600000", off_day, 3)
+    set_file_age(tmp_path, Table.FINANCIALS, "600000", off_day, 3)
+    assert fetched(off_day) == set()  # 文件较新且今天没轮到
+    set_file_age(tmp_path, Table.DIVIDENDS, "600000", on_day, 3)
+    set_file_age(tmp_path, Table.FINANCIALS, "600000", on_day, 3)
+    assert fetched(on_day) == {"dividends", "financials"}  # 轮到的日子才刷新
+    set_file_age(tmp_path, Table.DIVIDENDS, "600000", off_day, 14)
+    assert fetched(off_day) == {"dividends"}  # 超过两轮必须下载；财务文件刚刷新过
+    (tmp_path / "financials" / "600000.parquet").unlink()
+    assert "financials" in fetched(off_day)  # 文件缺失
+
+
+def test_fundamentals_due_spreads_symbols_over_refresh_days() -> None:
+    today = date(2026, 11, 16)
+    symbols = [f"{i:06d}" for i in range(600000, 600700)]
+    due = [s for s in symbols if fundamentals_due(s, age_days=3, today=today, refresh_days=7)]
+    assert 60 <= len(due) <= 140  # 约七分之一
+    assert fundamentals_due("600000", None, today, 7)  # 文件缺失必须下载
+    assert fundamentals_due("600000", 14, today, 7)  # 超过两轮必须下载
+    assert not fundamentals_due("600000", 0, today, 7)  # 当天已下载不重复
+    week = [today + timedelta(days=i) for i in range(7)]
+    assert sum(fundamentals_due("600000", 3, d, 7) for d in week) == 1  # 每轮恰好轮到一次
+    assert fundamentals_due("600000", 1, today, 0)  # refresh_days 为 0：每次都下载
+
+
+def test_refresh_fundamentals_ignores_freshness_and_reports_failures(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    div = pd.concat(
+        [
+            make_dividends(s, [(2023, date(2024, 7, 1), date(2024, 7, 10), 0.3)])
+            for s in ("600001", "600002")
+        ]
+    )
+    fin = pd.concat(
+        [
+            make_financials(s, [{"report_period": date(2023, 12, 31), "announce_date": TODAY}])
+            for s in ("600001", "600002")
+        ]
+    )
+    populate_store(
+        store,
+        dividends=[div[div["symbol"] == s] for s in ("600001", "600002")],
+        financials=[fin[fin["symbol"] == s] for s in ("600001", "600002")],
+    )  # 两只的文件都是刚写的
+    source = _fake(dividends=div, financials=fin)
+    source.fail_symbols = {"600002"}
+    failed = refresh_fundamentals(source, store, CFG, ["600001", "600002"])
+    assert [a for n, a in source.calls if n == "dividends"] == [("600001",), ("600002",)]
+    assert list(failed) == ["600002"]
+    assert "模拟取数失败" in failed["600002"]
+    assert len(store.read(Table.DIVIDENDS, symbols=["600001"])) == 1
 
 
 def test_fundamentals_keep_only_rows_from_data_start(tmp_path: Path) -> None:

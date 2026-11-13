@@ -236,7 +236,10 @@ def normalize_dividends(symbol: str, raw: pd.DataFrame) -> pd.DataFrame:
     的股数，(送股 + 转增) / 10 得 bonus_per_share（每股送转股数，缺失按 0）。
     announce_date 取 `公告日期`（实施公告日，晚于预案日），缺失时退回除权日（更保守）。
     同一除权日有多行（例如年报分红加特别分红）时合并：派息、送转相加，公告日取最早。
+    输入为空或缺少 `除权除息日` 列（数据源对没有分红记录的股票的返回）时，返回列齐全的空表。
     """
+    if len(raw) == 0 or "除权除息日" not in raw.columns:
+        return empty_frame(Table.DIVIDENDS)  # 没有分红记录的股票，数据源返回缺列的空表
     ex = to_dates(raw["除权除息日"])
     cash = to_numbers(raw["派息"]).fillna(0.0)
     bonus = to_numbers(raw["送股"]).fillna(0.0) + to_numbers(raw["转增"]).fillna(0.0)

@@ -1,6 +1,7 @@
 """增量更新与数据完整性检查。"""
 
 import logging
+import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -366,12 +367,24 @@ def _years_before(day: date, years: int) -> date:
         return day.replace(year=day.year - years, day=28)
 
 
-def _is_stale(
-    store: ParquetStore, table: Table, symbol: str, today: date, refresh_days: int
-) -> bool:
-    """文件不存在，或修改时间距今超过 refresh_days 天。"""
+def fundamentals_due(symbol: str, age_days: int | None, today: date, refresh_days: int) -> bool:
+    """分红或财务文件今天是否该重新下载（滚动刷新，把各股票错开到不同的日子）。
+
+    文件缺失（age_days 为 None）必须下载；当天已下载（0）不重复；超过两轮（>= 2 * refresh_days）
+    必须下载，兜底错过轮次的文件；否则每只股票每 refresh_days 天按代码散列轮到一次。
+    """
+    if age_days is None:
+        return True
+    if age_days == 0:
+        return False
+    if refresh_days == 0 or age_days >= 2 * refresh_days:
+        return True
+    return zlib.crc32(symbol.encode()) % refresh_days == today.toordinal() % refresh_days
+
+
+def _file_age_days(store: ParquetStore, table: Table, symbol: str, today: date) -> int | None:
     stamp = store.modified_time(table, symbol)
-    return stamp is None or (today - stamp.date()).days > refresh_days
+    return None if stamp is None else (today - stamp.date()).days
 
 
 def _update_bars(
@@ -402,17 +415,38 @@ def _update_bars(
 
 
 def _update_fundamentals(
-    source: DataSource, store: ParquetStore, cfg: AppConfig, symbol: str, today: date
+    source: DataSource,
+    store: ParquetStore,
+    cfg: AppConfig,
+    symbol: str,
+    today: date,
+    force: bool = False,
 ) -> None:
-    """分红与财务：文件缺失或过期才重新下载，只保留 data_start 之后的行。"""
+    """分红与财务：按文件年龄滚动刷新（force 为真则不看年龄），只保留 data_start 之后的行。"""
     days = cfg.data.fundamentals_refresh_days
     start = pd.Timestamp(cfg.backtest.data_start)
-    if _is_stale(store, Table.DIVIDENDS, symbol, today, days):
+    age = _file_age_days(store, Table.DIVIDENDS, symbol, today)
+    if force or fundamentals_due(symbol, age, today, days):
         div = source.dividends(symbol)
         store.write(Table.DIVIDENDS, div[div["ex_date"] >= start], symbol)
-    if _is_stale(store, Table.FINANCIALS, symbol, today, days):
+    age = _file_age_days(store, Table.FINANCIALS, symbol, today)
+    if force or fundamentals_due(symbol, age, today, days):
         fin = source.financials(symbol)
         store.write(Table.FINANCIALS, fin[fin["report_period"] >= start], symbol)
+
+
+def refresh_fundamentals(
+    source: DataSource, store: ParquetStore, cfg: AppConfig, symbols: Sequence[str]
+) -> dict[str, str]:
+    """不看新鲜度，强制重新下载这些股票的分红和财务；返回 symbol -> 错误信息（成功的不在里面）。"""
+    today = datetime.now(_MARKET_TZ).date()
+    failed: dict[str, str] = {}
+    for symbol in symbols:
+        try:
+            _update_fundamentals(source, store, cfg, symbol, today, force=True)
+        except Exception as exc:  # 单只失败不影响其他股票
+            failed[symbol] = f"{type(exc).__name__}: {exc}"
+    return failed
 
 
 def _finalize_and_write(store: ParquetStore, merged: pd.DataFrame) -> list[str]:

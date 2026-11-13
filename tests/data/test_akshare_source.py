@@ -130,6 +130,24 @@ def test_normalize_dividends_converts_per_10_shares_and_fiscal_year() -> None:
     assert out["ex_date"].tolist() == [pd.Timestamp("2024-07-18"), pd.Timestamp("2025-07-16")]
 
 
+def test_dividends_without_history_convert_to_empty_frame() -> None:
+    # 数据源对没有分红记录的股票返回无列空表
+    sample = normalize_dividends(
+        "600000", _raw_dividends([("2025-07-10", 4.10, "实施", "2025-07-16")])
+    )
+    out = normalize_dividends("603293", pd.DataFrame())
+    assert list(out.columns) == list(sample.columns)
+    assert len(out) == 0
+    validate(Table.DIVIDENDS, out)
+
+
+def test_dividends_missing_ex_date_column_convert_to_empty_frame() -> None:
+    raw = pd.DataFrame({"公告日期": ["2025-07-10"], "派息": [4.1], "进度": ["实施"]})
+    out = normalize_dividends("603293", raw)
+    assert len(out) == 0
+    validate(Table.DIVIDENDS, out)
+
+
 def test_fiscal_year_month_boundary() -> None:
     assert fiscal_year_of(date(2024, 8, 31)) == 2023
     assert fiscal_year_of(date(2024, 9, 1)) == 2024
