@@ -67,7 +67,8 @@ class HighDividendLow:
         """按股票池与买入条件筛选，股息率从高到低、同值按代码升序。
 
         任何指标为空值即不通过（NaN 的比较结果为假）；金融股豁免资产负债率。
-        exclude_dividend_cut 为真时，dividend_cut 为真的股票不通过（标志缺失同样不通过）。
+        exclude_dividend_cut 为真时，dividend_cut 为真的股票不通过。快照契约保证该列是真正的布尔值；
+        万一出现空值（NaN），也按"已削减"处理、不通过。
         """
         if snapshot.empty:
             return []
@@ -88,7 +89,7 @@ class HighDividendLow:
             )
         )
         if cfg.exclude_dividend_cut:
-            # 空值转 bool 为真，缺失的标志按"已削减"处理，不会被当成未削减
+            # 空值（NaN）转 bool 为真，因此 NaN 按"已削减"处理、不通过
             passes &= ~_bool_column(snapshot, "dividend_cut")
         # 一次性取出通过筛选的行，避免逐个单元格查表
         picked = snapshot.loc[passes.to_numpy(), [*_METRIC_COLUMNS, "close", "industry"]]

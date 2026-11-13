@@ -758,17 +758,22 @@ def _brute_total(rows: Sequence[tuple[int, date, date, float, float]], fy: int, 
 def test_dividend_features_match_brute_force_definition(tmp_path: Path) -> None:
     rng = np.random.default_rng(7)
     days = D[:650]
-    symbols = [f"60000{i}" for i in range(4)]
+    symbols = [f"60000{i}" for i in range(6)]
     divs: dict[str, list[tuple[int, date, date, float, float]]] = {}
     for symbol in symbols:
-        ex_days = sorted({days[int(i)] for i in rng.integers(0, len(days), size=8)})
+        # 每个财年一个随机分红水平，水平有升有降，使削减标志真假都常见；
+        # 部分财年拆成当年 8 月公告的中期分红 + 次年公告的末期分红，部分末期分红带送转
         rows: list[tuple[int, date, date, float, float]] = []
-        for ex in ex_days:
-            announced = ex - timedelta(days=int(rng.integers(0, 40)))
-            cash = float(rng.choice([0.0, 0.1, 0.2, 0.35]))
-            bonus = float(rng.choice([0.0, 0.0, 0.3, 1.0]))
-            cash = 0.15 if cash == 0 and bonus == 0 else cash
-            rows.append((ex.year - 1 if ex.month <= 8 else ex.year, announced, ex, cash, bonus))
+        for fy in range(2016, 2023):
+            level = float(rng.choice([0.2, 0.3, 0.5]))
+            final = date(fy + 1, int(rng.integers(3, 7)), int(rng.integers(1, 29)))
+            interim = level / 2 if rng.random() < 0.4 else 0.0
+            if interim > 0:
+                announced = date(fy, 8, int(rng.integers(10, 29)))
+                rows.append((fy, announced, announced + timedelta(days=20), interim, 0.0))
+            bonus = float(rng.choice([0.0, 0.0, 0.0, 0.3, 1.0]))
+            ex = final + timedelta(days=int(rng.integers(5, 40)))
+            rows.append((fy, final, ex, level - interim, bonus))
         divs[symbol] = rows
     closes = [5 + (i % 37) * 0.1 for i in range(len(days))]
     panel = _panel(
@@ -778,6 +783,9 @@ def test_dividend_features_match_brute_force_definition(tmp_path: Path) -> None:
         start=days[0],
         end=days[-1],
     )
+    flags: list[bool] = []
+    previous: dict[str, tuple[bool, int]] = {}
+    cleared: set[str] = set()
     for k in range(0, len(days), 3):
         day = days[k]
         snap = panel.snapshot(day)
@@ -795,8 +803,18 @@ def test_dividend_features_match_brute_force_definition(tmp_path: Path) -> None:
             assert _f(snap, symbol, "dividend_open_fy_total") == pytest.approx(current, abs=1e-12)
             level = max(fy, current)
             assert _f(snap, symbol, "dividend_yield") == pytest.approx(level / closes[k], abs=1e-12)
-            assert _b(snap, symbol, "dividend_cut") is (prev > 0 and level < prev - 1e-9)
+            cut = _b(snap, symbol, "dividend_cut")
+            assert cut is (prev > 0 and level < prev - 1e-9)
             assert int(cast(int, snap.at[symbol, "dividend_years"])) == run, (day, symbol)
+            last = previous.get(symbol)
+            if last is not None and last[0] and not cut:
+                # 真 → 假：Y* 未变说明是本年度已公告分红回升，Y* 变了说明是 9 月 1 日换年
+                cleared.add("roll" if last[1] != closed else "recovery")
+            previous[symbol] = (cut, closed)
+            flags.append(cut)
+    # 样本必须真假都有，并覆盖两种解除方式，否则对削减标志的检验没有意义
+    assert 0.05 <= sum(flags) / len(flags) <= 0.95, sum(flags) / len(flags)
+    assert cleared == {"roll", "recovery"}
 
 
 def test_bars_with_non_positive_open_or_close_are_treated_as_missing(tmp_path: Path) -> None:
