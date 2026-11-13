@@ -13,13 +13,12 @@ from typing import cast
 import pandas as pd
 
 from qt.calendar import TradingCalendar
-from qt.costs import CostModel
+from qt.costs import LOT_SIZE, CostModel
 from qt.features import Bar, FeaturePanel
 from qt.models import BuyCandidate, ExitReason, Order, Position, Side, Trade
 from qt.risk import Rejection, RiskEvent, RiskEventKind, RiskManager
 from qt.strategy.base import Strategy
 
-_LOT = 100
 _EPS = 1e-9  # 价格与涨跌停价比较的容差
 
 
@@ -203,7 +202,7 @@ def _match_buys(
                 remaining.append(order)
             continue
         lots = costs.max_lots(bar.open, max(state.cash, 0.0))
-        shares = min(order.shares, lots * _LOT)
+        shares = min(order.shares, lots * LOT_SIZE)
         if shares <= 0:
             state.expired_buys.append(order)
             del state.candidates[order.symbol]

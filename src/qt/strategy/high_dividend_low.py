@@ -4,7 +4,7 @@
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import date
 from typing import SupportsFloat, cast
@@ -41,12 +41,6 @@ def _cell(snapshot: pd.DataFrame, symbol: str, column: str) -> object:
 
 def _float_at(snapshot: pd.DataFrame, symbol: str, column: str) -> float:
     return _to_float(_cell(snapshot, symbol, column))
-
-
-def _industry_at(snapshot: pd.DataFrame, symbol: str) -> str:
-    """行业名；缺失（空值）时用空字符串。"""
-    value = _cell(snapshot, symbol, "industry")
-    return value if isinstance(value, str) else ""
 
 
 def _float_column(snapshot: pd.DataFrame, column: str) -> "pd.Series[float]":
@@ -92,24 +86,29 @@ class HighDividendLow:
                 | _bool_column(snapshot, "is_financial")
             )
         )
-        symbols = [str(s) for s in snapshot.index[passes.to_numpy()]]
+        # 一次性取出通过筛选的行，避免逐个单元格查表
+        picked = snapshot.loc[passes.to_numpy(), [*_METRIC_COLUMNS, "close", "industry"]]
+        records = picked.to_dict("records")
         candidates = [
-            self._candidate(day, snapshot, symbol) for symbol in symbols if symbol not in held
+            self._candidate(day, str(symbol), record)
+            for symbol, record in zip(picked.index, records, strict=True)
+            if str(symbol) not in held
         ]
         candidates.sort(key=lambda c: (-c.metrics["dividend_yield"], c.symbol))
         return candidates
 
-    def _candidate(self, day: date, snapshot: pd.DataFrame, symbol: str) -> BuyCandidate:
-        metrics = {col: _float_at(snapshot, symbol, col) for col in _METRIC_COLUMNS}
+    def _candidate(self, day: date, symbol: str, record: Mapping[Hashable, object]) -> BuyCandidate:
+        metrics = {col: _to_float(record[col]) for col in _METRIC_COLUMNS}
         reason = (
             f"股息率 {metrics['dividend_yield']:.1%}，"
             f"处于一年价格区间底部 {metrics['price_position']:.0%}"
         )
+        industry = record["industry"]
         return BuyCandidate(
             symbol=symbol,
             day=day,
-            close=_float_at(snapshot, symbol, "close"),
-            industry=_industry_at(snapshot, symbol),
+            close=_to_float(record["close"]),
+            industry=industry if isinstance(industry, str) else "",  # 缺失（空值）时用空字符串
             metrics=metrics,
             reason=reason,
         )

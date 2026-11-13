@@ -10,10 +10,9 @@ from enum import StrEnum
 
 from qt.calendar import TradingCalendar
 from qt.config import RiskConfig
-from qt.costs import CostModel
+from qt.costs import LOT_SIZE, CostModel
 from qt.models import BuyCandidate, ExitReason, Order, Position, Side
 
-_LOT = 100
 _EPS = 1e-9
 # 触发冷却的卖出原因；止盈与退市不冷却
 _COOLING_REASONS = frozenset({ExitReason.STOP_LOSS, ExitReason.TIME_STOP, ExitReason.FUNDAMENTAL})
@@ -241,15 +240,16 @@ class RiskManager:
             )
         price = closes.get(c.symbol, c.close)
         budget_lots = self._costs.max_lots(price, budget)
-        if budget_lots == 0:
+        if budget_lots <= 0:
             return (
                 "lot_too_expensive",
-                f"一手需约 {price * _LOT:.2f} 元（价格 {price:.2f}），超过单只预算 {budget:.2f} 元",
+                f"一手需约 {price * LOT_SIZE:.2f} 元（价格 {price:.2f}），"
+                f"超过单只预算 {budget:.2f} 元",
                 0,
             )
         existing = industry_mv.get(c.industry, 0.0)
         room = industry_limit - existing
-        industry_lots = int(room / (price * _LOT) + _EPS) if room > 0 else 0
+        industry_lots = int(room / (price * LOT_SIZE) + _EPS) if room > 0 else 0
         if industry_lots == 0:
             return (
                 "industry_cap",
@@ -258,7 +258,7 @@ class RiskManager:
                 0,
             )
         cash_lots = self._costs.max_lots(price, free_cash)
-        if cash_lots == 0:
+        if cash_lots <= 0:  # 待成交买单占用后可用现金可能为负
             return "no_cash", f"可用现金 {free_cash:.2f} 元不足以买入一手（价格 {price:.2f}）", 0
         lots = min(budget_lots, industry_lots, cash_lots)
-        return None, "", lots * _LOT
+        return None, "", lots * LOT_SIZE

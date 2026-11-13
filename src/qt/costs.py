@@ -2,7 +2,8 @@
 
 from qt.config import CostsConfig
 
-_LOT = 100
+# A 股一手 = 100 股；风控与回测引擎共用
+LOT_SIZE = 100
 
 
 class CostModel:
@@ -30,8 +31,13 @@ class CostModel:
         return amount - fees
 
     def max_lots(self, price: float, cash: float) -> int:
-        """现金够买的最大整手数（含费用），买不起一手返回 0。"""
-        lots = int(cash // (price * (1 + self._cfg.slippage) * _LOT))
-        while lots > 0 and self.buy_cost(price, lots * _LOT) > cash:
+        """现金够买的最大整手数（含费用），买不起一手返回 0；绝不返回负数。
+
+        现金或价格不为正（含 NaN）时返回 0：可用现金可能因待成交买单重估而为负。
+        """
+        if not (price > 0 and cash > 0):
+            return 0
+        lots = int(cash // (price * (1 + self._cfg.slippage) * LOT_SIZE))
+        while lots > 0 and self.buy_cost(price, lots * LOT_SIZE) > cash:
             lots -= 1
-        return lots
+        return max(lots, 0)

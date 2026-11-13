@@ -295,3 +295,19 @@ def test_paused_message_has_pause_day_and_drawdown() -> None:
     _, rej = mgr.size_buys(DAYS[2], [make_candidate("A")], 150_000, 150_000, [], {})
     assert str(DAYS[1]) in rej[0].message
     assert "20.00%" in rej[0].message
+
+
+def test_pending_buys_exceeding_cash_never_produce_negative_shares() -> None:
+    # 评审场景：待成交买单按今日收盘价重估后超过现金，可用现金为负
+    pending = [Order("600009", Side.BUY, 500, DAYS[0], "x")]
+    orders, rej = _mgr().size_buys(
+        DAYS[1],
+        [make_candidate("600001", close=10.0)],
+        equity=100_000,
+        cash=1000.0,
+        positions=[],
+        closes={"600009": 20.0, "600001": 10.0},
+        pending_buys=pending,
+    )
+    assert orders == []
+    assert [r.rule for r in rej] == ["no_cash"]
