@@ -1,0 +1,17 @@
+# 测试用 PostgreSQL：数据放内存（tmpfs），仅映射到本机 54329 端口
+services:
+  db-test:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: qt
+      POSTGRES_PASSWORD: qt
+      POSTGRES_DB: qt_test
+    ports:
+      - "127.0.0.1:54329:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qt -d qt_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
