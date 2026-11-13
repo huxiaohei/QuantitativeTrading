@@ -46,5 +46,8 @@ data:
   fundamentals_refresh_days: 7     # 分红、财务数据文件超过此天数才重新下载
   request_pause_seconds: 1.0       # 每次网络请求之后的礼貌间隔
   retries: 3                       # 单次请求最多尝试次数
+  request_timeout_seconds: 90      # 单次请求的墙钟时限，超时算一次失败的尝试
+  max_consecutive_failures: 20     # 连续这么多只股票因网络错误失败则中止本次运行（可续传）
   industries_refresh_days: 30      # 行业分类文件超过此天数才对全部在市股票重新查询
   min_industry_coverage: 0.9       # 在市股票中有行业分类的最低比例，低于此值视为数据问题
+  max_securities_shrink: 0.02      # 数据源证券数比已存储的少超过此比例视为数据问题

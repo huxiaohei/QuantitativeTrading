@@ -1,6 +1,7 @@
 """AKShare 原始表 → 标准表 的纯函数转换测试（不联网，列名取自 docs/data-gaps.md）。"""
 
 import math
+import threading
 from datetime import date
 
 import pandas as pd
@@ -25,7 +26,7 @@ from qt.data.akshare_convert import (
     period_label,
     statutory_deadline,
 )
-from qt.data.akshare_source import call_with_retry
+from qt.data.akshare_source import RequestTimeoutError, call_with_deadline, call_with_retry
 from qt.data.delist import UNKNOWN_DELIST_DATE
 from qt.data.schema import SCHEMAS, Table, validate
 
@@ -548,3 +549,51 @@ def test_call_with_retry_does_not_retry_fatal_errors() -> None:
     with pytest.raises(KeyError):
         call_with_retry(odd_shape, 3, 0.0, sleep=lambda _: None, fatal=(KeyError,))
     assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------- 墙钟时限
+
+
+def test_hung_call_times_out_on_every_attempt() -> None:
+    release = threading.Event()
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    def hang() -> int:
+        calls.append(1)
+        release.wait(5)
+        return 1
+
+    try:
+        with pytest.raises(RequestTimeoutError, match="秒"):
+            call_with_retry(hang, 2, 0.0, sleep=sleeps.append, timeout_seconds=0.05)
+        assert len(calls) == 2  # 超时算一次失败的尝试，会重试
+    finally:
+        release.set()
+
+
+def test_timed_out_attempt_is_retried_and_can_succeed() -> None:
+    release = threading.Event()
+    calls: list[int] = []
+
+    def first_hangs() -> str:
+        calls.append(1)
+        if len(calls) == 1:
+            release.wait(5)
+        return "ok"
+
+    try:
+        assert call_with_retry(first_hangs, 3, 0.0, sleep=lambda _: None, timeout_seconds=0.05)
+        assert len(calls) == 2
+    finally:
+        release.set()
+
+
+def test_deadline_passes_through_results_and_errors() -> None:
+    assert call_with_deadline(lambda: 42, 1.0) == 42
+
+    def boom() -> int:
+        raise ConnectionError("断线")
+
+    with pytest.raises(ConnectionError, match="断线"):
+        call_with_deadline(boom, 1.0)

@@ -512,12 +512,16 @@ def build_panel(
     """读取全部所需历史并构建 [start, end] 的 FeaturePanel。
 
     日线读到 end 为止的全部历史（保证 start 当天回看窗口有效），分红与财务读全量。
+    开盘价或收盘价不为正的日线当作当天没有日线（与停牌相同）。
     calendar 参数目前未使用，仅为保持调用方（命令行、测试）的签名不变而保留。
     """
     securities = store.read(Table.SECURITIES)
     securities = securities[securities["board"].isin(cfg.universe.boards)].reset_index(drop=True)
     symbols = [str(s) for s in securities["symbol"]]
     bars = store.read(Table.BARS, symbols=symbols, end=end)
+    # 开盘价或收盘价不为正的日线是坏数据：当作当天没有日线（不参与指标、撮合与计值）
+    bad = (bars["open"] <= 0) | (bars["close"] <= 0)
+    bars = bars[~bad].reset_index(drop=True)
     delisted = securities.dropna(subset=["delist_date"])
     delistings: dict[date, list[str]] = {}
     for symbol, when in zip(delisted["symbol"], delisted["delist_date"], strict=True):

@@ -1,9 +1,12 @@
 # pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportUnknownLambdaType=false, reportMissingTypeStubs=false
 """AKShare 数据源：带重试和间隔的网络封装。转换逻辑在 akshare_convert.py。"""
 
+import threading
 import time
 import warnings
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import date
 
 import akshare as ak
@@ -27,22 +30,52 @@ from qt.data.akshare_convert import (
 from qt.data.schema import Table, empty_frame, validate
 
 
+class RequestTimeoutError(TimeoutError):
+    """一次网络请求超过墙钟时限仍未返回。"""
+
+
+def call_with_deadline[T](fn: Callable[[], T], timeout_seconds: float) -> T:
+    """在后台守护线程里调用 fn，超过 timeout_seconds 秒未返回则抛 RequestTimeoutError。
+
+    AKShare 的套接字超时只限制两次收到数据之间的间隔，部分接口还会执行没有超时的 JavaScript，
+    因此需要自己的墙钟时限。超时的调用无法被强行停止：它所在的线程被放弃（守护线程，
+    不阻止程序退出），返回值被丢弃。
+    """
+    future: Future[T] = Future()
+
+    def worker() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(fn())
+        except BaseException as exc:  # 原样交给调用方
+            future.set_exception(exc)
+
+    threading.Thread(target=worker, name="qt-request", daemon=True).start()
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError:
+        raise RequestTimeoutError(f"请求超过 {timeout_seconds:g} 秒仍未返回，已放弃") from None
+
+
 def call_with_retry[T](
     fn: Callable[[], T],
     retries: int,
     pause_seconds: float,
     sleep: Callable[[float], None] = time.sleep,
     fatal: tuple[type[Exception], ...] = (),
+    timeout_seconds: float | None = None,
 ) -> T:
     """调用 fn，失败则间隔后重试，最多尝试 retries 次；成功后也停顿 pause_seconds。
 
     fatal 中的异常类型（如数据格式变化）不重试，直接抛出；最后一次失败后不再等待。
+    timeout_seconds 不为空时每次尝试都有墙钟时限（见 call_with_deadline），超时算一次失败的尝试。
     """
     attempts = max(retries, 1)
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            result = fn()
+            result = fn() if timeout_seconds is None else call_with_deadline(fn, timeout_seconds)
         except fatal:
             raise
         except Exception as exc:  # 网络接口可能抛任何异常，统一重试
@@ -69,12 +102,18 @@ def _slice_days(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
 class AkshareSource:
     """基于 AKShare（新浪、同花顺、巨潮、中证）的 DataSource。
 
-    所有网络请求单线程、带重试，每次请求之后停顿 request_pause_seconds。
+    所有网络请求依次进行、带重试，每次请求之后停顿 request_pause_seconds；每次尝试都有
+    request_timeout_seconds 的墙钟时限（在后台线程里执行，超时即放弃）。
     """
 
     def __init__(self, data: DataConfig, boards: Sequence[str], data_start: date) -> None:
         self._retries = data.retries
         self._pause = data.request_pause_seconds
+        self._timeout = data.request_timeout_seconds
+        setter = getattr(ak, "set_timeout", None)
+        if callable(setter):
+            # AKShare 自带的是套接字超时（连接、两次收到数据的间隔），只作补充，不能依赖
+            setter((10, self._timeout))
         self._boards = list(boards)
         self._data_start = data_start
         self._as_of: date | None = None
@@ -94,7 +133,9 @@ class AkshareSource:
         return self._as_of if self._as_of is not None else date.today()
 
     def _call[T](self, fn: Callable[[], T], fatal: tuple[type[Exception], ...] = ()) -> T:
-        return call_with_retry(fn, self._retries, self._pause, fatal=fatal)
+        return call_with_retry(
+            fn, self._retries, self._pause, fatal=fatal, timeout_seconds=self._timeout
+        )
 
     def trade_days(self) -> pd.DataFrame:
         raw = self._call(ak.tool_trade_date_hist_sina)

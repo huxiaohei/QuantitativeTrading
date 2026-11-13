@@ -723,3 +723,17 @@ def test_dividend_features_match_brute_force_definition(tmp_path: Path) -> None:
             assert _f(snap, symbol, "dividend_yield") == pytest.approx(expected_yield, abs=1e-12)
             assert _b(snap, symbol, "dividend_cut") is (prev > 0 and fy < prev - 1e-9)
             assert int(cast(int, snap.at[symbol, "dividend_years"])) == run, (day, symbol)
+
+
+def test_bars_with_non_positive_open_or_close_are_treated_as_missing(tmp_path: Path) -> None:
+    bars = make_bars(SYMBOL, D[:10], [10.0 + i for i in range(10)])
+    bars.loc[3, "open"] = 0.0
+    bars.loc[5, "close"] = -1.0
+    panel = _panel(tmp_path, [bars, _flat("600001", n=10)], start=D[0], end=D[9])
+    for i in (3, 5):
+        assert SYMBOL not in panel.snapshot(D[i]).index
+        assert panel.bar(D[i], SYMBOL) is None
+    assert panel.last_close(D[5], SYMBOL) == 14.0  # 跳过收盘价为负的那天
+    bar = panel.bar(D[6], SYMBOL)
+    assert bar is not None
+    assert bar.prev_close == 14.0  # 前一根有效日线

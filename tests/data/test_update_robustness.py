@@ -1,15 +1,19 @@
 """update_all 的中断与部分运行：磁盘上的表任何时候都是定稿状态。"""
 
+import logging
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+import qt.data.update as update_module
+from qt.config import AppConfig
 from qt.data.delist import UNKNOWN_DELIST_DATE
 from qt.data.schema import Table
 from qt.data.store import ParquetStore
-from qt.data.update import SharedTableError, merge_st_history, update_all
+from qt.data.update import NetworkOutageError, SharedTableError, merge_st_history, update_all
 from tests.data.helpers import (
     BrokenBenchmarkSource,
     InterruptingSource,
@@ -21,6 +25,7 @@ from tests.fakes import (
     FakeSource,
     default_app_config,
     make_bars,
+    make_industries,
     make_securities,
     make_st_history,
     populate_store,
@@ -237,3 +242,155 @@ def test_symbols_run_neither_refreshes_stale_industries_nor_resets_the_clock(
     full = LookupSource(classes, trade_days=make_trade_days(DAYS), securities=listed)
     update_all(full, store, CFG, AS_OF)
     assert full.industry_calls == ["600000", "600001", "600002"]  # 全量运行才处理过期
+
+
+# ---------------------------------------------------------------- securities 不缩水（I2）
+
+
+def _listed_source(symbols: list[str], **tables: pd.DataFrame) -> FakeSource:
+    secs = make_securities([(s, "sh_main", LISTED, None) for s in symbols])
+    return FakeSource(
+        trade_days=make_trade_days(DAYS),
+        securities=secs,
+        industries=make_industries([(s, "制造业", False) for s in symbols]),
+        **tables,
+    )
+
+
+def _shrink_problems(problems: Sequence[str]) -> list[str]:
+    return [p for p in problems if "证券" in p]
+
+
+def test_first_run_has_no_shrink_problem(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    symbols = [f"600{i:03d}" for i in range(5)]
+    report = update_all(_listed_source(symbols), store, CFG, AS_OF, symbols=symbols[:1])
+    assert _shrink_problems(report.problems) == []
+    assert store.read(Table.SECURITIES)["symbol"].tolist() == symbols
+
+
+def test_symbol_absent_from_later_source_is_kept(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    symbols = [f"600{i:03d}" for i in range(100)]
+    update_all(_listed_source(symbols), store, CFG, AS_OF, symbols=symbols[1:2])
+    before = store.read(Table.SECURITIES)
+    report = update_all(_listed_source(symbols[1:]), store, CFG, AS_OF, symbols=symbols[1:2])
+    after = store.read(Table.SECURITIES)
+    assert after["symbol"].tolist() == symbols  # 600000 不在本次数据源里，仍保留上次的行
+    pd.testing.assert_frame_equal(after, before)
+    assert _shrink_problems(report.problems) == []  # 少 1%，未超过 2%
+
+
+def test_empty_delisted_list_keeps_stored_delisted_rows_and_reports_problem(
+    tmp_path: Path,
+) -> None:
+    store = ParquetStore(tmp_path)
+    populate_store(store, bars=[make_bars("600005", DAYS[:6], [3.0] * 6)])
+    rows = [
+        ("600000", "sh_main", LISTED, None),
+        ("600001", "sh_main", LISTED, None),
+        ("600005", "sh_main", LISTED, DAYS[1]),  # 有日线：退市日定稿为最后日线 + 1 天
+        ("600006", "sh_main", LISTED, date(2023, 5, 1)),  # 无日线：沿用退市表日期
+    ]
+    first = FakeSource(trade_days=make_trade_days(DAYS), securities=make_securities(rows))
+    update_all(first, store, CFG, AS_OF, symbols=["600000"])
+    before = store.read(Table.SECURITIES)
+    second = FakeSource(trade_days=make_trade_days(DAYS), securities=make_securities(rows[:2]))
+    report = update_all(second, store, CFG, AS_OF, symbols=["600000"])
+    pd.testing.assert_frame_equal(store.read(Table.SECURITIES), before)
+    (problem,) = _shrink_problems(report.problems)
+    assert "2 只" in problem and "4 只" in problem
+
+
+# ---------------------------------------------------------------- 断网熔断（I7）
+
+
+class _OutageSource(FakeSource):
+    """bars() 对 down 中的股票抛网络错误。"""
+
+    def __init__(self, down: set[str], **tables: pd.DataFrame) -> None:
+        super().__init__(**tables)
+        self.down = down
+
+    def bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
+        if symbol in self.down:
+            self.calls.append(("bars", (symbol, start, end)))
+            raise ConnectionError(f"模拟断网：{symbol}")
+        return super().bars(symbol, start, end)
+
+
+def _limit(n: int) -> AppConfig:
+    return CFG.model_copy(
+        update={"data": CFG.data.model_copy(update={"max_consecutive_failures": n})}
+    )
+
+
+def test_consecutive_network_failures_abort_the_run(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    symbols = [f"60000{i}" for i in range(6)]
+    secs = make_securities(
+        [("600009", "sh_main", LISTED, DAYS[0])]  # 已退市，本次补到日线
+        + [(s, "sh_main", LISTED, None) for s in symbols]
+    )
+    source = _OutageSource(
+        set(symbols),
+        trade_days=make_trade_days(DAYS),
+        securities=secs,
+        bars=make_bars("600009", DAYS[:4], [3.0] * 4),
+    )
+    with pytest.raises(NetworkOutageError, match="连续 3 只"):
+        update_all(source, store, _limit(3), AS_OF)
+    requested = [str(args[0]) for name, args in source.calls if name == "bars"]
+    assert requested == ["600009", "600000", "600001", "600002"]
+    # 熔断后仍然定稿了 securities
+    row = store.read(Table.SECURITIES).set_index("symbol").loc["600009"]
+    assert bool(row["delist_date"] == pd.Timestamp(DAYS[3]) + pd.Timedelta(days=1))
+
+
+def test_success_resets_the_failure_streak_and_other_errors_do_not_count(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    symbols = [f"60000{i}" for i in range(7)]
+    source = _OutageSource(
+        {"600000", "600001", "600003", "600004"},
+        trade_days=make_trade_days(DAYS),
+        securities=make_securities([(s, "sh_main", LISTED, None) for s in symbols]),
+        bars=pd.concat([make_bars(s, DAYS, [10.0] * 10) for s in ("600002", "600006")]),
+    )
+    source.fail_symbols = {"600005"}  # RuntimeError：不是网络错误，不计入连续失败
+    report = update_all(source, store, _limit(3), AS_OF)
+    assert sorted(report.failed) == ["600000", "600001", "600003", "600004", "600005"]
+
+
+def test_delisted_symbols_without_bars_do_not_trip_the_breaker(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    secs = make_securities([(f"60000{i}", "sh_main", LISTED, DAYS[0]) for i in range(5)])
+    source = FakeSource(trade_days=make_trade_days(DAYS), securities=secs)
+    report = update_all(source, store, _limit(2), AS_OF)
+    assert len(report.failed) == 5
+    assert all("无日线数据" in m for m in report.failed.values())
+
+
+# ---------------------------------------------------------------- 定稿失败不掩盖原异常
+
+
+def test_finalize_error_does_not_mask_the_original_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls: list[int] = []
+    real = update_module.finalize_securities
+
+    def flaky(secs: pd.DataFrame, store: ParquetStore) -> tuple[pd.DataFrame, list[str]]:
+        calls.append(1)
+        if len(calls) >= 2:
+            raise OSError("模拟定稿写盘失败")
+        return real(secs, store)
+
+    monkeypatch.setattr(update_module, "finalize_securities", flaky)
+    source = InterruptingSource(
+        1,
+        trade_days=make_trade_days(DAYS),
+        securities=make_securities([("600000", "sh_main", LISTED, None)]),
+    )
+    with caplog.at_level(logging.ERROR), pytest.raises(KeyboardInterrupt):
+        update_all(source, ParquetStore(tmp_path), CFG, AS_OF)
+    assert "模拟定稿写盘失败" in caplog.text

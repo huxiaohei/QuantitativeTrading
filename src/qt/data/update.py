@@ -1,5 +1,6 @@
 """增量更新与数据完整性检查。"""
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -39,6 +40,10 @@ _MARKET_TZ = ZoneInfo("Asia/Shanghai")
 _MARKET_CLOSE = time(16, 0)
 
 ProgressFn = Callable[[str, int, int], None]
+# 进度回调的默认间隔（只）
+DEFAULT_PROGRESS_EVERY = 20
+
+_log = logging.getLogger(__name__)
 
 
 class DataIntegrityError(Exception):
@@ -47,6 +52,42 @@ class DataIntegrityError(Exception):
 
 class SharedTableError(Exception):
     """共享表（交易日历、证券列表、ST、基准）更新失败。"""
+
+
+class NetworkOutageError(Exception):
+    """连续多只股票因网络错误失败，判断为网络中断，中止本次运行（已下载的数据保留，可续传）。"""
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """网络类错误：连接、超时与 requests 的各种异常都是 OSError 的子类。"""
+    return isinstance(exc, OSError)
+
+
+class _OutageGuard:
+    """统计连续因网络错误失败的股票数，达到上限即抛 NetworkOutageError。"""
+
+    def __init__(self, limit: int, stage: str) -> None:
+        self._limit = limit
+        self._stage = stage
+        self._streak = 0
+        self._last = ""
+
+    def ok(self) -> None:
+        """本只股票没有因网络错误失败（成功、跳过或其他原因失败）。"""
+        self._streak = 0
+
+    def failed(self, exc: BaseException) -> None:
+        if not _is_network_error(exc):
+            self._streak = 0
+            return
+        self._streak += 1
+        self._last = f"{type(exc).__name__}: {exc}"
+        if self._streak >= self._limit:
+            raise NetworkOutageError(
+                f"{self._stage}阶段连续 {self._streak} 只股票因网络错误失败"
+                f"（最近一次：{self._last}），判断为网络中断，已中止本次运行；"
+                "已下载的数据已保存，网络恢复后重新运行即可续传"
+            )
 
 
 @runtime_checkable
@@ -164,23 +205,58 @@ def merge_st_history(stored: pd.DataFrame, current: pd.DataFrame, as_of: date) -
     )
 
 
+def merge_securities(source: pd.DataFrame, stored: pd.DataFrame) -> pd.DataFrame:
+    """数据源本次的证券表并上已存储、但本次数据源里没有的证券（保留其上次的行）。
+
+    已存储的证券绝不因一次更新而消失：数据源偶尔返回空表或截断的表，或某只股票从列表里消失，
+    都不能让它的历史从回测里消失。
+    """
+    missing = stored[~stored["symbol"].isin(source["symbol"])]
+    if len(missing) == 0:
+        return source.reset_index(drop=True)
+    return pd.concat([source, missing], ignore_index=True)
+
+
+def _shrink_problem(source: pd.DataFrame, stored: pd.DataFrame, limit: float) -> list[str]:
+    """数据源本次的证券数比已存储的少超过 limit 比例时返回问题描述。"""
+    have, now = len(stored), len(source)
+    if have == 0 or now >= (1 - limit) * have:
+        return []
+    return [
+        f"数据源本次返回的证券 {now} 只，比已存储的 {have} 只少 {1 - now / have:.1%}，"
+        f"超过 {limit:.0%}；缺失的证券已按上次的记录保留，请检查数据源"
+    ]
+
+
 def _refresh_shared(
-    source: DataSource, store: ParquetStore, cfg: AppConfig, as_of: date
-) -> pd.DataFrame:
+    source: DataSource,
+    store: ParquetStore,
+    cfg: AppConfig,
+    as_of: date,
+    refresh_trade_days: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """每次运行刷新一次的共享表；任何一张失败都抛 SharedTableError。
 
-    返回数据源本次给出的 securities（已按配置板块过滤、退市日期未定稿）：下载范围由它决定，
-    而不是由磁盘上的表决定。写盘的 securities 先按已存储的日线定稿退市日期：磁盘上的表任何
-    时候都不含未定稿的日期或占位值；退市日期缺失且暂无日线的证券暂不写入（本次运行可能补到日线）。
+    返回 (数据源本次给出的 securities, 待定稿的合并表, 数据问题)。数据源本次的表已按配置板块过滤、
+    退市日期未定稿，下载范围由它决定，而不是由磁盘上的表决定；合并表另含已存储而本次数据源
+    没有的证券（见 merge_securities）。写盘的 securities 先按已存储的日线定稿退市日期：磁盘上的表
+    任何时候都不含未定稿的日期或占位值；退市日期缺失且暂无日线的证券暂不写入（本次运行可能补到日线）。
+    refresh_trade_days 为假时不再请求交易日历（调用方刚刷新过）。
     """
-    universe: list[pd.DataFrame] = []
-    _shared("trade_days", lambda: store.write(Table.TRADE_DAYS, source.trade_days()))
+    found: list[tuple[pd.DataFrame, pd.DataFrame, list[str]]] = []
+    if refresh_trade_days:
+        _shared("trade_days", lambda: store.write(Table.TRADE_DAYS, source.trade_days()))
 
     def write_securities() -> None:
         secs = source.securities()
         in_boards = secs[secs["board"].isin(cfg.universe.boards)].reset_index(drop=True)
-        universe.append(in_boards)
-        store.write(Table.SECURITIES, finalize_securities(in_boards, store)[0])
+        stored = store.read(Table.SECURITIES)
+        merged = merge_securities(in_boards, stored)
+        stored_in_boards = stored[stored["board"].isin(cfg.universe.boards)]
+        limit = cfg.data.max_securities_shrink
+        problems = _shrink_problem(in_boards, stored_in_boards, limit)
+        found.append((in_boards, merged, problems))
+        store.write(Table.SECURITIES, finalize_securities(merged, store)[0])
 
     _shared("securities", write_securities)
 
@@ -203,7 +279,7 @@ def _refresh_shared(
         store.write(Table.BENCHMARKS, merged)
 
     _shared("benchmarks", write_benchmarks)
-    return universe[0]
+    return found[0]
 
 
 def _record(failed: dict[str, str], symbol: str, message: str) -> None:
@@ -241,12 +317,15 @@ def _refresh_industries(
         have = set(stored["symbol"])
         todo = list(targets) if stale else [s for s in targets if s not in have]
         found: dict[str, tuple[str, bool]] = {}
+        guard = _OutageGuard(cfg.data.max_consecutive_failures, "行业查询")
         for i, symbol in enumerate(todo, start=1):
             try:
                 classified = source.industry(symbol)
             except Exception as exc:  # 单只失败不影响其他股票
                 _record(failed, symbol, f"{INDUSTRY_FAILED_PREFIX}：{type(exc).__name__}: {exc}")
+                guard.failed(exc)  # 连续网络错误则中止，已查到的行业不写盘，下次重查
             else:
+                guard.ok()
                 if classified is not None:
                     found[symbol] = classified
             if progress is not None and i % progress_every == 0:
@@ -333,6 +412,13 @@ def _update_fundamentals(
         store.write(Table.FINANCIALS, fin[fin["report_period"] >= start], symbol)
 
 
+def _finalize_and_write(store: ParquetStore, merged: pd.DataFrame) -> list[str]:
+    """按现已存储的日线定稿 merged 并写回 securities，返回被丢弃的代码。"""
+    final, dropped = finalize_securities(merged, store)
+    store.write(Table.SECURITIES, final)
+    return dropped
+
+
 def update_all(
     source: DataSource,
     store: ParquetStore,
@@ -340,29 +426,29 @@ def update_all(
     as_of: date,
     symbols: Sequence[str] | None = None,
     progress: ProgressFn | None = None,
-    progress_every: int = 100,
+    progress_every: int = DEFAULT_PROGRESS_EVERY,
+    refresh_trade_days: bool = True,
 ) -> UpdateReport:
     """更新全部数据。
 
     as_of 是“最后一个已完整收盘的交易日”（见 latest_closed_day）：任何晚于 as_of 的日线都不入库。
-    先刷新共享表（失败抛 SharedTableError），再增量更新行业，最后逐只更新日线、分红、财务。
+    先刷新共享表（失败抛 SharedTableError；refresh_trade_days 为假时跳过交易日历，供刚刷新过它的
+    调用方使用），再增量更新行业，最后逐只更新日线、分红、财务。
     symbols 非空时，逐股数据和行业查询都只处理这些股票；共享表仍整表刷新。
-    单只股票失败记入 failed，不影响其他股票。运行结束时统一定稿全部退市证券的 delist_date。
+    单只股票失败记入 failed，不影响其他股票；但连续 data.max_consecutive_failures 只股票因网络错误
+    失败时抛 NetworkOutageError 中止（已退市且取不到日线的不算）。运行结束时（包括被中断或中止）
+    统一定稿全部退市证券的 delist_date；定稿本身出错时记日志，不掩盖原来的异常。
     progress(阶段, 已处理数, 总数) 每处理 progress_every 只调用一次。
     """
     if isinstance(source, AsOfAware):
         source.set_as_of(as_of)
-    source_secs = _refresh_shared(source, store, cfg, as_of)
+    source_secs, merged, problems = _refresh_shared(source, store, cfg, as_of, refresh_trade_days)
     in_universe = source_secs.set_index("symbol")
     wanted = list(in_universe.index) if symbols is None else list(dict.fromkeys(symbols))
 
     failed: dict[str, str] = {}
     is_listed = in_universe["delist_date"].isna().to_dict()
     listed_wanted = [s for s in wanted if is_listed.get(s, False)]
-    problems = _refresh_industries(
-        source, store, cfg, listed_wanted, as_of, failed, progress, progress_every, symbols is None
-    )
-
     calendar_days = store.read(Table.TRADE_DAYS)
     latest = as_of
     if len(calendar_days) > 0:
@@ -371,7 +457,19 @@ def update_all(
     window_start = pd.Timestamp(first_start) - pd.Timedelta(days=_DELIST_MARGIN_DAYS)
 
     updated = skipped = 0
+    guard = _OutageGuard(cfg.data.max_consecutive_failures, "日线")
     try:
+        problems = problems + _refresh_industries(
+            source,
+            store,
+            cfg,
+            listed_wanted,
+            as_of,
+            failed,
+            progress,
+            progress_every,
+            symbols is None,
+        )
         for i, symbol in enumerate(wanted, start=1):
             try:
                 if symbol not in in_universe.index:
@@ -384,17 +482,23 @@ def update_all(
                     changed = _update_bars(source, store, cfg, symbol, delisted, as_of, latest)
                     _update_fundamentals(source, store, cfg, symbol, as_of)
                     updated, skipped = (updated + 1, skipped) if changed else (updated, skipped + 1)
+                guard.ok()
             except _NoBarsError:
                 _record(failed, symbol, f"{NO_BARS_PREFIX}：已退市股票取不到日线")
+                guard.ok()
             except Exception as exc:  # 单只股票失败不影响其他股票
                 _record(failed, symbol, f"{type(exc).__name__}: {exc}")
+                guard.failed(exc)
             if progress is not None and i % progress_every == 0:
                 progress("日线", i, len(wanted))
-
-    finally:
-        # 即使被中断，也按数据源本次的证券表和现已存储的日线重新定稿 securities
-        final, dropped = finalize_securities(source_secs, store)
-        store.write(Table.SECURITIES, final)
+    except BaseException:
+        # 被中断或中止：仍按现已存储的日线定稿 securities；定稿出错只记日志，抛出原来的异常
+        try:
+            _finalize_and_write(store, merged)
+        except Exception:
+            _log.exception("中断后定稿 securities 失败（原异常将继续抛出）")
+        raise
+    dropped = _finalize_and_write(store, merged)
 
     attempted = set(wanted)
     for symbol in dropped:

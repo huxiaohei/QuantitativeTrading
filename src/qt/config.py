@@ -116,13 +116,16 @@ class BacktestConfig(_Frozen):
 
 
 class DataConfig(_Frozen):
-    """数据下载参数：基本面刷新间隔、请求间隔与重试次数。"""
+    """数据下载参数：刷新间隔、请求间隔、重试、超时与熔断。"""
 
     fundamentals_refresh_days: NonNegativeInt
     request_pause_seconds: NonNegativeFloat
     retries: PositiveInt
+    request_timeout_seconds: PositiveFloat
+    max_consecutive_failures: PositiveInt
     industries_refresh_days: NonNegativeInt
     min_industry_coverage: Share
+    max_securities_shrink: Rate
 
 
 class AppConfig(_Frozen):
