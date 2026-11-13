@@ -125,6 +125,21 @@ def test_parse_param_unknown_path_and_bad_value_raise() -> None:
         parse_param(cfg, "strategy.take_profit_mode=fixed,foo")
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "strategy.stop_loss=0.1,nan",
+        "strategy.stop_loss=inf",
+        "strategy.stop_loss=-0.1",
+        "risk.max_position_pct=1.5",
+        "risk.max_positions=0",
+    ],
+)
+def test_parse_param_rejects_out_of_range_values(text: str) -> None:
+    with pytest.raises(ValueError, match="无效"):
+        parse_param(default_app_config(), text)
+
+
 # ---------- run_sweep ----------
 
 

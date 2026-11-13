@@ -104,7 +104,11 @@ def parse_plain(value: object) -> float:
 
 
 def board_of_code(symbol: str) -> str | None:
-    """按代码前缀判断板块；B 股、科创板、北交所等不支持的返回 None。"""
+    """按代码前缀判断板块；B 股、科创板、北交所等不支持的返回 None。
+
+    创业板识别为 chinext 只是为了把它排除在外：配置的 universe.boards 不允许 chinext
+    （涨跌幅 ±20%，回测的涨跌停模型不适用）。
+    """
     if symbol[:3] in ("600", "601", "603", "605"):
         return "sh_main"
     if symbol[:3] in ("000", "001", "002", "003"):

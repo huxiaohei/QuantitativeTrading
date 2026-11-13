@@ -1,4 +1,7 @@
-"""交易成本模型：佣金、印花税、过户费与滑点。"""
+"""交易成本模型：佣金、印花税（按历史税率分段）、过户费与滑点。"""
+
+from bisect import bisect_right
+from datetime import date
 
 from qt.config import CostsConfig
 
@@ -11,6 +14,7 @@ class CostModel:
 
     def __init__(self, cfg: CostsConfig) -> None:
         self._cfg = cfg
+        self._tax_starts = [p.start for p in cfg.stamp_tax_schedule]
 
     def _commission(self, amount: float) -> float:
         return max(self._cfg.min_commission, amount * self._cfg.commission_rate)
@@ -20,12 +24,18 @@ class CostModel:
         amount = price * (1 + self._cfg.slippage) * shares
         return amount + self._commission(amount) + amount * self._cfg.transfer_fee_rate
 
-    def sell_proceeds(self, price: float, shares: float) -> float:
-        """卖出的现金流入净额（扣滑点、佣金、印花税、过户费）。"""
+    def stamp_tax_rate(self, day: date) -> float:
+        """day 当天有效的印花税率；早于第一段起始日的日子按第一段税率。"""
+        schedule = self._cfg.stamp_tax_schedule
+        i = bisect_right(self._tax_starts, day)
+        return schedule[max(i - 1, 0)].rate
+
+    def sell_proceeds(self, price: float, shares: float, day: date) -> float:
+        """day 当天卖出的现金流入净额（扣滑点、佣金、当天有效的印花税、过户费）。"""
         amount = price * (1 - self._cfg.slippage) * shares
         fees = (
             self._commission(amount)
-            + amount * self._cfg.stamp_tax_rate
+            + amount * self.stamp_tax_rate(day)
             + amount * self._cfg.transfer_fee_rate
         )
         return amount - fees

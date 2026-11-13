@@ -16,6 +16,7 @@ import pytest
 
 from qt.backtest.engine import BacktestResult, limit_prices, run_backtest
 from qt.calendar import TradingCalendar
+from qt.config import CostsConfig, StampTaxPeriod
 from qt.costs import CostModel
 from qt.data.store import ParquetStore
 from qt.features import build_panel
@@ -76,6 +77,7 @@ def _run(
     risk_update: Mapping[str, float] | None = None,
     initial_cash: float = CASH,
     name: str = "store",
+    costs_cfg: CostsConfig | None = None,
 ) -> BacktestResult:
     cfg = default_app_config()
     calendar = TradingCalendar(D)
@@ -92,7 +94,7 @@ def _run(
     )
     panel = build_panel(store, calendar, cfg, D[0], D[N - 1])
     risk_cfg = default_risk().model_copy(update=dict(risk_update or {}))
-    costs = CostModel(cfg.costs)
+    costs = CostModel(costs_cfg or cfg.costs)
     risk = RiskManager(risk_cfg, calendar, costs)
     return run_backtest(panel, strategy, risk, costs, calendar, D[0], D[N - 1], initial_cash)
 
@@ -182,7 +184,7 @@ def test_sell_blocked_at_limit_down_carries_over(tmp_path: Path) -> None:
     (trade,) = result.trades
     assert trade.exit_day == D[5]
     assert trade.exit_reason is ExitReason.STOP_LOSS
-    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(8.0, 1000))
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(8.0, 1000, trade.exit_day))
     assert result.open_positions == []
 
 
@@ -195,7 +197,7 @@ def test_st_position_uses_5_percent_limit(tmp_path: Path) -> None:
     result = _run(tmp_path, [bars], strategy, st_history=st)
     (trade,) = result.trades
     assert trade.exit_day == D[4]
-    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.0, 1000))
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.0, 1000, trade.exit_day))
 
 
 def test_suspended_position_valued_at_last_close_and_order_deferred(tmp_path: Path) -> None:
@@ -208,7 +210,7 @@ def test_suspended_position_valued_at_last_close_and_order_deferred(tmp_path: Pa
         assert _at(result.cash, D[i]) == pytest.approx(_at(result.cash, D[2]))
     (trade,) = result.trades
     assert trade.exit_day == D[8]
-    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(11.0, 1000))
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(11.0, 1000, trade.exit_day))
 
 
 def test_new_position_is_not_sold_on_signal_day_t_plus_1(tmp_path: Path) -> None:
@@ -284,7 +286,7 @@ def test_delisted_position_liquidated_at_last_close(tmp_path: Path) -> None:
     (trade,) = result.trades
     assert trade.exit_reason is ExitReason.DELISTED
     assert trade.exit_day == D[5]
-    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.5, 1000))
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.5, 1000, trade.exit_day))
     assert result.open_positions == []
     assert _at(result.equity, D[5]) == pytest.approx(_at(result.cash, D[5]))
 
@@ -295,7 +297,7 @@ def test_delisting_uses_previous_trading_day_close(tmp_path: Path) -> None:
     bars = _bars(S, {4: 10.5, 5: 9.0}, skip=range(6, N))
     result = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S)), delist={S: D[5]})
     (trade,) = result.trades
-    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.5, 1000))
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.5, 1000, trade.exit_day))
 
 
 def test_delisting_drops_pending_buy_of_unheld_symbol(tmp_path: Path) -> None:
@@ -315,7 +317,7 @@ def test_delist_date_on_non_trading_day_liquidates_next_trading_day(tmp_path: Pa
     (trade,) = result.trades
     assert trade.exit_reason is ExitReason.DELISTED
     assert trade.exit_day == monday
-    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.0, 1000))
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(10.0, 1000, trade.exit_day))
     assert result.open_positions == []
 
 
@@ -469,7 +471,7 @@ def test_limit_down_price_is_rounded_half_up_not_one_cent_low(tmp_path: Path) ->
     strategy = ScriptedStrategy(buys=_buy(S, close=7.85), sells={D[2]: [(S, ExitReason.STOP_LOSS)]})
     (trade,) = _run(tmp_path, [bars], strategy).trades
     assert trade.exit_day == D[4]
-    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(7.08, 1300))
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(7.08, 1300, trade.exit_day))
 
 
 def test_st_limit_down_price_inexact_product_is_deferred(tmp_path: Path) -> None:
@@ -511,7 +513,7 @@ def test_pending_sell_before_ex_dividend_sells_scaled_shares(tmp_path: Path) -> 
     strategy = ScriptedStrategy(buys=_buy(S), sells={D[1]: [(S, ExitReason.TAKE_PROFIT_FIXED)]})
     (trade,) = _run(tmp_path, [bars], strategy).trades
     assert trade.exit_day == D[2]
-    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(7.5, 1000 * 4 / 3))
+    assert trade.proceeds == pytest.approx(COSTS.sell_proceeds(7.5, 1000 * 4 / 3, trade.exit_day))
 
 
 def test_ex_dividend_during_suspension_applied_once_on_resume_day(tmp_path: Path) -> None:
@@ -532,3 +534,38 @@ def test_days_held_increments_during_suspension(tmp_path: Path) -> None:
     bars = _bars(S, skip=range(3, 8))
     (pos,) = _run(tmp_path, [bars], ScriptedStrategy(buys=_buy(S))).open_positions
     assert pos.days_held == 11
+
+
+def _switching_tax(switch_day: date) -> CostsConfig:
+    """印花税在 switch_day 由 0.1% 降为 0.05% 的成本配置。"""
+    schedule = [
+        StampTaxPeriod(start=date(2008, 9, 19), rate=0.001),
+        StampTaxPeriod(start=switch_day, rate=0.0005),
+    ]
+    return default_costs().model_copy(update={"stamp_tax_schedule": schedule})
+
+
+def test_sell_charged_stamp_tax_in_force_on_fill_day(tmp_path: Path) -> None:
+    # D[2] 收盘发出卖出信号，D[3]、D[4] 跌停顺延，D[5] 成交；税率在 D[5] 下调
+    bars = _bars(S, {3: 9.0, 4: 8.1, 5: 8.0})
+    strategy = ScriptedStrategy(buys=_buy(S), sells={D[2]: [(S, ExitReason.STOP_LOSS)]})
+    costs_cfg = _switching_tax(D[5])
+    result = _run(tmp_path, [bars], strategy, costs_cfg=costs_cfg)
+    (trade,) = result.trades
+    model = CostModel(costs_cfg)
+    assert trade.exit_day == D[5]
+    assert trade.proceeds == pytest.approx(model.sell_proceeds(8.0, 1000, D[5]))
+    assert trade.proceeds != pytest.approx(model.sell_proceeds(8.0, 1000, D[2]))
+
+
+def test_delisting_charged_stamp_tax_in_force_on_liquidation_day(tmp_path: Path) -> None:
+    bars = _bars(S, {4: 10.5}, n=5)
+    costs_cfg = _switching_tax(D[5])
+    result = _run(
+        tmp_path, [bars], ScriptedStrategy(buys=_buy(S)), delist={S: D[5]}, costs_cfg=costs_cfg
+    )
+    (trade,) = result.trades
+    model = CostModel(costs_cfg)
+    assert trade.exit_day == D[5]
+    assert trade.proceeds == pytest.approx(model.sell_proceeds(10.5, 1000, D[5]))
+    assert trade.proceeds != pytest.approx(model.sell_proceeds(10.5, 1000, D[4]))

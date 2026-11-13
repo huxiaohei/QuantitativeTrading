@@ -8,7 +8,6 @@ from typing import Annotated
 import pandas as pd
 import typer
 import yaml
-from pydantic import ValidationError
 
 from qt.backtest.metrics import compute_metrics
 from qt.backtest.report import (
@@ -54,7 +53,7 @@ def run(
     """运行回测并生成单文件 HTML 报告。"""
     try:
         cfg = load_config(config)
-    except (OSError, yaml.YAMLError, ValidationError) as exc:
+    except (OSError, yaml.YAMLError, ValueError) as exc:  # ValidationError 也是 ValueError
         typer.echo(f"无法读取配置文件 {config}：{exc}")
         raise typer.Exit(code=1) from exc
     if not data_gaps.is_file():
@@ -128,7 +127,7 @@ def sweep(
     """对参数组合逐一回测并对比。只用样本内区间，样本外数据不参与调参。"""
     try:
         cfg = load_config(config)
-    except (OSError, yaml.YAMLError, ValidationError) as exc:
+    except (OSError, yaml.YAMLError, ValueError) as exc:  # ValidationError 也是 ValueError
         typer.echo(f"无法读取配置文件 {config}：{exc}")
         raise typer.Exit(code=1) from exc
     if not param:

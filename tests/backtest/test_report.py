@@ -397,7 +397,7 @@ def test_run_command_writes_report(tmp_path: Path) -> None:
     store.write(Table.BENCHMARKS, make_benchmark("H00300", D[:12], [100.0 + i for i in range(12)]))
     raw = yaml.safe_load((GAPS.parent.parent / "config" / "default.yaml").read_text("utf-8"))
     raw["backtest"]["in_sample_start"] = D[0]
-    raw["backtest"]["in_sample_end"] = D[11]
+    raw["backtest"]["in_sample_end"] = D[5]  # 须早于 out_sample_start
     raw["backtest"]["out_sample_start"] = D[6]
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
@@ -560,7 +560,7 @@ def _cli_files(tmp_path: Path) -> tuple[Path, Path]:
     store.write(Table.BENCHMARKS, make_benchmark("H00300", D[:12], [100.0 + i for i in range(12)]))
     raw = yaml.safe_load((GAPS.parent.parent / "config" / "default.yaml").read_text("utf-8"))
     raw["backtest"]["in_sample_start"] = D[0]
-    raw["backtest"]["in_sample_end"] = D[11]
+    raw["backtest"]["in_sample_end"] = D[5]  # 须早于 out_sample_start
     raw["backtest"]["out_sample_start"] = D[6]
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
@@ -631,3 +631,12 @@ def test_run_command_missing_data_gaps_gives_chinese_error(tmp_path: Path) -> No
     assert "数据局限文档" in result.output
     assert "Traceback" not in result.output
     assert not out_dir.exists() or not list(out_dir.glob("*.html"))
+
+
+def test_run_command_empty_config_gives_chinese_error(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "empty.yaml"
+    cfg_path.write_text("", encoding="utf-8")
+    result = _invoke(tmp_path, "--config", str(cfg_path), "--out", str(tmp_path / "reports"))
+    assert result.exit_code == 1
+    assert "无法读取配置文件" in result.output
+    assert "Traceback" not in result.output

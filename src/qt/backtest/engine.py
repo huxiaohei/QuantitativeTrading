@@ -138,7 +138,12 @@ def _liquidate_delisted(
             assert prev_day is not None  # 持仓最早出现在回测第二天，必有上一交易日
             price = panel.last_close(prev_day, symbol)
             _close_position(
-                state, risk, day, pos, costs.sell_proceeds(price, pos.shares), ExitReason.DELISTED
+                state,
+                risk,
+                day,
+                pos,
+                costs.sell_proceeds(price, pos.shares, day),
+                ExitReason.DELISTED,
             )
         scan += timedelta(days=1)
 
@@ -172,7 +177,7 @@ def _match_sells(
             remaining.append(order)
             continue
         # 卖出成交时的股数（除权后可能带小数）才是实际股数，而非下单时的股数
-        proceeds = costs.sell_proceeds(bar.open, pos.shares)
+        proceeds = costs.sell_proceeds(bar.open, pos.shares, day)
         assert order.exit_reason is not None
         _close_position(state, risk, day, pos, proceeds, order.exit_reason)
     state.sell_orders = remaining
