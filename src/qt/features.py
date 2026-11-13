@@ -187,10 +187,24 @@ def _dividend_state(dividends: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     返回 (事件表[symbol, effective]，状态表[symbol, effective, fiscal_year, total, raw, run])。
     """
     div = dividends.sort_values(["symbol", "ex_date"], kind="stable").reset_index(drop=True)
-    growth = 1.0 + div["bonus_per_share"].fillna(0.0)
-    # 截至各行除权日（含）的送转连乘；除以本行自身的 (1 + 送转) 得到本行除权日之前的连乘
-    cum = growth.groupby(div["symbol"], sort=False).cumprod()
-    div = div.assign(f_before=cum / growth, visible_from=div["announce_date"] + _ONE_DAY)
+    div = div.assign(bonus_per_share=div["bonus_per_share"].fillna(0.0))
+    # 送转因子按 (symbol, 除权日) 汇总：同一除权日的多行（如送股一行、派息一行）送转相加，
+    # 连乘与行的先后顺序无关；同一除权日的送转对当天所有现金分红都生效
+    per_day = (
+        div.dropna(subset=["ex_date"])
+        .groupby(["symbol", "ex_date"], as_index=False, sort=True)["bonus_per_share"]
+        .sum()
+    )
+    growth = 1.0 + per_day["bonus_per_share"]
+    # f_at：截至该除权日（含）的连乘；f_before：该除权日之前的连乘
+    per_day = per_day.assign(f_at=growth.groupby(per_day["symbol"], sort=False).cumprod())
+    per_day = per_day.assign(f_before=per_day["f_at"] / growth)
+    div = div.merge(
+        per_day[["symbol", "ex_date", "f_before"]], on=["symbol", "ex_date"], how="left"
+    )
+    div = div.assign(
+        f_before=div["f_before"].fillna(1.0), visible_from=div["announce_date"] + _ONE_DAY
+    )
 
     bonus_days = div.loc[div["bonus_per_share"] > 0, ["symbol", "ex_date"]]
     events = (
@@ -206,8 +220,9 @@ def _dividend_state(dividends: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
         .sort_values("effective", kind="stable")
         .reset_index(drop=True)
     )
-    factors = pd.DataFrame({"symbol": div["symbol"], "factor_day": div["ex_date"], "f_at": cum})
-    factors = factors.dropna(subset=["factor_day"]).sort_values("factor_day", kind="stable")
+    factors = pd.DataFrame(
+        {"symbol": per_day["symbol"], "factor_day": per_day["ex_date"], "f_at": per_day["f_at"]}
+    ).sort_values("factor_day", kind="stable")
     # 事件当天（含）以前全部送转的连乘；此前没有任何除权则为 1
     at_event = pd.merge_asof(
         events, factors, left_on="effective", right_on="factor_day", by="symbol"

@@ -737,3 +737,21 @@ def test_bars_with_non_positive_open_or_close_are_treated_as_missing(tmp_path: P
     bar = panel.bar(D[6], SYMBOL)
     assert bar is not None
     assert bar.prev_close == 14.0  # 前一根有效日线
+
+
+@pytest.mark.parametrize("bonus_first", [True, False])
+def test_same_ex_date_bonus_and_cash_rows_do_not_depend_on_row_order(
+    tmp_path: Path, bonus_first: bool
+) -> None:
+    ex = date(2020, 7, 17)
+    closes = [20.0 if d < ex else 10.0 for d in D]
+    bonus_row = (2019, date(2020, 7, 10), ex, 0.0, 1.0)  # 10 转 10
+    cash_row = (2019, date(2020, 7, 10), ex, 0.5, 0.0)  # 同一除权日另一行：10 派 5
+    rows = [bonus_row, cash_row] if bonus_first else [cash_row, bonus_row]
+    div = make_dividends(SYMBOL, rows)
+    panel = _panel(tmp_path, [make_bars(SYMBOL, D, closes)], dividends=[div])
+    # 现金按除权前股本发放，同日的送转同样要折算：0.5 / 2 = 0.25 元每（新）股
+    sept = panel.snapshot(date(2020, 9, 1))
+    assert _f(sept, SYMBOL, "dividend_fy_total") == pytest.approx(0.25)
+    assert _f(sept, SYMBOL, "dividend_yield") == pytest.approx(0.025)
+    assert _yield(panel, date(2020, 7, 16)) == pytest.approx(0.025)  # 除权前 0.5 / 20
