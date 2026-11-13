@@ -19,7 +19,7 @@ from qt.service.accounts import (
 )
 from qt.service.errors import NotFoundError
 
-CFG: AppConfig = load_config(Path("config/default.yaml"))
+CFG: AppConfig = load_config(Path(__file__).resolve().parents[2] / "config" / "default.yaml")
 DAY = date(2026, 11, 16)
 
 

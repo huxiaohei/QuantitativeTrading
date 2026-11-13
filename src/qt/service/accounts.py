@@ -4,6 +4,7 @@
 每个改动使用者数据的函数都写一条审计日志。
 """
 
+import math
 import re
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
@@ -93,8 +94,8 @@ def create_subscription(
     user = repo.get_user(s, user_id)
     if user.status != "active":
         raise ValidationError("账号已停用，不能创建订阅")
-    if not initial_cash > 0:
-        raise ValidationError("本金必须大于 0")
+    if not math.isfinite(initial_cash) or initial_cash <= 0:
+        raise ValidationError("本金必须是大于 0 的有限数值")
     if repo.get_open_subscription(s, user_id) is not None:
         raise ValidationError("已有生效的订阅，请先关闭后再创建新的")
     merged = _apply_overrides(cfg, overrides or {})
@@ -138,6 +139,8 @@ def update_params(
     merged = _apply_overrides(subscription_config(cfg, sub), overrides)
     old = sub.params
     new = _params_of(merged)
+    if new == old:
+        raise ValidationError("参数没有变化")
     sub.params = new
     s.add(
         ParamChange(
@@ -154,7 +157,12 @@ def update_params(
         user_id,
         "subscription.update_params",
         f"subscription:{sub.id}",
-        {"overrides": dict(overrides), "effective_day": effective_day.isoformat()},
+        {
+            "overrides": {
+                path: new[path.partition(".")[0]][path.partition(".")[2]] for path in overrides
+            },
+            "effective_day": effective_day.isoformat(),
+        },
     )
     return sub
 

@@ -21,7 +21,7 @@ from qt.service.accounts import (
 )
 from qt.service.errors import ValidationError
 
-CFG: AppConfig = load_config(Path("config/default.yaml"))
+CFG: AppConfig = load_config(Path(__file__).resolve().parents[2] / "config" / "default.yaml")
 DAY = date(2026, 11, 16)
 
 
@@ -155,3 +155,30 @@ def test_mutations_write_audit_log(db: Session) -> None:
         "subscription.resume",
         "subscription.close",
     ]
+
+
+def test_initial_cash_must_be_finite(db: Session) -> None:
+    uid = create_user(db, "a@example.com").id
+    for bad in (float("inf"), float("nan"), -1.0):
+        with pytest.raises(ValidationError, match="本金"):
+            create_subscription(db, uid, CFG, bad, DAY)
+
+
+def test_update_params_without_change_rejected_and_writes_nothing(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    with pytest.raises(ValidationError, match="参数没有变化"):
+        update_params(db, uid, sid, CFG, {}, DAY)
+    with pytest.raises(ValidationError, match="参数没有变化"):
+        update_params(db, uid, sid, CFG, {"strategy.stop_loss": 0.15}, DAY)
+    assert repo.list_param_changes(db, uid, sid) == []
+    actions = [a.action for a in db.scalars(select(AuditLog))]
+    assert "subscription.update_params" not in actions
+
+
+def test_update_params_audit_stores_normalized_values(db: Session) -> None:
+    uid, sid = _user_and_sub(db)
+    update_params(db, uid, sid, CFG, {"strategy.stop_loss": "0.10"}, DAY)
+    entry = db.scalars(
+        select(AuditLog).where(AuditLog.action == "subscription.update_params")
+    ).one()
+    assert entry.detail["overrides"] == {"strategy.stop_loss": 0.10}

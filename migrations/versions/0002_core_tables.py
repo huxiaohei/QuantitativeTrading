@@ -198,6 +198,7 @@ def upgrade() -> None:
     op.create_table(
         "book_days",
         sa.Column("book_id", sa.BigInteger(), nullable=False),
+        sa.Column("user_id", sa.BigInteger(), nullable=False),
         sa.Column("day", sa.Date(), nullable=False),
         sa.Column("equity", sa.Double(), nullable=False),
         sa.Column("cash", sa.Double(), nullable=False),
@@ -212,8 +213,13 @@ def upgrade() -> None:
             ["book_id"],
             ["books.id"],
         ),
+        sa.ForeignKeyConstraint(
+            ["user_id"],
+            ["users.id"],
+        ),
         sa.PrimaryKeyConstraint("book_id", "day"),
     )
+    op.create_index(op.f("ix_book_days_user_id"), "book_days", ["user_id"], unique=False)
     op.create_table(
         "followups",
         sa.Column("id", sa.BigInteger(), nullable=False),
@@ -350,6 +356,7 @@ def upgrade() -> None:
     op.create_table(
         "system_states",
         sa.Column("book_id", sa.BigInteger(), nullable=False),
+        sa.Column("user_id", sa.BigInteger(), nullable=False),
         sa.Column("as_of_day", sa.Date(), nullable=False),
         sa.Column("state", postgresql.JSONB(), nullable=False),
         sa.Column(
@@ -362,8 +369,13 @@ def upgrade() -> None:
             ["book_id"],
             ["books.id"],
         ),
+        sa.ForeignKeyConstraint(
+            ["user_id"],
+            ["users.id"],
+        ),
         sa.PrimaryKeyConstraint("book_id"),
     )
+    op.create_index(op.f("ix_system_states_user_id"), "system_states", ["user_id"], unique=False)
     op.create_table(
         "trades",
         sa.Column("id", sa.BigInteger(), nullable=False),
@@ -463,6 +475,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_trades_user_id"), table_name="trades")
     op.drop_index(op.f("ix_trades_book_id"), table_name="trades")
     op.drop_table("trades")
+    op.drop_index(op.f("ix_system_states_user_id"), table_name="system_states")
     op.drop_table("system_states")
     op.drop_index(op.f("ix_signals_user_id"), table_name="signals")
     op.drop_index(op.f("ix_signals_book_id"), table_name="signals")
@@ -476,6 +489,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_followups_user_id"), table_name="followups")
     op.drop_index(op.f("ix_followups_book_id"), table_name="followups")
     op.drop_table("followups")
+    op.drop_index(op.f("ix_book_days_user_id"), table_name="book_days")
     op.drop_table("book_days")
     op.drop_index(op.f("ix_param_changes_user_id"), table_name="param_changes")
     op.drop_index(op.f("ix_param_changes_subscription_id"), table_name="param_changes")

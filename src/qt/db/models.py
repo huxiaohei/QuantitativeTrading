@@ -126,6 +126,7 @@ class SystemState(Base):
     __tablename__ = "system_states"
 
     book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     as_of_day: Mapped[date] = mapped_column(Date)
     state: Mapped[dict[str, Any]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _created_at()
@@ -137,6 +138,7 @@ class BookDay(Base):
     __tablename__ = "book_days"
 
     book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     day: Mapped[date] = mapped_column(Date, primary_key=True)
     equity: Mapped[float] = mapped_column(Double)
     cash: Mapped[float] = mapped_column(Double)
