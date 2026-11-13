@@ -104,7 +104,8 @@ def report(label: str, timed: TimedSource, names: list[str]) -> None:
         print(f"  {label}{name}: {timed.calls[name]} 次，合计 {timed.seconds[name]:.1f}s")
 
 
-def run(data_dir: Path, count: int, config: Path) -> None:
+def run(data_dir: Path, count: int, config: Path) -> int:
+    """返回退出码：有任何失败时为 1（耗时估计无效）。"""
     cfg: AppConfig = load_config(config)
     with tempfile.TemporaryDirectory(prefix="qt-probe-") as tmp:
         work = Path(tmp) / "data"
@@ -139,7 +140,7 @@ def run(data_dir: Path, count: int, config: Path) -> None:
         bars_s = timed.seconds["bars"]
         bars_n = max(timed.calls["bars"], 1)
         shared_s = sum(
-            timed.seconds[k] for k in ("securities", "st_history", "benchmark", "industries")
+            timed.seconds[k] for k in ("securities", "st_history", "benchmark", "industry")
         )
         roll_s = timed.seconds["dividends"] + timed.seconds["financials"]
         print(
@@ -154,6 +155,8 @@ def run(data_dir: Path, count: int, config: Path) -> None:
         fund_total = time.perf_counter() - t
         fund_per = fund_total / len(symbols)
         print(f"财务分红（强制全部 {len(symbols)} 只）：{fund_total:.1f}s，失败 {len(failed)}")
+        for symbol, message in list(failed.items())[:5]:
+            print(f"  财务分红失败 {symbol}: {message[:120]}")
         report("", timed, ["dividends", "financials"])
 
         bars_per = bars_s / bars_n
@@ -171,6 +174,14 @@ def run(data_dir: Path, count: int, config: Path) -> None:
             f"（{night / 3600:.2f} 小时）"
         )
         print("阈值：4 小时" + ("；超过，需上报 BLOCKED" if night > 4 * 3600 else "；未超过"))
+        if result.failed or failed:
+            print(
+                f"\n!!! 警告：本次有失败（日线等阶段 {len(result.failed)} 只，"
+                f"财务分红 {len(failed)} 只），"
+                "失败的请求耗时不具代表性，上面的外推估计无效，请排查后重跑 !!!"
+            )
+            return 1
+    return 0
 
 
 def main() -> None:
@@ -179,7 +190,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data"), help="原数据目录（只读）")
     parser.add_argument("--config", type=Path, default=Path("config/default.yaml"))
     args = parser.parse_args()
-    run(args.data_dir, args.symbols, args.config)
+    raise SystemExit(run(args.data_dir, args.symbols, args.config))
 
 
 if __name__ == "__main__":

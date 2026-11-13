@@ -1,7 +1,9 @@
 import pytest
 from sqlalchemy import Engine, text
+from sqlalchemy.orm import Session
 
 from qt.db.engine import database_url, session_scope
+from tests.db.conftest import truncate_all
 
 
 def test_session_scope_commits_and_rolls_back(db_engine: Engine) -> None:
@@ -27,16 +29,20 @@ def test_database_url_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert database_url() == "postgresql+psycopg://u:p@h/d"
 
 
-def test_db_fixture_truncates_tables_between_tests(db_engine: Engine, db: object) -> None:
-    del db
+def test_truncate_all_clears_rows_but_keeps_tables(db_engine: Engine) -> None:
     with db_engine.begin() as conn:
         conn.execute(text("create table t_trunc (id int)"))
         conn.execute(text("insert into t_trunc values (1)"))
+    try:
+        truncate_all(db_engine)
+        with db_engine.begin() as conn:
+            assert conn.execute(text("select count(*) from t_trunc")).scalar_one() == 0
+            version = conn.execute(text("select count(*) from alembic_version")).scalar_one()
+            assert version == 1
+    finally:
+        with db_engine.begin() as conn:
+            conn.execute(text("drop table t_trunc"))
 
 
-def test_db_fixture_cleaned_previous_rows(db_engine: Engine, db: object) -> None:
-    del db
-    with db_engine.begin() as conn:
-        count = conn.execute(text("select count(*) from t_trunc")).scalar_one()
-        conn.execute(text("drop table t_trunc"))
-    assert count == 0
+def test_db_fixture_gives_working_session(db: Session) -> None:
+    assert db.execute(text("select 1")).scalar_one() == 1
