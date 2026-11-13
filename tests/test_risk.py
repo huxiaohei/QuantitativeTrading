@@ -311,3 +311,38 @@ def test_pending_buys_exceeding_cash_never_produce_negative_shares() -> None:
     )
     assert orders == []
     assert [r.rule for r in rej] == ["no_cash"]
+
+
+def test_risk_state_roundtrip_preserves_pause_and_cooldown() -> None:
+    cfg = default_risk().model_copy(update={"cooldown_days": 80})
+    orig = _mgr(cfg)
+    orig.on_day_close(DAYS[0], 1.0)
+    orig.on_day_close(DAYS[1], 0.95)
+    orig.note_exit("A", DAYS[2], ExitReason.STOP_LOSS)
+    orig.note_exit("C", DAYS[2], ExitReason.TAKE_PROFIT_FIXED)  # 止盈不冷却，也不进记录
+    assert [e.kind for e in orig.on_day_close(DAYS[3], 0.80)] == [RiskEventKind.PAUSE]
+    orig.extend_pause(5)  # 暂停 65 个交易日，验证延长后的天数也被保存
+
+    state = orig.dump_state()
+    assert state.paused and state.pause_day == DAYS[3] and state.pause_days == 65
+    assert state.exits == (("A", DAYS[2]),)
+    copy = _mgr(cfg)
+    copy.load_state(state)
+    assert copy.dump_state() == state
+
+    cands = [make_candidate("A", industry="X"), make_candidate("B", industry="Y")]
+    kinds: set[RiskEventKind] = set()
+    rules: set[str] = set()
+    for i in range(4, 74):
+        nav = 0.80 + 0.001 * (i % 7)
+        events = orig.on_day_close(DAYS[i], nav)
+        assert copy.on_day_close(DAYS[i], nav) == events
+        result = orig.size_buys(DAYS[i], cands, 150_000, 150_000, [], {})
+        assert copy.size_buys(DAYS[i], cands, 150_000, 150_000, [], {}) == result
+        assert copy.buying_allowed() == orig.buying_allowed()
+        kinds |= {e.kind for e in events}
+        rules |= {r.rule for r in result[1]}
+    # 70 天里确实经历了暂停拒绝、到期恢复和恢复后的冷却拒绝
+    assert kinds == {RiskEventKind.RESUME}
+    assert rules == {"paused", "cooldown"}
+    assert copy.dump_state() == orig.dump_state()

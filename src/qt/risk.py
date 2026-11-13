@@ -49,6 +49,19 @@ class Rejection:
     message: str
 
 
+@dataclass(frozen=True)
+class RiskState:
+    """风控管理器的全部可变状态，用于逐日推进时保存与恢复。"""
+
+    peak: float | None
+    warned: bool
+    paused: bool
+    pause_day: date | None
+    pause_drawdown: float
+    pause_days: int
+    exits: tuple[tuple[str, date], ...]  # 冷却记录 (股票, 卖出日)，按记录先后
+
+
 class RiskManager:
     """风控管理器：持有回撤状态机与冷却记录。"""
 
@@ -63,6 +76,28 @@ class RiskManager:
         self._pause_drawdown = 0.0
         self._pause_days = cfg.pause_days
         self._exits: dict[str, date] = {}
+
+    def dump_state(self) -> RiskState:
+        """导出当前状态（不含配置、日历与成本模型，它们由调用方重新提供）。"""
+        return RiskState(
+            peak=self._peak,
+            warned=self._warned,
+            paused=self._paused,
+            pause_day=self._pause_day,
+            pause_drawdown=self._pause_drawdown,
+            pause_days=self._pause_days,
+            exits=tuple(self._exits.items()),
+        )
+
+    def load_state(self, state: RiskState) -> None:
+        """用 dump_state 导出的状态覆盖当前状态。"""
+        self._peak = state.peak
+        self._warned = state.warned
+        self._paused = state.paused
+        self._pause_day = state.pause_day
+        self._pause_drawdown = state.pause_drawdown
+        self._pause_days = state.pause_days
+        self._exits = dict(state.exits)
 
     def buying_allowed(self) -> bool:
         """是否允许买入（暂停期间为假）。"""

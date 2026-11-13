@@ -19,6 +19,14 @@ class CostModel:
     def _commission(self, amount: float) -> float:
         return max(self._cfg.min_commission, amount * self._cfg.commission_rate)
 
+    def buy_fill_price(self, price: float) -> float:
+        """买入成交价（报价加滑点），只用于记录成交，不参与金额计算。"""
+        return price * (1 + self._cfg.slippage)
+
+    def sell_fill_price(self, price: float) -> float:
+        """卖出成交价（报价减滑点），只用于记录成交，不参与金额计算。"""
+        return price * (1 - self._cfg.slippage)
+
     def buy_cost(self, price: float, shares: float) -> float:
         """买入的现金流出总额（含滑点、佣金、过户费）。"""
         amount = price * (1 + self._cfg.slippage) * shares

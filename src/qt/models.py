@@ -81,6 +81,19 @@ class Order:
 
 
 @dataclass(frozen=True)
+class Fill:
+    """一笔成交（买入或卖出），撮合成功与退市清算时记录。"""
+
+    symbol: str
+    side: Side
+    day: date
+    shares: float
+    price: float  # 成交价（含滑点）
+    amount: float  # 买入为含费用的支出，卖出为扣费后的收入
+    signal_day: date  # 退市清算没有信号，记为清算当天
+
+
+@dataclass(frozen=True)
 class Trade:
     """一笔已平仓交易。cost 为含费用买入总额，proceeds 为扣费后卖出净额。"""
 
