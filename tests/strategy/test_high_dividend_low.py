@@ -224,15 +224,15 @@ def test_no_signal_when_nothing_triggers() -> None:
     assert _strategy().sell_signals(DAY, snap, [_pos()]) == []
 
 
-def test_fixed_take_profit_at_12_percent() -> None:
+def test_fixed_take_profit_at_default_20_percent() -> None:
     pos = _pos()
-    hit = make_snapshot({"600000": {"close": 11.2}})
+    hit = make_snapshot({"600000": {"close": 12.01}})
     (sig,) = _strategy().sell_signals(DAY, hit, [pos])
     assert sig.reason is ExitReason.TAKE_PROFIT_FIXED
     assert sig.symbol == "600000"
     assert sig.day == DAY
-    assert "12.0%" in sig.detail
-    miss = make_snapshot({"600000": {"close": 11.19}})
+    assert "20.0%" in sig.detail
+    miss = make_snapshot({"600000": {"close": 11.99}})
     assert _strategy().sell_signals(DAY, miss, [pos]) == []
 
 
@@ -260,7 +260,7 @@ def test_trailing_mode_ignores_fixed_threshold() -> None:
 
 
 def test_fixed_mode_ignores_trailing_rule() -> None:
-    # 回落 8.3% 满足 trailing，但 fixed 模式下收益 0.10 < 0.12 不触发
+    # 回落 8.3% 满足 trailing，但 fixed 模式下收益 0.10 < 0.20 不触发
     snap = make_snapshot({"600000": {"close": 11.0}})
     assert _strategy().sell_signals(DAY, snap, [_pos(peak_return=0.20)]) == []
 
@@ -353,7 +353,7 @@ def test_sell_signals_do_not_mutate_positions() -> None:
 
 def test_multiple_positions_each_checked() -> None:
     snap = make_snapshot(
-        {"600000": {"close": 11.2}, "600001": {"close": 10.0}, "600002": {"close": 8.0}}
+        {"600000": {"close": 12.1}, "600001": {"close": 10.0}, "600002": {"close": 8.0}}
     )
     positions = [_pos(symbol="600000"), _pos(symbol="600001"), _pos(symbol="600002")]
     result = _strategy().sell_signals(DAY, snap, positions)

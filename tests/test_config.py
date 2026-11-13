@@ -22,7 +22,7 @@ def _write_modified(tmp_path: Path, section: str, key: str, value: object) -> Pa
 def test_default_config_matches_spec() -> None:
     cfg = load_config(DEFAULT)
     assert cfg.strategy.min_dividend_yield == 0.04
-    assert cfg.strategy.take_profit_fixed == 0.12
+    assert cfg.strategy.take_profit_fixed == 0.20
     assert cfg.risk.pause_drawdown == 0.20
     assert cfg.risk.cooldown_days == 60
     assert cfg.costs.min_commission == 5.0
