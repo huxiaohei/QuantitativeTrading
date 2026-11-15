@@ -32,8 +32,8 @@ services:
       QT_DATA_DIR: /app/data
     volumes:
       - ${QT_DATA_DIR:-./data}:/app/data
-    # 任务 10 改为 `qt worker`
-    command: ["qt", "--help"]
+    # 常驻定时进程：每个交易日 run_time 运行，休眠醒来后补跑
+    command: ["qt", "worker"]
 
 volumes:
   qt_pg:

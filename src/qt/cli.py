@@ -1,7 +1,9 @@
-"""命令行入口：qt data update、qt data check、qt backtest run、qt backtest sweep。"""
+"""命令行入口：qt data、qt backtest、qt run-day（手动跑一天）、qt worker（定时进程）。"""
 
 import json
-from datetime import datetime
+import logging
+import os
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
 from zoneinfo import ZoneInfo
@@ -30,6 +32,10 @@ from qt.data.update import (
     load_calendar,
     update_all,
 )
+from qt.db.engine import database_url, make_engine
+from qt.jobs.daily import RunContext, due_day, run_day
+from qt.jobs.worker import run_forever
+from qt.mail.send import make_sender
 
 app = typer.Typer(help="A 股量化回测工具", no_args_is_help=True)
 data_app = typer.Typer(help="数据下载与检查", no_args_is_help=True)
@@ -168,3 +174,83 @@ def check(
     code = run_check(data_dir)
     if code != 0:
         raise typer.Exit(code=code)
+
+
+# ---------- 每日任务 ----------
+
+_STATUS_LABELS = {
+    "done": "完成",
+    "done_with_errors": "完成，但有使用者处理出错（已告警管理员）",
+    "data_failed": "数据异常，本日未出信号（已告警管理员）",
+}
+
+
+def make_context(config: Path, data_dir: Path) -> RunContext:
+    """由配置文件与环境变量（DATABASE_URL、ADMIN_EMAIL、邮件相关）创建每日任务的运行环境。"""
+    cfg = load_config(config)
+    admin = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+    if not admin:
+        raise RuntimeError("未设置环境变量 ADMIN_EMAIL（系统异常告警的收件人）")
+    return RunContext(
+        engine=make_engine(database_url()),
+        store=ParquetStore(data_dir),
+        source=make_source(cfg),
+        cfg=cfg,
+        sender=make_sender(),
+        admin_email=admin,
+        now=_now,
+    )
+
+
+def _context_or_exit(config: Path, data_dir: Path) -> RunContext:
+    try:
+        return make_context(config, data_dir)
+    except (OSError, yaml.YAMLError, ValueError, RuntimeError) as exc:
+        typer.echo(f"无法启动：{exc}")
+        raise typer.Exit(code=1) from exc
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s：%(message)s"
+    )
+
+
+@app.command("run-day")
+def run_day_command(
+    day: Annotated[
+        str | None, typer.Option(help="交易日 YYYY-MM-DD，默认最近一个到点的已收盘交易日")
+    ] = None,
+    notify: Annotated[
+        bool, typer.Option("--notify/--no-notify", help="是否给使用者发信号邮件")
+    ] = True,
+    update: Annotated[bool, typer.Option("--update/--no-update", help="是否先增量更新数据")] = True,
+    config: Annotated[Path, typer.Option(help="配置文件路径")] = Path("config/default.yaml"),
+    data_dir: Annotated[Path, typer.Option(help="数据目录", envvar="QT_DATA_DIR")] = Path("data"),
+) -> None:
+    """手动跑一个交易日的每日任务（可重跑，不会重复记录或重复发信）。"""
+    _setup_logging()
+    ctx = _context_or_exit(config, data_dir)
+    try:
+        target = (
+            date.fromisoformat(day)
+            if day
+            else due_day(ctx.now(), load_calendar(ctx.store), ctx.cfg.service.run_time)
+        )
+        status = run_day(ctx, target, notify=notify, update_data=update)
+    except (ValueError, DataIntegrityError) as exc:
+        typer.echo(f"无法运行：{exc}")
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"{target} 每日运行结果：{status}（{_STATUS_LABELS.get(status, status)}）")
+    if status != "done":
+        raise typer.Exit(code=1)
+
+
+@app.command("worker")
+def worker_command(
+    config: Annotated[Path, typer.Option(help="配置文件路径")] = Path("config/default.yaml"),
+    data_dir: Annotated[Path, typer.Option(help="数据目录", envvar="QT_DATA_DIR")] = Path("data"),
+) -> None:
+    """常驻的定时进程：每个交易日到点运行，电脑休眠醒来后补跑错过的日子。"""
+    _setup_logging()
+    run_forever(_context_or_exit(config, data_dir))

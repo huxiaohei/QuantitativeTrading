@@ -1,0 +1,156 @@
+"""定时进程：何时到点、休眠唤醒后立即补跑、数据失败重试与超时告警；以及两个命令。"""
+
+from collections.abc import Callable
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pytest
+from sqlalchemy.orm import Session
+from typer.testing import CliRunner
+
+from qt import cli
+from qt.jobs.daily import RunContext
+from qt.jobs.worker import is_due, run_forever
+from tests.jobs.conftest import (
+    ADMIN,
+    DAY,
+    BrokenSource,
+    Env,
+    daily_run,
+    evening,
+    mirror_source,
+    processed_through,
+    subscribe,
+)
+
+
+class _Stop(BaseException):
+    """测试用：让假的 sleep 结束 run_forever 的循环。"""
+
+
+def _ticking(env: Env, until: datetime, seen: list[float]) -> Callable[[float], None]:
+    """每次 sleep 把假时钟拨快相应秒数，超过 until 就结束循环。"""
+
+    def sleep(seconds: float) -> None:
+        seen.append(seconds)
+        env.clock.now += timedelta(seconds=seconds)
+        if env.clock.now > until:
+            raise _Stop
+
+    return sleep
+
+
+def test_is_due_and_deadline() -> None:
+    sh = ZoneInfo("Asia/Shanghai")
+    assert not is_due(datetime(2026, 11, 16, 17, 59, tzinfo=sh), "18:00", None)
+    assert is_due(datetime(2026, 11, 16, 18, 0, tzinfo=sh), "18:00", None)
+    assert not is_due(
+        datetime(2026, 11, 16, 18, 5, tzinfo=sh), "18:00", datetime(2026, 11, 16, 18, 0, tzinfo=sh)
+    )
+    # 休眠跨过了周二 18:00：周三上午醒来立即到点
+    assert is_due(
+        datetime(2026, 11, 18, 9, 0, tzinfo=sh), "18:00", datetime(2026, 11, 16, 17, 0, tzinfo=sh)
+    )
+
+    def weekday(d: date) -> bool:
+        return d.weekday() < 5
+
+    # 周一上午：最近的运行时刻是周五 18:00（周末不是交易日），周五 18:30 已尝试过
+    friday = datetime(2026, 11, 13, 18, 30, tzinfo=sh)
+    assert not is_due(datetime(2026, 11, 16, 9, 0, tzinfo=sh), "18:00", friday, weekday)
+    assert not is_due(datetime(2026, 11, 14, 18, 0, tzinfo=sh), "18:00", None, weekday)  # 周六
+    assert is_due(datetime(2026, 11, 16, 18, 0, tzinfo=sh), "18:00", friday, weekday)
+
+
+def test_worker_alerts_once_when_deadline_passes_without_success(env: Env, db: Session) -> None:
+    days = env.days
+    sub = subscribe(db, "a@example.com", days[DAY])
+    source = mirror_source(env.store, BrokenSource)  # 数据一直失败
+    env.source = source
+    env.clock.now = evening(days[DAY], 18, 30)
+    seen: list[float] = []
+    until = evening(days[DAY + 1], 10, 0)  # 跨过次日 08:30
+    with pytest.raises(_Stop):
+        run_forever(env.ctx, _ticking(env, until, seen))
+    assert set(seen) == {60}
+    subjects = [m.subject for m in env.sender.sent]
+    assert subjects.count("【系统异常】每日运行超时") == 1
+    assert subjects.count("【系统异常】数据更新失败") == 1  # 每天同一标题只告警一次
+    assert all(m.to_addr == ADMIN for m in env.sender.sent)
+    assert processed_through(db, sub, "system") is None
+    run = daily_run(db, days[DAY])
+    assert run is not None and run.status == "data_failed"
+    # 每 30 分钟重试一次，直到次日 08:30：18:30 启动时 1 次，19:00 至 08:00 共 27 次
+    assert len([c for c in source.calls if c[0] == "securities"]) == 28
+
+
+def test_worker_runs_catch_up_immediately_after_wake_from_sleep(env: Env, db: Session) -> None:
+    days = env.days
+    monday, tuesday, wednesday = days[DAY], days[DAY + 1], days[DAY + 2]
+    sub = subscribe(db, "a@example.com", monday)
+    env.clock.now = evening(monday, 17, 0)
+    calls = 0
+
+    def sleep(seconds: float) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            env.clock.now = evening(wednesday, 9, 0)  # 电脑从周一 17:00 一直睡到周三 09:00
+            return
+        raise _Stop
+
+    with pytest.raises(_Stop):
+        run_forever(env.ctx, sleep)
+    for day in (monday, tuesday):
+        run = daily_run(db, day)
+        assert run is not None and run.status == "done"
+    assert daily_run(db, wednesday) is None
+    assert processed_through(db, sub, "manual") == tuesday
+    # 只有最新一天（周二）的信号发邮件
+    assert [m.subject.split(" ")[0] for m in env.sender.sent] == [f"【买入信号】{tuesday}"]
+
+
+def test_worker_survives_unexpected_error_and_alerts(
+    env: Env, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subscribe(db, "a@example.com", env.days[DAY])
+
+    def boom(ctx: RunContext) -> list[tuple[date, str]]:
+        raise RuntimeError("模拟意外错误")
+
+    monkeypatch.setattr("qt.jobs.worker.catch_up", boom)
+    seen: list[float] = []
+    with pytest.raises(_Stop):
+        run_forever(env.ctx, _ticking(env, env.clock.now + timedelta(hours=2), seen))
+    assert [m.subject for m in env.sender.sent] == ["【系统异常】每日运行出错"]
+    assert "模拟意外错误" in env.sender.sent[0].text
+
+
+def test_run_day_command(env: Env, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    subscribe(db, "a@example.com", env.days[DAY])
+    ctx = env.ctx
+
+    def make_context(config: Path, data_dir: Path) -> RunContext:
+        return ctx
+
+    monkeypatch.setattr(cli, "make_context", make_context)
+    result = CliRunner().invoke(cli.app, ["run-day", "--day", "2022-01-03", "--no-update"])
+    assert result.exit_code == 0, result.output
+    assert "2022-01-03" in result.output and "done" in result.output
+    assert [m.to_addr for m in env.sender.sent] == ["a@example.com"]
+    bad = CliRunner().invoke(cli.app, ["run-day", "--day", "2022-01-01", "--no-update"])
+    assert bad.exit_code == 1 and "不是交易日" in bad.output
+
+
+def test_make_context_requires_admin_email(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@127.0.0.1:1/x")
+    monkeypatch.setenv("MAIL_BACKEND", "file")
+    monkeypatch.delenv("ADMIN_EMAIL", raising=False)
+    config = Path(__file__).resolve().parents[2] / "config" / "default.yaml"
+    with pytest.raises(RuntimeError, match="ADMIN_EMAIL"):
+        cli.make_context(config, tmp_path)
+    monkeypatch.setenv("ADMIN_EMAIL", "Boss@Example.com")
+    ctx = cli.make_context(config, tmp_path)
+    assert ctx.admin_email == "boss@example.com"
+    assert ctx.now().tzinfo is not None
