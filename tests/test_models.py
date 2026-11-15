@@ -11,6 +11,12 @@ def test_position_return_includes_reinvested_dividend() -> None:
     assert p.ret(9.6) == pytest.approx(0.008)  # 1050 * 9.6 / 10000 - 1
 
 
+def test_position_return_includes_cash_received() -> None:
+    p = Position("600000", 1000, 10_005.0, date(2020, 1, 2), "银行", {}, cash_received=500.0)
+    assert p.ret(9.5) == pytest.approx((9_500.0 + 500.0) / 10_005.0 - 1)
+    assert Position("600000", 1000, 10_000.0, date(2020, 1, 2), "银行", {}).cash_received == 0.0
+
+
 def test_trade_pnl_and_ret() -> None:
     t = Trade(
         "600000",
