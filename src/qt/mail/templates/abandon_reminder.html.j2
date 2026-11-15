@@ -1,0 +1,6 @@
+{% extends "base.html.j2" %}
+{% from "base.html.j2" import card_sections %}
+{% block content %}
+<p>{{ intro }}</p>
+{{ card_sections(sections) }}
+{% endblock %}

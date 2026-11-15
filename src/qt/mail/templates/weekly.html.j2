@@ -1,0 +1,20 @@
+{% extends "base.html.j2" %}
+{% from "base.html.j2" import card_sections, facts_table %}
+{% block content %}
+<p>{{ intro }}</p>
+{{ card_sections(sections) }}
+<h2>本周信号</h2>
+{% for line in signal_lines %}
+<p>{{ line }}</p>
+{% else %}
+<p class="empty">{{ none_text }}</p>
+{% endfor %}
+<h2>本周成交</h2>
+{% for line in trade_lines %}
+<p>{{ line }}</p>
+{% else %}
+<p class="empty">{{ none_text }}</p>
+{% endfor %}
+<h2>净值与基准</h2>
+{{ facts_table(facts) }}
+{% endblock %}

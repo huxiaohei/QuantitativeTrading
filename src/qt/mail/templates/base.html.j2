@@ -1,0 +1,50 @@
+{% macro card_sections(sections) %}
+{% for sec in sections %}
+<h2>{{ sec.heading }}</h2>
+{% for card in sec.cards %}
+<div class="card">
+<h3>{{ card.title }}</h3>
+<table>
+{% for label, value in card.fields %}
+<tr><th>{{ label }}</th><td>{{ value }}</td></tr>
+{% endfor %}
+</table>
+</div>
+{% else %}
+<p class="empty">{{ sec.empty_text }}</p>
+{% endfor %}
+{% endfor %}
+{% endmacro %}
+{% macro facts_table(facts) %}
+{% if facts %}
+<table class="facts">
+{% for label, value in facts %}
+<tr><th>{{ label }}</th><td>{{ value }}</td></tr>
+{% endfor %}
+</table>
+{% endif %}
+{% endmacro %}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{{ subject }}</title>
+<style>
+body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; color: #222; max-width: 640px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 20px; }
+h2 { font-size: 16px; border-bottom: 1px solid #ddd; padding-bottom: 4px; margin-top: 24px; }
+h3 { font-size: 15px; margin: 12px 0 4px; }
+th { text-align: left; font-weight: normal; color: #666; padding: 2px 12px 2px 0; vertical-align: top; white-space: nowrap; }
+td { padding: 2px 0; }
+.empty { color: #888; }
+.disclaimer { margin-top: 24px; padding-top: 8px; border-top: 1px solid #ddd; color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>{{ subject }}</h1>
+{% block content %}{% endblock %}
+{% if disclaimer %}
+<p class="disclaimer">{{ disclaimer }}</p>
+{% endif %}
+</body>
+</html>

@@ -1,0 +1,6 @@
+{% extends "base.html.j2" %}
+{% from "base.html.j2" import facts_table %}
+{% block content %}
+<p>{{ intro }}</p>
+{{ facts_table(facts) }}
+{% endblock %}

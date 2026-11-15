@@ -1,0 +1,9 @@
+{% extends "base.html.j2" %}
+{% block content %}
+{% if day %}
+<p>交易日：{{ day }}</p>
+{% endif %}
+{% for line in lines %}
+<p>{{ line }}</p>
+{% endfor %}
+{% endblock %}
