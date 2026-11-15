@@ -115,7 +115,7 @@ ls mail_out/                                         # MAIL_BACKEND=file 时邮�
 | --- | --- |
 | `qt admin user add --email E [--admin]` / `user list` / `user weekly --email E --on\|--off` | 使用者管理、周报开关 |
 | `qt admin sub create --email E --cash N [--start 日期] [--set 路径=值 ...]` | 创建订阅；`--start` 可选过去的交易日 |
-| `qt admin sub set --email E --set 路径=值 ...` | 修改参数（从下一次运行起生效） |
+| `qt admin sub set --email E --set 路径=值 ...` | 修改参数（从下一次运行处理的交易日起生效，命令会打印这一天） |
 | `qt admin sub show / pause / resume / close --email E` | 查看、暂停、恢复、关闭订阅 |
 | `qt admin trade buy\|sell 代码 --email E --price P --shares N [--day D] [--fees F]` | 录入手动账的成交；日期缺省为最近已收盘的交易日 |
 | `qt admin holding add 代码 --email E --cost P --shares N --bought D` | 把已有持仓转入手动账 |
@@ -127,7 +127,7 @@ ls mail_out/                                         # MAIL_BACKEND=file 时邮�
 | `qt admin runs [--last 10]` | 查看每日运行记录（第一行是发件箱里待发、发送失败的邮件数） |
 | `qt admin outbox list [--status pending\|sent\|failed] [--last 50]` | 查看发件箱：状态、尝试次数、最近一次错误 |
 | `qt admin outbox retry ID` / `outbox retry --all-failed` | 把发送失败的邮件重新排队（重新开始 48 小时重试期） |
-| `qt run-day [--day YYYY-MM-DD] [--notify\|--no-notify] [--update\|--no-update]` | 手动跑某一天（缺省为当晚该跑的那天） |
+| `qt run-day [--day YYYY-MM-DD] [--notify\|--no-notify] [--update\|--no-update]` | 手动跑某一天（缺省为当晚该跑的那天）；不做数据库备份；worker 正在运行时会提示“另一个每日运行正在进行”并退出 |
 
 加 `--help` 可看每条命令的全部选项。
 
@@ -140,7 +140,24 @@ docker compose logs --since 24h worker                     # 最近 24 小时
 ```
 
 运行状态含义：`done` 正常完成；`done_with_errors` 完成但个别使用者处理出错（管理员邮箱会收到告警）；
-`data_failed` 数据更新或检查失败，当晚没有出信号，worker 每 30 分钟重试，次日 08:30 仍未完成会发超时告警。
+`data_failed` 数据更新或检查失败（包括持仓股票当天行情下载失败、再下载一次仍失败），当晚没有出信号，
+worker 每 30 分钟重试，直到**下一个交易日** 08:30（周五的失败周末也会一直重试）；到期仍未完成会发超时告警。
+
+### 数据完整性检查一直不通过怎么办
+
+`qt admin runs` 会逐条列出检查发现的问题（如“某股票在某日复权收盘价单日变动 +30%”“仅 N/M 只在市股票有日线”）
+和下载失败的股票。某一只股票的本地日线有错、反复让检查失败时，可以只重新下载这一只：
+
+```bash
+mkdir -p data/bad-bars && mv data/bars/600001.parquet data/bad-bars/      # 先挪走这只股票的日线文件（不要删）
+docker compose run --rm worker qt data update --symbols 600001          # 从头重新下载这一只
+docker compose run --rm worker qt data check                            # 可选：扫描全部历史
+```
+
+之后不用做别的：worker 下一次重试（最多 30 分钟）会重新检查并补跑。也可以手动
+`docker compose run --rm worker qt run-day` 立即重跑当天（若 worker 正在运行会提示稍后再试）。
+重新下载后问题仍在，多半是数据源本身的数据有误，请看 `docs/data-gaps.md` 并记录下来；
+覆盖率不足（很多股票同时缺日线）一般是数据源当天还没更新完，等下一次重试即可。
 
 邮件发送失败（如 SMTP 暂时不可用）时，邮件留在发件箱里，worker 每 30 分钟补发一次；入队满 48 小时仍未发出
 才标记为发送失败并告警管理员。修好发信之后用 `qt admin outbox retry --all-failed` 重新排队。
@@ -151,7 +168,8 @@ docker compose logs --since 24h worker                     # 最近 24 小时
 - **自动备份：** worker 每次完成每日运行（状态为 `done` 或 `done_with_errors`）之后备份一次，文件是
   `backups/qt-YYYYMMDD.sql.gz`，保留最近 14 天。备份失败不影响当晚的运行，管理员邮箱会收到
   “【系统异常】数据库备份失败”（每天最多一封）。
-- **手动备份：** `./scripts/backup_db.sh`（做法与自动备份相同）。
+- **手动备份：** `./scripts/backup_db.sh`（做法与自动备份相同）。手动执行 `qt run-day` **不会**备份数据库，
+  需要时请在它之后运行这个脚本。
 - 备份里有全部使用者的数据：文件权限是 0600，`backups/` 目录已被 git 和 Docker 构建忽略，不要拷给别人。
 - 备份只保存数据库；行情数据在 `data/` 里，需要自己另行备份。恢复方法见 `docs/migrate-to-server.md`。
 
