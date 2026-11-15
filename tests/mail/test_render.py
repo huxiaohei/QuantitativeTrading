@@ -288,3 +288,14 @@ def test_entry_command_is_exact_cli_shape() -> None:
     sell = render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=False, to_email=EMAIL)
     sell_cmd = "qt admin trade sell --email u@example.com 600001 --price <实际成交价> --shares 1000"
     assert sell_cmd in sell.text
+
+
+def test_entry_command_quotes_shell_metacharacters() -> None:
+    evil = "a b;rm -rf x@example.com"
+    m = render_buy_signals(DAY, [_buy()], [], BOOKS, to_email=evil)
+    cmd = (
+        "qt admin trade buy --email 'a b;rm -rf x@example.com' 600001 "
+        "--price <实际成交价> --shares 1000"
+    )
+    assert cmd in m.text
+    assert cmd.replace("<", "&lt;").replace(">", "&gt;").replace("'", "&#39;") in m.html

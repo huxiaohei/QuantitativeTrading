@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from functools import cache
+from shlex import quote
 
 from jinja2 import Environment, PackageLoader
 
@@ -151,7 +152,7 @@ def _signed_pct(value: float | None) -> str:
 
 
 def _command(side: str, v: SignalView, to_email: str) -> str:
-    head = f"qt admin trade {side} --email {to_email} {v.symbol}"
+    head = f"qt admin trade {side} --email {quote(to_email)} {quote(v.symbol)}"
     return f"{head} --price <实际成交价> --shares {v.shares}"
 
 
