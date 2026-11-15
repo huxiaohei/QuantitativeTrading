@@ -19,10 +19,12 @@ from qt.jobs.daily import (
     alert,
     catch_up,
     describe,
+    due_day,
     first_start_day,
     has_pending_mail,
     parse_clock,
     pending_days,
+    run_deadline_at,
     send_outbox,
 )
 
@@ -65,11 +67,6 @@ def is_due(
     return False
 
 
-def _deadline(day: date, run_deadline: str) -> datetime:
-    """交易日 day 的完成期限：次日 run_deadline。"""
-    return datetime.combine(day + timedelta(days=1), parse_clock(run_deadline), tzinfo=MARKET_TZ)
-
-
 def _calendar(ctx: RunContext) -> TradingCalendar | None:
     try:
         return load_calendar(ctx.store)
@@ -90,14 +87,40 @@ class _Worker:
         self.last_flush: datetime | None = None
 
     def attempt(self, now: datetime) -> None:
+        """补跑一次。先排好重试，成功（没有 data_failed、没有异常）才取消，告警出错也不影响重试。"""
         self.last_attempt = now
-        self.retry_at = None
-        self.retry_until = None
+        self.retry_at = now + RETRY_INTERVAL
+        self.retry_until = self._retry_until(now)
         try:
             results = catch_up(self.ctx)
         except Exception as exc:
             _log.exception("每日运行出错")
-            local_day = now.astimezone(MARKET_TZ).date()
+            self._report(now, exc)
+            return
+        if not any(status == DATA_FAILED for _, status in results):
+            self.retry_at = None
+            self.retry_until = None
+
+    def _retry_until(self, now: datetime) -> datetime | None:
+        """重试截止：当晚要跑的交易日的完成期限（次日 run_deadline）。
+
+        已过期限（如休眠醒来时）或读不到日历时为 None：一直每 30 分钟重试，直到下一次到点。
+        """
+        calendar = _calendar(self.ctx)
+        if calendar is None:
+            return None
+        service = self.ctx.cfg.service
+        try:
+            night = due_day(now, calendar, service.run_time)
+        except (DataIntegrityError, ValueError):
+            return None
+        until = run_deadline_at(night, service.run_deadline)
+        return until if until > now else None
+
+    def _report(self, now: datetime, exc: Exception) -> None:
+        """意外错误告警；告警本身失败（如数据库暂时不可用）只记日志。"""
+        local_day = now.astimezone(MARKET_TZ).date()
+        try:
             alert(
                 self.ctx,
                 local_day,
@@ -105,12 +128,8 @@ class _Worker:
                 ["补跑过程意外中断，将稍后重试。", describe(exc)],
             )
             send_outbox(self.ctx, local_day)
-            self.retry_at = now + RETRY_INTERVAL
-            return
-        failed = [day for day, status in results if status == DATA_FAILED]
-        if failed:
-            self.retry_at = now + RETRY_INTERVAL
-            self.retry_until = _deadline(failed[0], self.ctx.cfg.service.run_deadline)
+        except Exception:
+            _log.exception("每日运行出错的告警没有发出")
 
     def tick(self, now: datetime) -> None:
         calendar = _calendar(self.ctx)
@@ -142,7 +161,7 @@ class _Worker:
         self.settled.add(day)
         if not pending:
             return
-        deadline = _deadline(day, service.run_deadline)
+        deadline = run_deadline_at(day, service.run_deadline)
         alert(
             self.ctx,
             day,
@@ -164,7 +183,10 @@ def run_forever(ctx: RunContext, sleep: Callable[[float], None] = time.sleep) ->
     """常驻运行：启动时补跑一次，之后每 60 秒检查一次。单个节拍出错只记日志，不退出。"""
     worker = _Worker(ctx)
     _log.info("定时进程启动")
-    worker.attempt(ctx.now())
+    try:
+        worker.attempt(ctx.now())
+    except Exception:
+        _log.exception("启动时补跑出错，下个节拍继续")
     while True:
         sleep(TICK_SECONDS)
         try:

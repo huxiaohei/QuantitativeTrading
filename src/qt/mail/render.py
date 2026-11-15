@@ -85,14 +85,14 @@ class RiskEventView:
 
 @dataclass(frozen=True)
 class HoldingView:
-    """周报里的一只持仓；pnl_pct 为小数。"""
+    """周报里的一只持仓；pnl_pct 为小数。成本为 0（无法计算）时 cost、pnl_pct 为 None，显示"—"。"""
 
     symbol: str
     name: str
     shares: int
-    cost: float
+    cost: float | None
     last_price: float
-    pnl_pct: float
+    pnl_pct: float | None
 
 
 @dataclass(frozen=True)
@@ -353,7 +353,7 @@ def render_weekly(week_end: date, report: WeeklyView) -> Mail:
             f"{h.symbol} {h.name}",
             [
                 ("数量", f"{h.shares} 股"),
-                ("成本", f"{h.cost:.2f}"),
+                ("成本", _price(h.cost)),
                 ("现价", f"{h.last_price:.2f}"),
                 ("浮动盈亏", _signed_pct(h.pnl_pct)),
             ],

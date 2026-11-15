@@ -1,6 +1,6 @@
 """定时进程：何时到点、休眠唤醒后立即补跑、数据失败重试与超时告警；以及两个命令。"""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from qt import cli
+from qt.jobs import worker
 from qt.jobs.daily import RunContext
 from qt.jobs.worker import is_due, run_forever
 from tests.jobs.conftest import (
@@ -107,8 +108,24 @@ def test_worker_runs_catch_up_immediately_after_wake_from_sleep(env: Env, db: Se
         assert run is not None and run.status == "done"
     assert daily_run(db, wednesday) is None
     assert processed_through(db, sub, "manual") == tuesday
-    # 只有最新一天（周二）的信号发邮件
-    assert [m.subject.split(" ")[0] for m in env.sender.sent] == [f"【买入信号】{tuesday}"]
+    # 只有最新一天（周二）的信号发邮件；周一已过期限才补跑，告知管理员
+    user_mails = [m.subject.split(" ")[0] for m in env.sender.sent if m.to_addr != ADMIN]
+    assert user_mails == [f"【买入信号】{tuesday}"]
+    [note] = [m for m in env.sender.sent if m.to_addr == ADMIN]
+    assert note.subject == "【系统异常】补跑了已超时的交易日" and str(monday) in note.text
+
+
+def test_worker_keeps_retrying_tonight_after_backlog_fails(env: Env, db: Session) -> None:
+    days = env.days
+    subscribe(db, "a@example.com", days[DAY])  # 周一起积压到周五
+    source = mirror_source(env.store, BrokenSource)
+    env.source = source
+    friday = days[DAY + 4]
+    env.clock.now = evening(friday, 20, 0)
+    with pytest.raises(_Stop):
+        run_forever(env.ctx, _ticking(env, evening(friday + timedelta(days=1), 9, 0), []))
+    # 重试截止按当晚（周五）的期限：20:00 启动 1 次，20:30 至次日 08:00 共 24 次
+    assert len([c for c in source.calls if c[0] == "securities"]) == 25
 
 
 def test_worker_survives_unexpected_error_and_alerts(
@@ -125,6 +142,48 @@ def test_worker_survives_unexpected_error_and_alerts(
         run_forever(env.ctx, _ticking(env, env.clock.now + timedelta(hours=2), seen))
     assert [m.subject for m in env.sender.sent] == ["【系统异常】每日运行出错"]
     assert "模拟意外错误" in env.sender.sent[0].text
+
+
+def test_failed_alert_does_not_cancel_retry(
+    env: Env, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subscribe(db, "a@example.com", env.days[DAY])
+    calls: list[datetime] = []
+
+    def boom(ctx: RunContext) -> list[tuple[date, str]]:
+        calls.append(ctx.now())
+        raise RuntimeError("模拟意外错误")
+
+    real_alert = worker.alert
+    alerts = 0
+
+    def flaky_alert(ctx: RunContext, day: date, title: str, lines: Sequence[str]) -> None:
+        nonlocal alerts
+        alerts += 1
+        if alerts == 1:
+            raise RuntimeError("模拟数据库暂时不可用")
+        real_alert(ctx, day, title, lines)
+
+    monkeypatch.setattr(worker, "catch_up", boom)
+    monkeypatch.setattr(worker, "alert", flaky_alert)
+    start = env.clock.now
+    with pytest.raises(_Stop):
+        run_forever(env.ctx, _ticking(env, start + timedelta(hours=2), []))
+    assert calls == [start + timedelta(minutes=30 * i) for i in range(5)]
+    assert [m.subject for m in env.sender.sent] == ["【系统异常】每日运行出错"]
+
+
+def test_failing_first_attempt_does_not_end_run_forever(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(self: object, now: datetime) -> None:
+        raise RuntimeError("模拟启动时出错")
+
+    monkeypatch.setattr("qt.jobs.worker._Worker.attempt", broken)
+    seen: list[float] = []
+    with pytest.raises(_Stop):
+        run_forever(env.ctx, _ticking(env, env.clock.now + timedelta(minutes=3), seen))
+    assert seen == [60, 60, 60, 60]
 
 
 def test_run_day_command(env: Env, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:

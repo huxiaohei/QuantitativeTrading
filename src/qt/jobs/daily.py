@@ -60,6 +60,7 @@ DONE_WITH_ERRORS = "done_with_errors"
 FINISHED = (DONE, DONE_WITH_ERRORS)
 _MAX_ERROR_CHARS = 500
 _LOOKBACK_SLACK_DAYS = 5  # 跟踪记录回看窗口 = 补记上限 + 这几天
+_MAX_PREVIOUS_RUNS = 20  # daily_runs.detail 里保留的历次运行记录条数
 
 
 @dataclass(frozen=True)
@@ -105,11 +106,16 @@ class _Run:
             if row is None:
                 row = DailyRun(trade_day=day, detail={})
                 s.add(row)
+            else:  # 重跑：上一次的结果留作历史，失败记录不丢
+                old = dict(row.detail)
+                previous = list(old.pop("previous", []))
+                previous.append({"status": row.status, "stage": row.stage, **old})
+                self.detail["previous"] = previous[-_MAX_PREVIOUS_RUNS:]
             row.status = RUNNING
             row.stage = "data"
             row.started_at = ctx.now()
             row.finished_at = None
-            row.detail = {}
+            row.detail = dict(self.detail)
             s.commit()
 
     def stage(self, name: str) -> None:
@@ -403,7 +409,7 @@ def _users_stage(
         alert(
             ctx,
             day,
-            f"使用者 {user_id} 的每日处理出错",
+            f"使用者 {user_id} 订阅 {sub_id} 的每日处理出错",
             [f"订阅 {sub_id} 当晚的处理已整体回滚，其他使用者不受影响。", error],
         )
     return errors
@@ -433,7 +439,7 @@ def _mail_stage(
                 errors.append(
                     {"user_id": user_id, "subscription_id": sub_id, "error": describe(exc)}
                 )
-                alert(ctx, day, f"使用者 {user_id} 的周报出错", [describe(exc)])
+                alert(ctx, day, f"使用者 {user_id} 订阅 {sub_id} 的周报出错", [describe(exc)])
     return errors
 
 
@@ -539,6 +545,11 @@ def first_start_day(s: Session) -> date | None:
     return min(starts) if starts else None
 
 
+def run_deadline_at(day: date, run_deadline: str) -> datetime:
+    """交易日 day 的完成期限：次日 run_deadline（上海时间）。"""
+    return datetime.combine(day + timedelta(days=1), parse_clock(run_deadline), tzinfo=MARKET_TZ)
+
+
 def due_day(now: datetime, calendar: TradingCalendar, run_time: str) -> date:
     """补跑的截止日：最近一个已收盘的交易日，但当天要过了每日运行时刻才算。"""
     as_of = latest_closed_day(now, calendar)
@@ -568,6 +579,7 @@ def catch_up(ctx: RunContext) -> list[tuple[date, str]]:
     with _session(ctx) as s:
         days = pending_days(s, calendar, as_of, first)
     if not days:
+        _warn_stale_calendar(ctx, calendar, refresh_error)
         return []
     _log.info("待补跑 %d 个交易日：%s 至 %s", len(days), days[0], days[-1])
     try:
@@ -592,4 +604,41 @@ def catch_up(ctx: RunContext) -> list[tuple[date, str]]:
         results.append((day, status))
         if status == DATA_FAILED:
             break
+    _note_late_days(ctx, results, as_of)
     return results
+
+
+def _warn_stale_calendar(
+    ctx: RunContext, calendar: TradingCalendar, refresh_error: str | None
+) -> None:
+    """交易日历刷新失败且已存储的日历没覆盖到今天：没有要补的日子也要告警（否则会一直静默）。"""
+    if refresh_error is None:
+        return
+    today = ctx.now().astimezone(MARKET_TZ).date()
+    if calendar.between(today, date.max):
+        return
+    alert(ctx, today, "交易日历更新失败", ["已存储的交易日历没有覆盖到今天。", refresh_error])
+    _send_quietly(ctx, today)
+
+
+def _note_late_days(ctx: RunContext, results: Sequence[tuple[date, str]], as_of: date) -> None:
+    """补跑了已过完成期限的日子（这些日子的信号没有发给使用者）：告知管理员一次。"""
+    now = ctx.now()
+    deadline = ctx.cfg.service.run_deadline
+    late = [
+        d
+        for d, status in results
+        if status in FINISHED and d != as_of and run_deadline_at(d, deadline) <= now
+    ]
+    if not late:
+        return
+    alert(
+        ctx,
+        as_of,
+        "补跑了已超时的交易日",
+        [
+            "以下交易日在完成期限之后才补跑，信号已记为未通知，没有发邮件给使用者：",
+            "、".join(str(d) for d in late),
+        ],
+    )
+    _send_quietly(ctx, as_of)

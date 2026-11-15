@@ -160,6 +160,8 @@ def queue_signal_mails(
     买卖信号邮件只在手动账当晚有该类信号时才写，系统账同日的信号附在后面作对照。
     """
     user = repo.get_user(s, sub.user_id)
+    if user.status != "active":
+        return 0  # 已停用的使用者不再收邮件
     manual = _book(s, sub, "manual")
     system = _book(s, sub, "system")
     system_today = [
@@ -342,9 +344,11 @@ def queue_weekly(
             symbol=pos.symbol,
             name=names.get(pos.symbol, ""),
             shares=round(pos.shares),
-            cost=pos.cost / pos.shares,
+            cost=pos.cost / pos.shares if pos.shares > 0 else None,
             last_price=(last := market.last_close(day, pos.symbol)),
-            pnl_pct=(pos.shares * last + pos.cash_received) / pos.cost - 1,
+            pnl_pct=(pos.shares * last + pos.cash_received) / pos.cost - 1
+            if pos.cost > 0
+            else None,
         )
         for pos in state.positions.values()
     ]

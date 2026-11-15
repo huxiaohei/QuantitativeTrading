@@ -1,7 +1,7 @@
 """每日任务：数据、检查、面板、逐个使用者推进两本账与写邮件、发送；重跑、补跑与出错隔离。"""
 
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -18,12 +18,13 @@ from qt.db.models import Base, BookDay, Outbox, Signal, Subscription, Trade, Use
 from qt.features import FeaturePanel, build_panel
 from qt.jobs import daily
 from qt.jobs.daily import catch_up, pending_days, run_day
+from qt.mail.render import HoldingView, WeeklyView, render_weekly
 from qt.mail.send import Sender
 from qt.service.accounts import close_subscription, pause_subscription, subscription_config
 from qt.service.manual_book import Market
 from qt.service.manual_ops import ManualDayResult, record_holding
 from qt.service.market import StoreMarket
-from tests.fakes import TRADING_SYMBOLS, make_industries, make_securities
+from tests.fakes import TRADING_SYMBOLS, FakeSource, make_industries, make_securities
 from tests.jobs.conftest import (
     ADMIN,
     CFG,
@@ -37,6 +38,13 @@ from tests.jobs.conftest import (
     processed_through,
     subscribe,
 )
+
+
+class NoCalendarSource(FakeSource):
+    """交易日历取不到。"""
+
+    def trade_days(self) -> pd.DataFrame:
+        raise ConnectionError("模拟交易日历不可用")
 
 
 class _Killed(BaseException):
@@ -106,11 +114,16 @@ def test_integrity_failure_emits_no_signals_and_alerts_admin(env: Env, db: Sessi
     assert [m.to_addr for m in env.sender.sent] == [ADMIN]
     assert env.sender.sent[0].subject.startswith("【系统异常】")
     run = daily_run(db, day)
+    assert run is not None and "previous" not in run.detail
     assert run is not None and (run.status, run.stage) == ("data_failed", "check")
     assert "2/4" in str(run.detail["problems"])
     # 重跑仍失败，同一天同一标题的告警只发一次
     assert run_day(env.ctx, day, True, False) == "data_failed"
     assert len(env.sender.sent) == 1
+    run = daily_run(db, day)
+    assert run is not None and "2/4" in str(run.detail["problems"])
+    [previous] = run.detail["previous"]  # 上一次的失败记录保留
+    assert previous["status"] == "data_failed" and "2/4" in str(previous["problems"])
 
 
 def test_data_update_failure_marks_run_failed_and_alerts(env: Env, db: Session) -> None:
@@ -133,6 +146,11 @@ def test_catch_up_processes_missing_days_in_order_and_notifies_only_latest(
     env.clock.now = evening(days[248])
     first = catch_up(env.ctx)
     assert first == [(d, "done") for d in days[240:249]]
+    # 已过完成期限才补跑的日子：管理员收到一次说明
+    [late] = [m for m in env.sender.sent if m.to_addr == ADMIN]
+    assert late.subject == "【系统异常】补跑了已超时的交易日"
+    listed = late.text.strip().splitlines()[-1]
+    assert listed == "、".join(str(d) for d in days[240:248])  # 不含当晚（已通知的）那天
     env.sender.sent.clear()
     # 上次成功是 5 个交易日前
     env.clock.now = evening(days[253])
@@ -144,7 +162,8 @@ def test_catch_up_processes_missing_days_in_order_and_notifies_only_latest(
     latest = [s.status for s in signals if s.signal_day == five_days[-1]]
     assert earlier and all(v == "unnotified" for v in earlier)
     assert latest and all(v == "notified" for v in latest)
-    assert [m.subject for m in env.sender.sent] == [f"【买入信号】{five_days[-1]} {len(latest)} 只"]
+    user_mails = [m.subject for m in env.sender.sent if m.to_addr != ADMIN]
+    assert user_mails == [f"【买入信号】{five_days[-1]} {len(latest)} 只"]
     # 系统账与一次性回测一致（逐日面板、每晚基本面复核都不改变结果）
     merged = subscription_config(CFG, sub)
     whole = run_period(merged, env.store, days[240], days[253])
@@ -217,7 +236,8 @@ def test_one_user_error_does_not_block_others(
     assert run_day(env.ctx, day, True, False) == "done_with_errors"
     assert processed_through(db, user_a, "system") is None  # 甲整体回滚
     assert processed_through(db, user_b, "manual") == day
-    assert any(m.to_addr == ADMIN for m in env.sender.sent)
+    [admin] = [m for m in env.sender.sent if m.to_addr == ADMIN]
+    assert admin.subject == f"【系统异常】使用者 {user_a.user_id} 订阅 {user_a.id} 的每日处理出错"
     assert [m.to_addr for m in env.sender.sent if m.to_addr != ADMIN] == ["b@example.com"]
     run = daily_run(db, day)
     assert run is not None
@@ -384,15 +404,63 @@ def test_subscription_starting_later_is_skipped_and_late_one_is_caught_up(
 ) -> None:
     days = env.days
     later = subscribe(db, "a@example.com", days[DAY + 1])
-    backdated = subscribe(db, "b@example.com", days[DAY - 2])  # 起始日在过去、从没跑过
+    backdated = subscribe(db, "b@example.com", days[DAY - 15])  # 起始日在过去、从没跑过
     assert run_day(env.ctx, days[DAY], True, False) == "done"
     assert processed_through(db, later, "system") is None
     assert processed_through(db, backdated, "system") == days[DAY]
     db.rollback()
     book = repo.get_book_of_kind(db, backdated.user_id, backdated.id, "system")
     rows = db.scalars(select(BookDay.day).where(BookDay.book_id == book.id).order_by(BookDay.day))
-    assert list(rows) == days[DAY - 2 : DAY + 1]  # 从起始日起逐日推进，没有跳过
+    assert list(rows) == days[DAY - 15 : DAY + 1]  # 从起始日起逐日推进，没有跳过
     statuses = {(s.signal_day, s.status) for s in book_signals(db, backdated, "manual")}
     assert {st for d, st in statuses if d < days[DAY]} <= {"unnotified"}
     assert {st for d, st in statuses if d == days[DAY]} == {"notified"}
     assert [m.to_addr for m in env.sender.sent] == ["b@example.com"]
+    # 补推进用的是更宽的面板：系统账仍与一次性回测逐项相同
+    whole = run_period(subscription_config(CFG, backdated), env.store, days[DAY - 15], days[DAY])
+    equity = _equity(db, backdated, "system")
+    assert equity == pytest.approx(list(whole.equity), rel=0, abs=0)
+    assert [x.hex() for x in equity] == [float(x).hex() for x in whole.equity]
+    assert len(equity) == 16 and whole.equity.iloc[-1] != whole.equity.iloc[0]  # 期间有成交
+
+
+def test_disabled_user_gets_no_signal_mail(env: Env, db: Session) -> None:
+    day = env.days[DAY]
+    sub = subscribe(db, "a@example.com", day)
+    user = db.get(User, sub.user_id)
+    assert user is not None
+    user.status = "disabled"
+    db.commit()
+    assert run_day(env.ctx, day, True, False) == "done"
+    assert processed_through(db, sub, "manual") == day
+    assert env.sender.sent == []
+
+
+def test_failed_calendar_refresh_alerts_when_stored_calendar_is_stale(
+    env: Env, db: Session
+) -> None:
+    subscribe(db, "a@example.com", env.days[-1] + timedelta(days=30))  # 没有要补的日子
+    env.source = mirror_source(env.store, NoCalendarSource)
+    env.clock.now = evening(env.days[-1] + timedelta(days=10))
+    assert catch_up(env.ctx) == []
+    assert [m.subject for m in env.sender.sent] == ["【系统异常】交易日历更新失败"]
+    env.clock.now = evening(env.days[-1])  # 日历还覆盖今天：不告警
+    env.sender.sent.clear()
+    assert catch_up(env.ctx) == []
+    assert env.sender.sent == []
+
+
+def test_weekly_holding_with_unknown_cost_shows_dash() -> None:
+    report = WeeklyView(
+        week_start=date(2022, 1, 3),
+        manual_equity=1.0,
+        system_equity=1.0,
+        manual_week_return=0.0,
+        system_week_return=0.0,
+        benchmark_week_return=None,
+        holdings=[HoldingView("600001", "甲", 100, None, 10.0, None)],
+        signal_lines=[],
+        trade_lines=[],
+    )
+    text = render_weekly(date(2022, 1, 7), report).text
+    assert "成本：—" in text and "浮动盈亏：—" in text
