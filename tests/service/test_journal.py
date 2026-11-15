@@ -300,5 +300,5 @@ def test_old_unfilled_followups_are_not_listed_forever(db: Session, world: World
     assert fill_followups(db, cal, m, d[EVENT + 20 + 31], [20]) == 0  # 超出窗口：不再查
     db.refresh(f)
     assert f.ret_20 is None
-    assert admin_repo.list_unfilled_followups(db, d[EVENT + 1], d[EVENT + 90]) == []
-    assert admin_repo.list_unfilled_followups(db, d[EVENT], d[EVENT + 90]) == [f]
+    assert admin_repo.list_unfilled_followups(db, d[EVENT + 1], d[-1]) == []
+    assert admin_repo.list_unfilled_followups(db, d[EVENT], d[-1]) == [f]
