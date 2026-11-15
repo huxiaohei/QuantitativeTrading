@@ -10,28 +10,33 @@ import json
 import unicodedata
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from contextvars import ContextVar
+from datetime import date, datetime, time, timedelta
 from typing import Annotated, Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 import typer
-import yaml
-from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from qt.backtest.state import load_state
 from qt.calendar import TradingCalendar
-from qt.config import AppConfig, load_config
 from qt.data.schema import SchemaError
-from qt.data.store import ParquetStore
-from qt.data.update import DataIntegrityError, load_calendar
+from qt.data.update import DataIntegrityError
 from qt.db import admin_repo, repo
-from qt.db.engine import database_url, make_engine, session_scope
+from qt.db.engine import session_scope
 from qt.db.models import Book, LedgerEntry, Signal, Subscription, User
 from qt.features import build_panel
 from qt.jobs.daily import due_day
 from qt.models import Position, Side
+from qt.runtime import (
+    DEFAULT_CONFIG,
+    DEFAULT_DATA_DIR,
+    ConfigOption,
+    DataDirOption,
+    Runtime,
+    SetupError,
+)
+from qt.runtime import now as runtime_now
 from qt.service import accounts, manual_ops
 from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
 from qt.service.manual_book import CorporateAction
@@ -55,6 +60,10 @@ admin_app.add_typer(entry_app, name="entry")
 admin_app.add_typer(book_app, name="book")
 
 _MARKET_TZ = ZoneInfo("Asia/Shanghai")
+_MARKET_CLOSE = time(15, 0)
+_DAY_DEFAULT_HELP = (
+    "默认最近一个已收盘的交易日（今天是交易日且已过 15:00 为今天，否则为上一个交易日）"
+)
 _EARLIEST = date(1990, 1, 1)
 _RECENT_ENTRIES = 20  # book show 显示的最近流水条数
 _FAR_FUTURE = date.max
@@ -133,7 +142,7 @@ _RUN_STATUS_LABELS = {
 
 def now() -> datetime:
     """当前时间（上海时区）；测试里替换。"""
-    return datetime.now(_MARKET_TZ)
+    return runtime_now()
 
 
 def money(value: float) -> str:
@@ -149,81 +158,53 @@ def pct(value: float) -> str:
 # ---------- 运行环境 ----------
 
 
-class _SetupError(Exception):
-    """命令还没开始就无法运行（配置、数据库地址等）；消息为中文。"""
+def _market(rt: Runtime, calendar: TradingCalendar, today: date) -> StoreMarket:
+    """行情：以不晚于今天的最近一个交易日为指标面板的日期。"""
+    days = calendar.between(_EARLIEST, today)
+    if not days:
+        raise ValidationError(f"交易日历里没有 {today} 及以前的交易日")
+    panel = build_panel(rt.store(), calendar, rt.cfg(), days[-1], days[-1])
+    return StoreMarket(rt.store(), panel, rt.cfg())
 
 
-class _Cli:
-    """一次命令行调用共用的配置与连接；各项在用到时才创建。"""
+# 命令的输出先攒在这里，事务提交成功之后才打印（出错回滚时丢弃）
+_output: ContextVar[list[str] | None] = ContextVar("admin_output", default=None)
 
-    def __init__(self, config: Path, data_dir: Path) -> None:
-        self._config = config
-        self._data_dir = data_dir
-        self._cfg: AppConfig | None = None
-        self._engine: Engine | None = None
-        self._store: ParquetStore | None = None
 
-    def cfg(self) -> AppConfig:
-        if self._cfg is None:
-            try:
-                self._cfg = load_config(self._config)
-            except (OSError, yaml.YAMLError, ValueError) as exc:  # ValidationError 也是 ValueError
-                raise _SetupError(f"无法读取配置文件 {self._config}：{exc}") from exc
-        return self._cfg
-
-    def engine(self) -> Engine:
-        if self._engine is None:
-            try:
-                self._engine = make_engine(database_url())
-            except RuntimeError as exc:
-                raise _SetupError(str(exc)) from exc
-        return self._engine
-
-    def store(self) -> ParquetStore:
-        if self._store is None:
-            self._store = ParquetStore(self._data_dir)
-        return self._store
-
-    def calendar(self) -> TradingCalendar:
-        return load_calendar(self.store())
-
-    def market(self, calendar: TradingCalendar, today: date) -> StoreMarket:
-        """行情：以不晚于今天的最近一个交易日为指标面板的日期。"""
-        days = calendar.between(_EARLIEST, today)
-        if not days:
-            raise ValidationError(f"交易日历里没有 {today} 及以前的交易日")
-        panel = build_panel(self.store(), calendar, self.cfg(), days[-1], days[-1])
-        return StoreMarket(self.store(), panel, self.cfg())
-
-    def close(self) -> None:
-        if self._engine is not None:
-            self._engine.dispose()
+def _emit(text: str = "") -> None:
+    lines = _output.get()
+    if lines is None:
+        typer.echo(text)
+    else:
+        lines.append(text)
 
 
 @admin_app.callback()
 def _setup(
     ctx: typer.Context,
-    config: Annotated[Path, typer.Option(help="配置文件路径", envvar="QT_CONFIG")] = Path(
-        "config/default.yaml"
-    ),
-    data_dir: Annotated[Path, typer.Option(help="数据目录", envvar="QT_DATA_DIR")] = Path("data"),
+    config: ConfigOption = DEFAULT_CONFIG,
+    data_dir: DataDirOption = DEFAULT_DATA_DIR,
 ) -> None:
     """管理命令。数据库地址取自环境变量 DATABASE_URL。"""
-    cli = _Cli(config, data_dir)
-    ctx.obj = cli
-    ctx.call_on_close(cli.close)
+    runtime = Runtime(config, data_dir)
+    ctx.obj = runtime
+    ctx.call_on_close(runtime.close)
 
 
 @contextmanager
-def _unit(ctx: typer.Context) -> Generator[tuple[_Cli, Session]]:
-    """一个命令的工作单元：一个事务，成功提交，出错回滚；错误按约定转成退出码。"""
-    cli = ctx.find_object(_Cli)
-    if cli is None:
+def _unit(ctx: typer.Context) -> Generator[tuple[Runtime, Session]]:
+    """一个命令的工作单元：一个事务，成功提交后才打印输出，出错回滚；错误按约定转成退出码。"""
+    runtime = ctx.find_object(Runtime)
+    if runtime is None:
         raise RuntimeError("管理命令的运行环境没有初始化")
+    lines: list[str] = []
+    token = _output.set(lines)
     try:
-        with session_scope(cli.engine()) as s:
-            yield cli, s
-    except (ValidationError, NotFoundError, _SetupError) as exc:
+        with session_scope(runtime.engine()) as s:
+            yield runtime, s
+        for line in lines:  # 事务已提交
+            typer.echo(line)
+    except (ValidationError, NotFoundError, SetupError) as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
     except (DataIntegrityError, SchemaError) as exc:
@@ -233,6 +214,8 @@ def _unit(ctx: typer.Context) -> Generator[tuple[_Cli, Session]]:
         typer.echo(str(exc))
         typer.echo("该使用者的账本需要修复，本次操作没有保存；请先检查并更正流水，再继续录入。")
         raise typer.Exit(code=2) from exc
+    finally:
+        _output.reset(token)
 
 
 # ---------- 输入解析 ----------
@@ -277,16 +260,20 @@ def _today() -> date:
     return now().date()
 
 
-def _default_day(calendar: TradingCalendar, today: date) -> date:
-    """今天之前最近的交易日。"""
+def _closed_day(moment: datetime, calendar: TradingCalendar) -> date:
+    """最近一个已收盘的交易日：今天是交易日且上海时间已到 15:00 为今天，否则为上一个交易日。"""
+    local = moment.astimezone(_MARKET_TZ)
+    today = local.date()
+    if calendar.is_trading_day(today) and local.time() >= _MARKET_CLOSE:
+        return today
     earlier = calendar.between(_EARLIEST, today - timedelta(days=1))
     if not earlier:
-        raise ValidationError("交易日历里没有今天之前的交易日，请用 --day 指定日期")
+        raise ValidationError("交易日历里没有已收盘的交易日，请用 --day 指定日期")
     return earlier[-1]
 
 
-def _day_or_default(day: str | None, calendar: TradingCalendar, today: date) -> date:
-    return _default_day(calendar, today) if day is None else _parse_day(day)
+def _day_or_default(day: str | None, calendar: TradingCalendar) -> date:
+    return _closed_day(now(), calendar) if day is None else _parse_day(day)
 
 
 # ---------- 查找使用者与订阅 ----------
@@ -336,9 +323,9 @@ def _table(
         parts = [_pad(c, widths[i], i in right) for i, c in enumerate(cells)]
         return ("  ".join(parts)).rstrip()
 
-    typer.echo(line(headers))
+    _emit(line(headers))
     for row in rows:
-        typer.echo(line(row))
+        _emit(line(row))
 
 
 def _json_text(value: object) -> str:
@@ -362,7 +349,7 @@ def user_add(
     """创建使用者。"""
     with _unit(ctx) as (_cli, s):
         user = accounts.create_user(s, email, is_admin=admin)
-        typer.echo(f"已创建使用者 {user.email}{'（管理员）' if user.is_admin else ''}")
+        _emit(f"已创建使用者 {user.email}{'（管理员）' if user.is_admin else ''}")
 
 
 @user_app.command("list")
@@ -371,7 +358,7 @@ def user_list(ctx: typer.Context) -> None:
     with _unit(ctx) as (_cli, s):
         users = admin_repo.list_users(s)
         if not users:
-            typer.echo("还没有使用者")
+            _emit("还没有使用者")
             return
         rows: list[list[str]] = []
         for u in users:
@@ -400,7 +387,7 @@ def user_weekly(
             raise ValidationError("请用 --on 或 --off 指定周报开关")
         user = _user(s, email)
         accounts.set_weekly_mail(s, user.id, on)
-        typer.echo(f"已{'开启' if on else '关闭'} {user.email} 的周报邮件")
+        _emit(f"已{'开启' if on else '关闭'} {user.email} 的周报邮件")
 
 
 # ---------- 订阅 ----------
@@ -422,14 +409,12 @@ def sub_create(
         if not upcoming:
             raise ValidationError("交易日历还没有覆盖到下一个交易日，请先运行 qt data update")
         sub = accounts.create_subscription(s, user.id, cli.cfg(), cash, upcoming[0], overrides)
-        typer.echo(
+        _emit(
             f"已为 {user.email} 创建订阅 {sub.id}：本金 {money(cash)}，起始日 {upcoming[0]}"
             "（下一个交易日）"
         )
         if overrides:
-            typer.echo(
-                "参数覆盖：" + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items())
-            )
+            _emit("参数覆盖：" + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items()))
 
 
 @sub_app.command("set")
@@ -451,11 +436,11 @@ def sub_set(ctx: typer.Context, email: Email, set_: SetOption = None) -> None:
                 "交易日历还没有覆盖到下一次运行的日期，请先运行 qt data update"
             ) from exc
         accounts.update_params(s, user.id, sub.id, cfg, overrides, effective)
-        typer.echo(
+        _emit(
             f"已修改 {user.email} 的参数："
             + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items())
         )
-        typer.echo(f"从下一次运行（{effective}）起生效，已有账本与历史不变")
+        _emit(f"从下一次运行（{effective}）起生效，已有账本与历史不变")
 
 
 @sub_app.command("show")
@@ -470,13 +455,13 @@ def sub_show(ctx: typer.Context, email: Email) -> None:
             "risk": site.risk.model_dump(mode="json"),
         }
         params = sub.params
-        typer.echo(
+        _emit(
             f"{user.email} 的订阅 {sub.id}：{_SUB_STATUS.get(sub.status, sub.status)}，"
             f"本金 {money(sub.initial_cash)}，起始日 {sub.start_day}"
         )
         changes = repo.list_param_changes(s, user.id, sub.id)
         if changes:
-            typer.echo(f"参数修改过 {len(changes)} 次，最近一次生效日 {changes[-1].effective_day}")
+            _emit(f"参数修改过 {len(changes)} 次，最近一次生效日 {changes[-1].effective_day}")
         different = 0
         for path, label in _PARAM_LABELS.items():
             section, _, field = path.partition(".")
@@ -486,8 +471,8 @@ def sub_show(ctx: typer.Context, email: Email) -> None:
             if value != default:
                 different += 1
                 line += f" ← 与默认值不同（默认 {_json_text(default)}）"
-            typer.echo(line)
-        typer.echo(f"共 {different} 项与默认值不同；以上为按你设定的规则计算时使用的参数")
+            _emit(line)
+        _emit(f"共 {different} 项与默认值不同；以上为按你设定的规则计算时使用的参数")
 
 
 @sub_app.command("pause")
@@ -496,7 +481,7 @@ def sub_pause(ctx: typer.Context, email: Email) -> None:
     with _unit(ctx) as (_cli, s):
         user = _user(s, email)
         accounts.pause_subscription(s, user.id, _open_sub(s, user).id)
-        typer.echo(f"已暂停 {user.email} 的订阅")
+        _emit(f"已暂停 {user.email} 的订阅")
 
 
 @sub_app.command("resume")
@@ -505,7 +490,7 @@ def sub_resume(ctx: typer.Context, email: Email) -> None:
     with _unit(ctx) as (_cli, s):
         user = _user(s, email)
         accounts.resume_subscription(s, user.id, _open_sub(s, user).id)
-        typer.echo(f"已恢复 {user.email} 的订阅")
+        _emit(f"已恢复 {user.email} 的订阅")
 
 
 @sub_app.command("close")
@@ -514,7 +499,7 @@ def sub_close(ctx: typer.Context, email: Email) -> None:
     with _unit(ctx) as (_cli, s):
         user = _user(s, email)
         accounts.close_subscription(s, user.id, _open_sub(s, user).id)
-        typer.echo(f"已关闭 {user.email} 的订阅，账本与历史保留")
+        _emit(f"已关闭 {user.email} 的订阅，账本与历史保留")
 
 
 # ---------- 录入 ----------
@@ -535,8 +520,8 @@ def _record_trade(
         sub = _open_sub(s, user)
         calendar = cli.calendar()
         today = _today()
-        trade_day = _day_or_default(day, calendar, today)
-        market = cli.market(calendar, today)
+        trade_day = _day_or_default(day, calendar)
+        market = _market(cli, calendar, today)
         code = symbol.strip()
         entry = manual_ops.record_trade(
             s,
@@ -555,15 +540,15 @@ def _record_trade(
         )
         label = "买入" if side is Side.BUY else "卖出"
         estimated = "（估算）" if entry.fees_estimated else ""
-        typer.echo(
+        _emit(
             f"已录入{label}：{code} {shares:,.0f} 股 @ {money(price)}，日期 {trade_day}，"
             f"费用 {money(entry.fees)}{estimated}，{_origin_label(entry.origin, label)}"
             f"（流水 {entry.id}）"
         )
         if entry.signal_id is not None:
-            typer.echo(f"关联信号 #{entry.signal_id}")
+            _emit(f"关联信号 #{entry.signal_id}")
         if entry.note:
-            typer.echo(f"提示：{entry.note}")
+            _emit(f"提示：{entry.note}")
 
 
 @trade_app.command("buy")
@@ -574,7 +559,11 @@ def trade_buy(
     price: Annotated[float, typer.Option("--price", help="实际成交价")],
     shares: Annotated[float, typer.Option("--shares", help="股数")],
     day: Annotated[
-        str | None, typer.Option("--day", help="成交日 YYYY-MM-DD，默认今天之前最近的交易日")
+        str | None,
+        typer.Option(
+            "--day",
+            help="成交日 YYYY-MM-DD，" + _DAY_DEFAULT_HELP,
+        ),
     ] = None,
     fees: Annotated[float | None, typer.Option("--fees", help="实际费用，不填则按规则估算")] = None,
 ) -> None:
@@ -590,7 +579,11 @@ def trade_sell(
     price: Annotated[float, typer.Option("--price", help="实际成交价")],
     shares: Annotated[float, typer.Option("--shares", help="股数")],
     day: Annotated[
-        str | None, typer.Option("--day", help="成交日 YYYY-MM-DD，默认今天之前最近的交易日")
+        str | None,
+        typer.Option(
+            "--day",
+            help="成交日 YYYY-MM-DD，" + _DAY_DEFAULT_HELP,
+        ),
     ] = None,
     fees: Annotated[float | None, typer.Option("--fees", help="实际费用，不填则按规则估算")] = None,
 ) -> None:
@@ -613,7 +606,7 @@ def holding_add(
         sub = _open_sub(s, user)
         calendar = cli.calendar()
         today = _today()
-        market = cli.market(calendar, today)
+        market = _market(cli, calendar, today)
         code = symbol.strip()
         entry = manual_ops.record_holding(
             s,
@@ -628,12 +621,12 @@ def holding_add(
             cost,
             shares,
         )
-        typer.echo(
+        _emit(
             f"已录入已有持仓：{code} {shares:,.0f} 股，成本价 {money(cost)}，"
             f"买入日 {entry.trade_day}，从 {entry.effective_day} 起进入净值（自主买入）"
         )
         if entry.note:
-            typer.echo(f"提示：{entry.note}")
+            _emit(f"提示：{entry.note}")
 
 
 def _record_cash(
@@ -648,13 +641,13 @@ def _record_cash(
         sub = _open_sub(s, user)
         calendar = cli.calendar()
         today = _today()
-        cash_day = _day_or_default(day, calendar, today)
-        market = cli.market(calendar, today)
+        cash_day = _day_or_default(day, calendar)
+        market = _market(cli, calendar, today)
         entry = manual_ops.record_cash(
             s, user.id, sub.id, market, calendar, cli.cfg(), today, kind, cash_day, amount
         )
         label = "入金" if kind == "deposit" else "出金"
-        typer.echo(f"已录入{label} {money(amount)}，日期 {cash_day}（流水 {entry.id}）")
+        _emit(f"已录入{label} {money(amount)}，日期 {cash_day}（流水 {entry.id}）")
 
 
 @cash_app.command("deposit")
@@ -663,7 +656,11 @@ def cash_deposit(
     email: Email,
     amount: Annotated[float, typer.Option("--amount", help="金额（元）")],
     day: Annotated[
-        str | None, typer.Option("--day", help="日期 YYYY-MM-DD，默认今天之前最近的交易日")
+        str | None,
+        typer.Option(
+            "--day",
+            help="日期 YYYY-MM-DD，" + _DAY_DEFAULT_HELP,
+        ),
     ] = None,
 ) -> None:
     """录入入金。"""
@@ -676,7 +673,11 @@ def cash_withdraw(
     email: Email,
     amount: Annotated[float, typer.Option("--amount", help="金额（元）")],
     day: Annotated[
-        str | None, typer.Option("--day", help="日期 YYYY-MM-DD，默认今天之前最近的交易日")
+        str | None,
+        typer.Option(
+            "--day",
+            help="日期 YYYY-MM-DD，" + _DAY_DEFAULT_HELP,
+        ),
     ] = None,
 ) -> None:
     """录入出金。"""
@@ -695,11 +696,11 @@ def entry_void(
         sub = _open_sub(s, user)
         calendar = cli.calendar()
         today = _today()
-        market = cli.market(calendar, today)
+        market = _market(cli, calendar, today)
         row = manual_ops.void_entry(
             s, user.id, sub.id, market, calendar, cli.cfg(), today, entry_id
         )
-        typer.echo(f"已作废流水 {entry_id}（新增作废记录 {row.id}）")
+        _emit(f"已作废流水 {entry_id}（新增作废记录 {row.id}）")
 
 
 # ---------- 账本 ----------
@@ -760,11 +761,11 @@ def _show_header(
     user: User, sub: Subscription, kind: str, through: date, equity: float, cash: float, nav: float
 ) -> None:
     name = "手动账" if kind == "manual" else "系统账"
-    typer.echo(
+    _emit(
         f"{user.email} · 订阅 {sub.id}（{_SUB_STATUS.get(sub.status, sub.status)}）· {name}"
         f" · 截至 {through}（按你设定的规则计算，仅供提示）"
     )
-    typer.echo(f"净值 {money(equity)}  现金 {money(cash)}  单位净值 {nav:.4f}  收益 {pct(nav - 1)}")
+    _emit(f"净值 {money(equity)}  现金 {money(cash)}  单位净值 {nav:.4f}  收益 {pct(nav - 1)}")
 
 
 def _position_rows(
@@ -796,10 +797,10 @@ _POSITION_HEADERS = ["代码", "股数", "成本价", "现价", "市值", "收�
 
 
 def _show_manual(
-    cli: _Cli, s: Session, user: User, sub: Subscription, book: Book, calendar: TradingCalendar
+    cli: Runtime, s: Session, user: User, sub: Subscription, book: Book, calendar: TradingCalendar
 ) -> None:
     today = _today()
-    market = cli.market(calendar, today)
+    market = _market(cli, calendar, today)
     rows = repo.list_ledger_entries(s, user.id, book.id)
     days = calendar.between(_EARLIEST, today)
     through = max([days[-1], *(r.effective_day for r in rows if r.kind != "void")])
@@ -807,39 +808,39 @@ def _show_manual(
     equity = state.equity[-1] if state.equity else sub.initial_cash
     nav = state.unit_nav[-1] if state.unit_nav else 1.0
     _show_header(user, sub, "manual", through, equity, state.cash, nav)
-    typer.echo("")
+    _emit("")
     if state.positions:
-        typer.echo("持仓：")
+        _emit("持仓：")
         held = [(p, _origin_label(state.origins.get(p.symbol))) for p in state.positions.values()]
         _table(_POSITION_HEADERS, _position_rows(held, market, through), right=[1, 2, 3, 4, 5])
     else:
-        typer.echo("持仓：无")
-    typer.echo("")
-    typer.echo(f"最近 {_RECENT_ENTRIES} 条流水（含推算出的除权记录）：")
+        _emit("持仓：无")
+    _emit("")
+    _emit(f"最近 {_RECENT_ENTRIES} 条流水（含推算出的除权记录）：")
     lines = _recent_entries(rows, state.actions)
     for line in lines or ["暂无流水"]:
-        typer.echo(f"  {line}")
+        _emit(f"  {line}")
 
 
 def _show_system(
-    cli: _Cli, s: Session, user: User, sub: Subscription, book: Book, calendar: TradingCalendar
+    cli: Runtime, s: Session, user: User, sub: Subscription, book: Book, calendar: TradingCalendar
 ) -> None:
     state_row = repo.get_system_state(s, user.id, book.id)
     book_days = repo.list_book_days(s, user.id, book.id)
     if state_row is None or not book_days:
-        typer.echo(f"{user.email} 的系统账尚未推进过（每日运行之后才有数据）")
+        _emit(f"{user.email} 的系统账尚未推进过（每日运行之后才有数据）")
         return
     engine_state, _risk = load_state(state_row.state)
     last = book_days[-1]
     _show_header(user, sub, "system", last.day, last.equity, last.cash, last.unit_nav)
-    typer.echo("")
-    market = cli.market(calendar, last.day)
+    _emit("")
+    market = _market(cli, calendar, last.day)
     if engine_state.positions:
-        typer.echo("持仓：")
+        _emit("持仓：")
         held = [(p, "按信号买入") for p in engine_state.positions.values()]
         _table(_POSITION_HEADERS, _position_rows(held, market, last.day), right=[1, 2, 3, 4, 5])
     else:
-        typer.echo("持仓：无")
+        _emit("持仓：无")
 
 
 @book_app.command("show")
@@ -913,11 +914,9 @@ def signals(
             if sig.signal_day >= since
         ]
         if not found:
-            typer.echo(f"最近 {days} 天没有符合条件的信号")
+            _emit(f"最近 {days} 天没有符合条件的信号")
             return
-        typer.echo(
-            f"{user.email} · {'手动账' if kind == 'manual' else '系统账'}的信号（仅为提示）："
-        )
+        _emit(f"{user.email} · {'手动账' if kind == 'manual' else '系统账'}的信号（仅为提示）：")
         _table(
             [
                 "编号",
@@ -945,8 +944,8 @@ def journal(ctx: typer.Context, email: Email, book: BookOption = "manual") -> No
         sub = _shown_sub(s, user)
         row = repo.get_book_of_kind(s, user.id, sub.id, kind)
         trades = repo.list_trades(s, user.id, row.id)
-        typer.echo(f"{user.email} · {'手动账' if kind == 'manual' else '系统账'}")
-        typer.echo("已完成的交易：")
+        _emit(f"{user.email} · {'手动账' if kind == 'manual' else '系统账'}")
+        _emit("已完成的交易：")
         if trades:
             _table(
                 [
@@ -979,9 +978,9 @@ def journal(ctx: typer.Context, email: Email, book: BookOption = "manual") -> No
                 right=[3, 4, 5, 6, 7],
             )
         else:
-            typer.echo("  暂无")
-        typer.echo("")
-        typer.echo("跟踪记录（事件之后 20、60 个交易日的复权涨跌）：")
+            _emit("  暂无")
+        _emit("")
+        _emit("跟踪记录（事件之后 20、60 个交易日的复权涨跌）：")
         followups = repo.list_followups(s, user.id, row.id)
         if followups:
             _table(
@@ -999,7 +998,7 @@ def journal(ctx: typer.Context, email: Email, book: BookOption = "manual") -> No
                 right=[3, 4],
             )
         else:
-            typer.echo("  暂无")
+            _emit("  暂无")
 
 
 def _reason_lines(detail: dict[str, Any]) -> list[str]:
@@ -1040,7 +1039,7 @@ def runs(
     with _unit(ctx) as (_cli, s):
         found = admin_repo.list_recent_runs(s, last)
         if not found:
-            typer.echo("还没有运行记录")
+            _emit("还没有运行记录")
             return
         for run in found:
             started = run.started_at.astimezone(_MARKET_TZ).strftime("%Y-%m-%d %H:%M")
@@ -1049,9 +1048,9 @@ def runs(
                 if run.finished_at is None
                 else run.finished_at.astimezone(_MARKET_TZ).strftime("%H:%M")
             )
-            typer.echo(
+            _emit(
                 f"{run.trade_day}  {_RUN_STATUS_LABELS.get(run.status, run.status)}"
                 f"  阶段 {run.stage}  开始 {started}  结束 {finished}"
             )
             for line in _reason_lines(run.detail):
-                typer.echo(f"    {line}")
+                _emit(f"    {line}")

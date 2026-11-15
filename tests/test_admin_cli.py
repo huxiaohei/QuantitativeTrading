@@ -1,14 +1,15 @@
 """管理命令：用 Typer 的 CliRunner 对测试库与假数据（临时目录）执行，不联网、不碰真实 data/。
 
-命令通过环境变量找到数据库与数据目录（DATABASE_URL、QT_DATA_DIR、QT_CONFIG），
-与每日任务相同；当前时间通过替换 qt.admin_cli.now 控制。
+命令通过环境变量找到数据库、配置与数据目录（DATABASE_URL、QT_CONFIG、QT_DATA_DIR），
+与 qt run-day、qt worker 共用 qt.runtime 的解析；当前时间通过替换 qt.admin_cli.now 控制。
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -32,7 +33,9 @@ from qt.db.models import (
     User,
 )
 from qt.features import build_panel
+from qt.runtime import Runtime
 from qt.service.accounts import create_subscription, create_user
+from qt.service.errors import ValidationError
 from qt.service.manual_ops import advance_manual_book
 from qt.service.market import StoreMarket
 from tests.conftest import resolve_test_db_url
@@ -49,7 +52,7 @@ type Invoke = Callable[..., Result]
 
 
 class SetNow(Protocol):
-    def __call__(self, day: date, hour: int = 20) -> None: ...
+    def __call__(self, day: date, hour: int = 9) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -71,7 +74,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, db_engine: Engine, db
 
 @pytest.fixture
 def set_now(monkeypatch: pytest.MonkeyPatch) -> SetNow:
-    def _set(day: date, hour: int = 20) -> None:
+    def _set(day: date, hour: int = 9) -> None:
         moment = datetime.combine(day, time(hour, 0), tzinfo=SH)
 
         def fake_now() -> datetime:
@@ -675,3 +678,164 @@ def test_new_admin_repo_and_repo_queries(world: World, db: Session) -> None:
     assert repo.get_latest_subscription(db, sub.user_id) is not None
     assert repo.get_latest_subscription(db, sub.user_id + 1000) is None
     assert admin_repo.list_recent_runs(db, 5) == []
+
+
+# ---------- 与 run-day / worker 共用同一套解析 ----------
+
+
+def test_admin_run_day_and_worker_resolve_same_config_and_data_dir(
+    world: World,
+    db: Session,
+    invoke: Invoke,
+    set_now: SetNow,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "site.yaml"
+    config.write_text(
+        (_ROOT / "config" / "default.yaml")
+        .read_text(encoding="utf-8")
+        .replace("stop_loss: 0.15", "stop_loss: 0.12"),
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "elsewhere"
+    monkeypatch.setenv("QT_CONFIG", str(config))
+    monkeypatch.setenv("QT_DATA_DIR", str(data_dir))
+
+    seen: list[tuple[str, Path, Path]] = []
+
+    class Spy(Runtime):
+        def __init__(self, config: Path, data_dir: Path) -> None:
+            seen.append(("admin", config, data_dir))
+            super().__init__(config, data_dir)
+
+    def spy_context(config: Path, data_dir: Path) -> object:
+        seen.append(("job", config, data_dir))
+        raise RuntimeError("测试中止")
+
+    monkeypatch.setattr(qt.admin_cli, "Runtime", Spy)
+    monkeypatch.setattr(qt.cli, "make_context", spy_context)
+    invoke("admin", "user", "list")
+    assert invoke("run-day", "--no-update").exit_code == 1
+    assert invoke("worker").exit_code == 1
+    assert seen == [
+        ("admin", config, data_dir),
+        ("job", config, data_dir),
+        ("job", config, data_dir),
+    ]
+
+    # 命令行选项优先于环境变量，三者一致
+    other = tmp_path / "other"
+    seen.clear()
+    invoke("admin", "--data-dir", str(other), "user", "list")
+    invoke("run-day", "--data-dir", str(other))
+    assert [(c, d) for _, c, d in seen] == [(config, other), (config, other)]
+
+
+def test_admin_uses_config_from_qt_config_like_the_nightly_job(
+    world: World,
+    invoke: Invoke,
+    set_now: SetNow,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "site.yaml"
+    config.write_text(
+        (_ROOT / "config" / "default.yaml")
+        .read_text(encoding="utf-8")
+        .replace("stop_loss: 0.15", "stop_loss: 0.12"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("QT_CONFIG", str(config))
+    set_now(world.days[262])
+    invoke("admin", "user", "add", "--email", EMAIL)
+    assert invoke("admin", "sub", "create", "--email", EMAIL, "--cash", "1000").exit_code == 0
+    shown = invoke("admin", "sub", "show", "--email", EMAIL).stdout
+    assert "止损比例：0.12" in shown and "共 0 项与默认值不同" in shown
+
+
+# ---------- --day 缺省：最近已收盘的交易日 ----------
+
+
+def _deposit_day(db: Session, sub: Subscription, invoke: Invoke) -> date:
+    r = invoke("admin", "cash", "deposit", "--email", EMAIL, "--amount", "100")
+    assert r.exit_code == 0, r.stdout
+    return _ledger(db, sub)[-1].trade_day
+
+
+def test_default_day_is_latest_closed_trading_day(
+    world: World, db: Session, invoke: Invoke, set_now: SetNow
+) -> None:
+    sub = _subscribe(db, world)
+    wed = world.days[262]  # 2022-01-05 周三
+    assert wed.weekday() == 2
+    set_now(wed, 20)  # 交易日傍晚：就是今天
+    assert _deposit_day(db, sub, invoke) == wed
+    set_now(wed, 15)  # 15:00 整点算已收盘
+    assert _deposit_day(db, sub, invoke) == wed
+    set_now(wed, 14)  # 交易日下午三点前：上一个交易日
+    assert _deposit_day(db, sub, invoke) == world.days[261]
+    set_now(wed, 9)
+    assert _deposit_day(db, sub, invoke) == world.days[261]
+    saturday = date(2022, 1, 8)
+    assert saturday not in world.days
+    set_now(saturday, 20)  # 周末：周五
+    assert _deposit_day(db, sub, invoke) == world.days[264]
+    set_now(wed, 20)  # trade 用同一规则
+    r = invoke(
+        "admin", "trade", "buy", "--email", EMAIL, "600001", "--price", "10", "--shares", "100"
+    )
+    assert r.exit_code == 0, r.stdout
+    assert _ledger(db, sub)[-1].trade_day == wed
+
+
+def test_day_option_help_states_default_rule(invoke: Invoke) -> None:
+    for args in (("trade", "buy"), ("trade", "sell"), ("cash", "deposit"), ("cash", "withdraw")):
+        text = invoke("admin", *args, "--help").stdout
+        assert "已收盘" in text and "15:00" in text
+
+
+# ---------- 提交之后才打印；失败回滚 ----------
+
+
+def test_failure_after_rows_were_flushed_rolls_everything_back(
+    world: World,
+    db: Session,
+    invoke: Invoke,
+    set_now: SetNow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sub = _subscribe(db, world)
+    set_now(world.days[262])
+    before = db.scalars(select(AuditLog.id)).all()
+    real = repo.add_audit
+
+    def flush_then_fail(
+        s: Session, user_id: int, action: str, target: str, detail: Mapping[str, Any]
+    ) -> AuditLog:
+        real(s, user_id, action, target, detail)  # 流水与审计已 flush 进事务
+        raise ValidationError("模拟的后续失败")
+
+    monkeypatch.setattr(repo, "add_audit", flush_then_fail)
+    r = invoke(
+        "admin", "trade", "buy", "--email", EMAIL, "600001", "--price", "10", "--shares", "100"
+    )
+    assert r.exit_code == 1 and "模拟的后续失败" in r.stdout and "已录入" not in r.stdout
+    assert _ledger(db, sub) == []
+    assert db.scalars(select(AuditLog.id)).all() == before
+
+
+def test_success_message_is_printed_only_after_commit(
+    world: World, invoke: Invoke, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = qt.admin_cli.session_scope
+
+    @contextmanager
+    def failing_commit(engine: Engine) -> Generator[Session]:
+        with real(engine) as s:
+            yield s
+        raise ValidationError("模拟提交失败")
+
+    monkeypatch.setattr(qt.admin_cli, "session_scope", failing_commit)
+    r = invoke("admin", "user", "add", "--email", EMAIL)
+    assert r.exit_code == 1 and "已创建" not in r.stdout and "模拟提交失败" in r.stdout

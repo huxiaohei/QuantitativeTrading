@@ -6,7 +6,6 @@ import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
-from zoneinfo import ZoneInfo
 
 import typer
 import yaml
@@ -33,10 +32,10 @@ from qt.data.update import (
     load_calendar,
     update_all,
 )
-from qt.db.engine import database_url, make_engine
 from qt.jobs.daily import RunContext, due_day, run_day
 from qt.jobs.worker import run_forever
 from qt.mail.send import make_sender
+from qt.runtime import DEFAULT_CONFIG, DEFAULT_DATA_DIR, ConfigOption, DataDirOption, Runtime, now
 
 app = typer.Typer(help="A 股量化回测工具", no_args_is_help=True)
 data_app = typer.Typer(help="数据下载与检查", no_args_is_help=True)
@@ -55,7 +54,7 @@ def make_source(cfg: AppConfig) -> DataSource:
 
 def _now() -> datetime:
     """当前时间（上海时区）；测试里替换。"""
-    return datetime.now(ZoneInfo("Asia/Shanghai"))
+    return now()
 
 
 def _load(config: Path) -> AppConfig | None:
@@ -188,14 +187,15 @@ _STATUS_LABELS = {
 
 
 def make_context(config: Path, data_dir: Path) -> RunContext:
-    """由配置文件与环境变量（DATABASE_URL、ADMIN_EMAIL、邮件相关）创建每日任务的运行环境。"""
-    cfg = load_config(config)
+    """每日任务的运行环境：共用的 Runtime 之上加 ADMIN_EMAIL、数据源与发信器。"""
+    runtime = Runtime(config, data_dir)
+    cfg = runtime.cfg()
     admin = os.environ.get("ADMIN_EMAIL", "").strip().lower()
     if not admin:
         raise RuntimeError("未设置环境变量 ADMIN_EMAIL（系统异常告警的收件人）")
     return RunContext(
-        engine=make_engine(database_url()),
-        store=ParquetStore(data_dir),
+        engine=runtime.engine(),
+        store=runtime.store(),
         source=make_source(cfg),
         cfg=cfg,
         sender=make_sender(),
@@ -227,8 +227,8 @@ def run_day_command(
         bool, typer.Option("--notify/--no-notify", help="是否给使用者发信号邮件")
     ] = True,
     update: Annotated[bool, typer.Option("--update/--no-update", help="是否先增量更新数据")] = True,
-    config: Annotated[Path, typer.Option(help="配置文件路径")] = Path("config/default.yaml"),
-    data_dir: Annotated[Path, typer.Option(help="数据目录", envvar="QT_DATA_DIR")] = Path("data"),
+    config: ConfigOption = DEFAULT_CONFIG,
+    data_dir: DataDirOption = DEFAULT_DATA_DIR,
 ) -> None:
     """手动跑一个交易日的每日任务（可重跑，不会重复记录或重复发信）。"""
     _setup_logging()
@@ -250,8 +250,8 @@ def run_day_command(
 
 @app.command("worker")
 def worker_command(
-    config: Annotated[Path, typer.Option(help="配置文件路径")] = Path("config/default.yaml"),
-    data_dir: Annotated[Path, typer.Option(help="数据目录", envvar="QT_DATA_DIR")] = Path("data"),
+    config: ConfigOption = DEFAULT_CONFIG,
+    data_dir: DataDirOption = DEFAULT_DATA_DIR,
 ) -> None:
     """常驻的定时进程：每个交易日到点运行，电脑休眠醒来后补跑错过的日子。"""
     _setup_logging()
