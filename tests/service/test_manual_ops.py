@@ -22,7 +22,7 @@ from qt.db.models import Rejection as RejectionRow
 from qt.features import build_panel
 from qt.models import Side
 from qt.service.accounts import create_subscription, create_user
-from qt.service.errors import NotFoundError, ValidationError
+from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
 from qt.service.manual_ops import (
     ManualDayResult,
     advance_manual_book,
@@ -294,6 +294,55 @@ def test_invalid_entry_is_rejected_without_writing(db: Session, plain: World) ->
         _holding(db, sub, plain, "600003", 12.0, 1000, S)
     after = _row_counts(db)
     assert after["ledger_entries"] == before["ledger_entries"] + 1
+
+
+def _break_ledger(db: Session, sub: Subscription, w: World, day: int, amount: float) -> None:
+    """绕过校验直接写一笔超过现金的出金：模拟数据源修订分红后现有流水已不一致。"""
+    book = _manual_book(db, sub)
+    db.add(
+        LedgerEntry(
+            book_id=book.id,
+            user_id=sub.user_id,
+            kind="withdraw",
+            trade_day=w.days[day],
+            effective_day=w.days[day],
+            shares=0.0,
+            price=amount,
+            fees=0.0,
+            fees_estimated=False,
+            created_by_user_id=sub.user_id,
+        )
+    )
+    db.commit()
+
+
+def test_deposit_repairs_inconsistent_ledger(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain)
+    _night(db, sub, plain, S)
+    _break_ledger(db, sub, plain, S, CASH + 3_000.0)
+    with pytest.raises(LedgerInconsistentError, match="入金"):
+        _trade(db, sub, plain, Side.BUY, "600003", S, 10.0, 100)
+    with pytest.raises(LedgerInconsistentError):
+        _night(db, sub, plain, S + 1)
+    db.rollback()
+    record_cash(
+        db,
+        sub.user_id,
+        sub.id,
+        plain.market,
+        plain.calendar,
+        plain.cfg,
+        plain.days[S],
+        "deposit",
+        plain.days[S],
+        5_000.0,
+    )
+    db.commit()
+    state = manual_state(
+        db, sub.user_id, sub.id, plain.market, plain.calendar, plain.cfg, plain.days[S + 1]
+    )
+    assert state.cash == pytest.approx(2_000.0)
+    _night(db, sub, plain, S + 1)  # 账本修好之后每晚推进恢复正常
 
 
 def test_unacted_buy_signal_reserves_cash_and_slot(db: Session, plain: World) -> None:

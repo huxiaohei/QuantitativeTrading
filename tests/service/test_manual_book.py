@@ -495,3 +495,40 @@ def test_inconsistent_existing_ledger_is_not_blamed_on_new_entry() -> None:
     broken = [buy(1, DAYS[B + 30], 100, 10.0), sell(2, DAYS[B + 31], 200, 10.0)]
     with pytest.raises(LedgerInconsistentError, match="现有流水"):
         _check(deposit(9, TODAY, 1_000.0), ledger=broken)
+
+
+def _revised_dividend_ledger() -> tuple[FakeMarket, list[Entry]]:
+    """S1 的一笔现金分红（2700 元）已被花掉之后，数据源修订删掉了它：现有流水重放出负现金。"""
+    original = FakeMarket()
+    revised = FakeMarket()
+    for m in (original, revised):
+        m.add_dividend(S2, DAYS[B + 34], 0.2)
+    original.add_dividend(S1, DAYS[B + 31], 0.3)
+    ledger = [
+        buy(1, DAYS[B + 30], 9000, 10.0),
+        sell(2, DAYS[B + 32], 9000, 10.0),
+        buy(3, DAYS[B + 33], 9900, 10.0, symbol=S2),
+        withdraw(4, DAYS[B + 35], 3_000.0),
+    ]
+    run(ledger, original, TODAY)  # 修订前一致
+    with pytest.raises(ValueError, match="超过现金"):
+        run(ledger, revised, TODAY)
+    return revised, ledger
+
+
+def test_deposit_repairs_ledger_broken_by_revised_dividend() -> None:
+    market, ledger = _revised_dividend_ledger()
+    _check(deposit(9, DAYS[B + 35], 5_000.0), market, ledger)  # 不抛：加上它之后能重放
+    state = run([*ledger, deposit(9, DAYS[B + 35], 5_000.0)], market, TODAY)
+    assert state.cash >= 0
+
+
+def test_void_repairs_ledger_broken_by_revised_dividend() -> None:
+    market, ledger = _revised_dividend_ledger()
+    _check(void(9, TODAY, 4), market, ledger)
+
+
+def test_unrelated_entry_on_still_broken_ledger_is_rejected() -> None:
+    market, ledger = _revised_dividend_ledger()
+    with pytest.raises(LedgerInconsistentError, match=r"入金.*作废"):
+        _check(buy(9, TODAY, 100, 10.0), market, ledger)

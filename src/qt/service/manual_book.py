@@ -519,7 +519,9 @@ def validate_entry(
     起始日重放到"今天与全部流水生效日中较晚者"：任何一天出现超卖、现金为负、转入时已持有
     都拒绝。这样同时覆盖"卖出不超过当日持仓""出金不超过当日现金"、回溯录入让之后某笔卖出
     超卖、作废后出现负持仓或负现金，以及与尚未生效的转入冲突。
-    现有流水在不加新流水时就已不一致，抛 LedgerInconsistentError（不归咎于本次录入）。
+    现有流水在不加新流水时就已不一致（如数据源修订了已入账的分红）：加上新流水之后能在同一区间
+    重放通过的（一笔入金或一次作废把账本修好），照常接受；仍不一致抛 LedgerInconsistentError
+    （不归咎于本次录入），消息说明问题与修复办法。
     """
     if new.kind is EntryKind.VOID:
         _check_void(entries, new)
@@ -531,10 +533,18 @@ def validate_entry(
     through = max([today, *(e.apply_day for e in live)])
     try:
         _replay(entries, market, calendar, risk_cfg, costs, start_cash, start_day, through)
-    except _LedgerProblem as p:
-        raise LedgerInconsistentError(
-            f"账本现有流水已不一致（与本次录入无关），请联系管理员：{p.message}"
-        ) from p
+    except _LedgerProblem as old:
+        try:
+            _replay(
+                [*entries, new], market, calendar, risk_cfg, costs, start_cash, start_day, through
+            )
+        except _LedgerProblem as p:
+            raise LedgerInconsistentError(
+                f"账本现有流水已不一致（与本次录入无关）：{old.message}；加上本次录入后仍不一致："
+                f"{p.message}。录入一笔足够的入金（qt admin cash deposit），或作废出错的流水"
+                "（qt admin entry void），把账本修好之后再录入其他流水"
+            ) from p
+        return  # 本次录入把账本修好了
     try:
         _replay([*entries, new], market, calendar, risk_cfg, costs, start_cash, start_day, through)
     except _LedgerProblem as p:

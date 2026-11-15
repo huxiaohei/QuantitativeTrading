@@ -176,7 +176,9 @@ def _replay(
             through,
         )
     except LedgerReplayError as exc:
-        raise LedgerInconsistentError(f"账本现有流水已不一致，请联系管理员：{exc}") from exc
+        raise LedgerInconsistentError(
+            f"账本现有流水已不一致：{exc}；录入一笔足够的入金或作废出错的流水可以修复"
+        ) from exc
 
 
 # ---------- 派生表 ----------
@@ -414,7 +416,11 @@ def _trade_notes(
             and e.trade_day == trade_day
         )
         if bought > 0:
-            pos = _replay(b, ledger.entries, market, calendar, trade_day).positions.get(symbol)
+            try:
+                before = _replay(b, ledger.entries, market, calendar, trade_day)
+            except LedgerInconsistentError:  # 现有流水本身不一致（本次录入正在修复）：不提示
+                return "；".join(notes)
+            pos = before.positions.get(symbol)
             sellable = (0.0 if pos is None else pos.shares) - bought
             if shares > sellable + _EPS:
                 notes.append(
