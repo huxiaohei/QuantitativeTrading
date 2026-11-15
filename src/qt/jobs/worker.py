@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
@@ -14,6 +15,8 @@ from qt.calendar import TradingCalendar
 from qt.data.update import DataIntegrityError, latest_trading_day, load_calendar
 from qt.jobs.daily import (
     DATA_FAILED,
+    DONE,
+    DONE_WITH_ERRORS,
     MARKET_TZ,
     RunContext,
     alert,
@@ -75,11 +78,26 @@ def _calendar(ctx: RunContext) -> TradingCalendar | None:
         return None
 
 
+def run_backup(ctx: RunContext, backup: Callable[[date], Path], now: datetime) -> None:
+    """每日运行完成后备份数据库一次。失败只记日志并告警管理员（每天一次），绝不影响运行结果。"""
+    local_day = now.astimezone(MARKET_TZ).date()
+    try:
+        backup(local_day)
+    except Exception as exc:
+        _log.exception("数据库备份失败")
+        try:
+            alert(ctx, local_day, "数据库备份失败", [describe(exc)])
+            send_outbox(ctx, local_day)
+        except Exception:
+            _log.exception("数据库备份失败的告警没有发出")
+
+
 class _Worker:
     """run_forever 的状态：上次尝试时间、下次重试时间、已确认过期限的交易日。"""
 
-    def __init__(self, ctx: RunContext) -> None:
+    def __init__(self, ctx: RunContext, backup: Callable[[date], Path] | None = None) -> None:
         self.ctx = ctx
+        self.backup = backup
         self.last_attempt: datetime | None = None
         self.retry_at: datetime | None = None
         self.retry_until: datetime | None = None
@@ -97,9 +115,15 @@ class _Worker:
             _log.exception("每日运行出错")
             self._report(now, exc)
             return
+        if any(status in (DONE, DONE_WITH_ERRORS) for _, status in results):
+            self.run_backup(now)
         if not any(status == DATA_FAILED for _, status in results):
             self.retry_at = None
             self.retry_until = None
+
+    def run_backup(self, now: datetime) -> None:
+        if self.backup is not None:
+            run_backup(self.ctx, self.backup, now)
 
     def _retry_until(self, now: datetime) -> datetime | None:
         """重试截止：当晚要跑的交易日的完成期限（次日 run_deadline）。
@@ -179,9 +203,16 @@ class _Worker:
             send_outbox(self.ctx, now.astimezone(MARKET_TZ).date())
 
 
-def run_forever(ctx: RunContext, sleep: Callable[[float], None] = time.sleep) -> None:
-    """常驻运行：启动时补跑一次，之后每 60 秒检查一次。单个节拍出错只记日志，不退出。"""
-    worker = _Worker(ctx)
+def run_forever(
+    ctx: RunContext,
+    sleep: Callable[[float], None] = time.sleep,
+    backup: Callable[[date], Path] | None = None,
+) -> None:
+    """常驻运行：启动时补跑一次，之后每 60 秒检查一次。单个节拍出错只记日志，不退出。
+
+    backup 不为空时，每次补跑出现 done 或 done_with_errors 之后调用一次（参数为当天日期）。
+    """
+    worker = _Worker(ctx, backup)
     _log.info("定时进程启动")
     try:
         worker.attempt(ctx.now())

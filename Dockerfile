@@ -11,6 +11,14 @@ ENV TZ=Asia/Shanghai \
 
 WORKDIR /app
 
+# 数据库备份用 pg_dump：必须不低于服务端 postgres:16 的主版本。
+# 本镜像基于 Debian 13（trixie），自带 postgresql-client 17，无需另加 PGDG 源；
+# 若以后换成更老的基础镜像，需要从 apt.postgresql.org 安装 16 以上的客户端。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && pg_dump --version
+
 # 先装依赖（利用构建缓存），再拷贝源码并安装项目本身
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project

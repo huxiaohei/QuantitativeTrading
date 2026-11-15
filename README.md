@@ -59,6 +59,35 @@ uv run qt backtest sweep \
 
 参数对比只在样本内区间运行，并且不允许把 `backtest.in_sample_start`、`backtest.in_sample_end`、`backtest.out_sample_start` 当作参数来扫。这是有意的：设计要求 2022 年之后的数据只用来检验，不参与调参。挑好参数后，再用 `--period out` 看它在没见过的数据上表现如何。
 
+## 第二阶段：每日运行
+
+在回测之外，项目还能作为多人使用的每日信号服务运行：每个交易日 18:00 起更新数据，按每位使用者订阅的参数计算信号，发邮件，并记录“系统账”（照信号严格执行的模拟账）和“手动账”（你实际做了的买卖）。系统只出信号，不下单，不构成投资建议。
+
+用 Docker Compose 部署（详见 [Mac 部署说明](docs/deploy-mac.md)，迁移见 [迁移到服务器](docs/migrate-to-server.md)，使用者须知见 [每日信号与回测的差异](docs/live-vs-backtest.md)）：
+
+```bash
+cp .env.example .env                  # 填写邮箱、管理员邮箱等；授权码只放在 .env 里
+docker compose up -d                  # db、migrate（升级数据库）、worker（定时进程）
+docker compose ps
+docker compose logs -f worker         # 查看运行日志
+./scripts/backup_db.sh                # 手动备份数据库（worker 每日运行后也会自动备份，保留 14 天）
+```
+
+常用命令（容器内执行，前缀 `docker compose run --rm worker`；也可在本机用 `uv run --env-file .env qt ...`）：
+
+```bash
+qt admin user add --email you@example.com --admin
+qt admin sub create --email you@example.com --cash 150000 [--set strategy.stop_loss=0.10]
+qt admin sub show --email you@example.com
+qt admin book show --email you@example.com            # 手动账；加 --book system 看系统账
+qt admin trade buy 600001 --email you@example.com --price 10.5 --shares 1000
+qt admin signals --email you@example.com --status 已通知
+qt admin runs --last 10                               # 每日运行记录
+qt run-day [--day 2026-11-13]                         # 手动跑一天
+```
+
+Mac 必须在 18:00 起的约 3.5 小时里保持唤醒并接电，防休眠设置见部署说明。
+
 ## 输出放在哪里
 
 | 位置 | 内容 |

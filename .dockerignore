@@ -7,3 +7,5 @@ reports
 **/__pycache__
 .pytest_cache
 .ruff_cache
+backups
+mail_out

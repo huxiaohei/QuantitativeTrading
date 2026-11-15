@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  防休眠模板：只是模板，需要由 Mac 的主人自己安装，项目里的任何命令都不会替你加载它。
+  作用：每个工作日 17:55 运行 caffeinate -i -t 14400，让 Mac 在接下来 4 小时内不进入空闲休眠，
+  覆盖 18:00 开始的每日更新。注意：整晚更新实测约 3.5 小时，4 小时余量不大；
+  如果某晚更新更慢，建议同时在系统设置里把“接电源时防止自动睡眠”打开。
+  合盖仍会休眠；请保持 Mac 接通电源。
+  安装、卸载步骤见 docs/deploy-mac.md。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qt.keepawake</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>-t</string>
+        <string>14400</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>55</integer></dict>
+    </array>
+</dict>
+</plist>

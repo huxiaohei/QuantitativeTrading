@@ -19,20 +19,40 @@ services:
       timeout: 3s
       retries: 20
 
+  # 一次性服务：把数据库升级到最新结构，成功后退出；worker 等它成功才启动
+  migrate:
+    build: .
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      DATABASE_URL: postgresql+psycopg://qt:${POSTGRES_PASSWORD:-qt}@db:5432/qt
+    command: ["alembic", "upgrade", "head"]
+
   worker:
     build: .
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     env_file: .env
     environment:
       TZ: Asia/Shanghai
       DATABASE_URL: postgresql+psycopg://qt:${POSTGRES_PASSWORD:-qt}@db:5432/qt
       QT_DATA_DIR: /app/data
+      QT_BACKUP_DIR: /app/backups
+      MAIL_FILE_DIR: /app/mail_out
     volumes:
       - ${QT_DATA_DIR:-./data}:/app/data
-    # 常驻定时进程：每个交易日 run_time 运行，休眠醒来后补跑
+      # 每日运行完成后，worker 把数据库备份写到这里（宿主机 ./backups，不进入 git）
+      - ./backups:/app/backups
+      # MAIL_BACKEND=file 时，邮件以 .eml 文件写到这里（宿主机 ./mail_out，不进入 git）
+      - ./mail_out:/app/mail_out
+    # 常驻定时进程：每个交易日 run_time 运行，休眠醒来后补跑，运行完成后备份数据库
     command: ["qt", "worker"]
 
 volumes:

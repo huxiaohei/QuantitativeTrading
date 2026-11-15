@@ -32,6 +32,7 @@ from qt.data.update import (
     load_calendar,
     update_all,
 )
+from qt.jobs.backup import backup_from_env
 from qt.jobs.daily import RunContext, due_day, run_day
 from qt.jobs.worker import run_forever
 from qt.mail.send import make_sender
@@ -253,6 +254,6 @@ def worker_command(
     config: ConfigOption = DEFAULT_CONFIG,
     data_dir: DataDirOption = DEFAULT_DATA_DIR,
 ) -> None:
-    """常驻的定时进程：每个交易日到点运行，电脑休眠醒来后补跑错过的日子。"""
+    """常驻的定时进程：每个交易日到点运行，电脑休眠醒来后补跑错过的日子，运行完成后备份数据库。"""
     _setup_logging()
-    run_forever(_context_or_exit(config, data_dir))
+    run_forever(_context_or_exit(config, data_dir), backup=backup_from_env)
