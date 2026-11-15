@@ -5,12 +5,22 @@
 """
 
 from collections.abc import Mapping
+from datetime import date
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from qt.db.models import AuditLog, Book, ParamChange, Subscription, User
+from qt.db.models import (
+    AuditLog,
+    Book,
+    ParamChange,
+    Rejection,
+    Signal,
+    Subscription,
+    SystemState,
+    User,
+)
 from qt.service.errors import NotFoundError
 
 
@@ -51,6 +61,52 @@ def list_books(s: Session, user_id: int, subscription_id: int) -> list[Book]:
     get_subscription(s, user_id, subscription_id)
     stmt = select(Book).where(Book.user_id == user_id, Book.subscription_id == subscription_id)
     return list(s.scalars(stmt.order_by(Book.id)))
+
+
+def get_book_of_kind(s: Session, user_id: int, subscription_id: int, kind: str) -> Book:
+    """订阅下指定种类（system 或 manual）的账本。"""
+    stmt = select(Book).where(
+        Book.user_id == user_id, Book.subscription_id == subscription_id, Book.kind == kind
+    )
+    book = s.scalars(stmt).first()
+    if book is None:
+        raise NotFoundError("账本不存在")
+    return book
+
+
+def get_system_state(s: Session, user_id: int, book_id: int) -> SystemState | None:
+    """系统账保存的引擎状态；还没推进过则返回 None。"""
+    state = s.get(SystemState, book_id)
+    if state is None or state.user_id != user_id:
+        return None
+    return state
+
+
+def find_signal(
+    s: Session, user_id: int, book_id: int, side: str, symbol: str, signal_day: date
+) -> Signal | None:
+    """按自然键（账本、方向、股票、信号日）找信号；没有则返回 None。"""
+    stmt = select(Signal).where(
+        Signal.user_id == user_id,
+        Signal.book_id == book_id,
+        Signal.side == side,
+        Signal.symbol == symbol,
+        Signal.signal_day == signal_day,
+    )
+    return s.scalars(stmt).first()
+
+
+def latest_rejection(
+    s: Session, user_id: int, book_id: int, symbol: str, rule: str
+) -> Rejection | None:
+    """该账本中同一股票、同一规则最近的一条拒绝记录；没有则返回 None。"""
+    stmt = select(Rejection).where(
+        Rejection.user_id == user_id,
+        Rejection.book_id == book_id,
+        Rejection.symbol == symbol,
+        Rejection.rule == rule,
+    )
+    return s.scalars(stmt.order_by(Rejection.last_day.desc(), Rejection.id.desc())).first()
 
 
 def list_param_changes(s: Session, user_id: int, subscription_id: int) -> list[ParamChange]:

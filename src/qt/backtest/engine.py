@@ -12,6 +12,7 @@ step_day 推进一个交易日：跨日状态全部在 EngineState（引擎）�
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
+from enum import StrEnum
 from typing import cast
 
 import pandas as pd
@@ -54,6 +55,14 @@ class EngineState:
     candidates: dict[str, BuyCandidate]  # 买单对应的候选
 
 
+class BuyVoidReason(StrEnum):
+    """买单作废的原因，与 DayLog.expired_buys 逐项对应。"""
+
+    EXPIRED = "expired"  # 自信号日起满有效期仍未成交
+    NO_CASH = "no_cash"  # 现金不足，买不起一手
+    PAUSED = "paused"  # 暂停买入生效当晚被一并取消
+
+
 @dataclass(frozen=True)
 class DayLog:
     """一个交易日产生的全部记录。equity、cash 为当日收盘计值时的总资产与现金。"""
@@ -66,6 +75,7 @@ class DayLog:
     rejections: list[Rejection]
     risk_events: list[RiskEvent]
     expired_buys: list[Order]
+    expired_reasons: list[BuyVoidReason]  # 与 expired_buys 逐项对应的作废原因
     new_sell_orders: list[Order]  # 当晚新下的卖单（次日起撮合）
     new_buy_orders: list[Order]  # 当晚新下的买单（次日起撮合）
 
@@ -79,6 +89,7 @@ class _Day:
     rejections: list[Rejection] = field(default_factory=lambda: [])
     risk_events: list[RiskEvent] = field(default_factory=lambda: [])
     expired_buys: list[Order] = field(default_factory=lambda: [])
+    expired_reasons: list[BuyVoidReason] = field(default_factory=lambda: [])
     new_sell_orders: list[Order] = field(default_factory=lambda: [])
     new_buy_orders: list[Order] = field(default_factory=lambda: [])
 
@@ -253,6 +264,7 @@ def _match_buys(
         if bar is None or bar.open >= _limits(bar)[0] - _EPS:
             if calendar.count_between(order.signal_day, day) >= valid_days:
                 log.expired_buys.append(order)
+                log.expired_reasons.append(BuyVoidReason.EXPIRED)
                 del state.candidates[order.symbol]
             else:
                 remaining.append(order)
@@ -261,6 +273,7 @@ def _match_buys(
         shares = min(order.shares, lots * LOT_SIZE)
         if shares <= 0:
             log.expired_buys.append(order)
+            log.expired_reasons.append(BuyVoidReason.NO_CASH)
             del state.candidates[order.symbol]
             continue
         cost = costs.buy_cost(bar.open, shares)
@@ -314,6 +327,7 @@ def _update_risk(
     log.risk_events.extend(events)
     if any(e.kind is RiskEventKind.PAUSE for e in events):
         log.expired_buys.extend(state.buy_orders)
+        log.expired_reasons.extend(BuyVoidReason.PAUSED for _ in state.buy_orders)
         state.buy_orders = []
         state.candidates.clear()
 
@@ -417,6 +431,7 @@ def step_day(
         rejections=log.rejections,
         risk_events=log.risk_events,
         expired_buys=log.expired_buys,
+        expired_reasons=log.expired_reasons,
         new_sell_orders=log.new_sell_orders,
         new_buy_orders=log.new_buy_orders,
     )
