@@ -321,8 +321,34 @@ def _in_window(sig: Signal, side: Side, trade_day: date) -> bool:
     return True
 
 
+def _rerecord_allowed(
+    sig: Signal, ledger: _Ledger, calendar: TradingCalendar, valid_days: int, trade_day: date
+) -> bool:
+    """已执行的信号能否由更正后重新录入的成交再次关联。
+
+    该信号关联的流水须全部已作废，且成交日不晚于"其中最晚成交日 + 有效天数"，
+    防止很久以后的自主卖出被关联到一个早已作废的旧信号。
+    """
+    voided = {e.voids_entry_id for e in ledger.entries if e.kind is EntryKind.VOID}
+    linked = [r for r in ledger.rows if r.kind != "void" and r.signal_id == sig.id]
+    if not linked or any(r.id not in voided for r in linked):
+        return False
+    latest = max(r.trade_day for r in linked)
+    try:
+        bound = calendar.offset(latest, valid_days)
+    except ValueError:
+        return True  # 日历还没覆盖到上限日，成交日必然在上限之内
+    return trade_day <= bound
+
+
 def _find_link(
-    s: Session, b: _Book, ledger: _Ledger, side: Side, symbol: str, trade_day: date
+    s: Session,
+    b: _Book,
+    ledger: _Ledger,
+    calendar: TradingCalendar,
+    side: Side,
+    symbol: str,
+    trade_day: date,
 ) -> tuple[Signal | None, bool]:
     """录入成交时要关联的信号，返回 (信号, 是否要置为已执行)。
 
@@ -336,12 +362,11 @@ def _find_link(
     open_ = [sig for sig in signals if sig.status in _OPEN]
     if open_:
         return max(open_, key=lambda sig: sig.signal_day), True
-    voided = {e.voids_entry_id for e in ledger.entries if e.kind is EntryKind.VOID}
-    linked_live = {r.signal_id for r in ledger.rows if r.kind != "void" and r.id not in voided}
+    valid_days = b.cfg.service.signal_valid_days
 
     def late(sig: Signal) -> bool:
-        if sig.status == SignalStatus.EXECUTED.value:
-            return sig.id not in linked_live  # 关联的流水都已作废：更正后重新录入
+        if sig.status == SignalStatus.EXECUTED.value:  # 更正后重新录入
+            return _rerecord_allowed(sig, ledger, calendar, valid_days, trade_day)
         if side is Side.SELL:
             return (
                 sig.status == SignalStatus.VOIDED.value
@@ -420,7 +445,8 @@ def record_trade(
     自动关联同一本账里同一股票、方向相同、成交日在窗口内的信号
     （信号日 < 成交日，买入另需成交日 <= 有效期）：
     1. 未结（created/notified）的信号：关联并置为已执行；
-    2. 没有时，不改状态地关联：已执行但关联流水全部作废的（作废后重新录入）、
+    2. 没有时，不改状态地关联：已执行但关联流水全部作废、且成交日不晚于
+       "被作废流水的最晚成交日 + 有效天数"的（作废后重新录入）、
        卖出信号因"条件不再满足"作废且成交日 <= 作废日的、买入信号已放弃的（晚录入）。
     多个符合时取信号日最近的。关联上流水记为 origin=signal，否则为 self；
     卖出原因与买入指标随之带入。
@@ -430,7 +456,7 @@ def record_trade(
     ledger = _load_ledger(s, b, market)
     estimated = fees is None
     fee = _estimate_fees(b, side, price, shares, trade_day) if fees is None else fees
-    signal, execute = _find_link(s, b, ledger, side, symbol, trade_day)
+    signal, execute = _find_link(s, b, ledger, calendar, side, symbol, trade_day)
     exit_reason: ExitReason | None = None
     metrics: dict[str, float] = {}
     if signal is not None and side is Side.SELL and signal.exit_reason is not None:

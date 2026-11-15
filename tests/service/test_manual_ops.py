@@ -418,6 +418,36 @@ def test_void_and_rerecord_keeps_signal_link_and_cooldown(db: Session, plain: Wo
     assert _cooldown_rules(db, book, "600003") == ["cooldown"]
 
 
+def test_voided_sell_does_not_link_stale_signal_after_bound(db: Session, plain: World) -> None:
+    # 作废已关联的止损卖出、不再重新录入；超过 作废流水的成交日 + 有效天数 之后的卖出不关联旧信号
+    sub = _subscribe(db, plain)
+    _holding(db, sub, plain, "600003", 12.0, 1000, S)
+    [sig] = _night(db, sub, plain, S).new_sell_signals
+    linked = _trade(db, sub, plain, Side.SELL, "600003", S + 1, 10.0, 1000)
+    assert linked.signal_id == sig.id
+    void_entry(
+        db,
+        sub.user_id,
+        sub.id,
+        plain.market,
+        plain.calendar,
+        plain.cfg,
+        plain.days[S + 1],
+        linked.id,
+    )
+    db.commit()
+    bound = plain.calendar.offset(plain.days[S + 1], CFG.service.signal_valid_days)
+    assert plain.days[S + 8] > bound
+    e = _trade(db, sub, plain, Side.SELL, "600003", S + 8, 10.0, 1000)
+    assert e.origin == "self" and e.signal_id is None
+    state = manual_state(
+        db, sub.user_id, sub.id, plain.market, plain.calendar, plain.cfg, plain.days[S + 8]
+    )
+    [trade] = state.trades
+    assert trade.exit_reason is None
+    assert state.risk.exits == ()  # 没有进入冷却
+
+
 def test_void_and_rerecord_buy_keeps_signal_link(db: Session, plain: World) -> None:
     sub = _subscribe(db, plain)
     [sig] = [s for s in _night(db, sub, plain, S).new_buy_signals if s.symbol == "600001"]
