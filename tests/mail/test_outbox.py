@@ -1,14 +1,17 @@
 """发件箱：入队去重与逐封发送。"""
 
 import contextlib
+import logging
 from collections.abc import Callable
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from qt.db.models import Outbox
-from qt.mail.outbox import enqueue, send_pending
+from qt.mail.outbox import enqueue, requeue_failed, send_pending
+from qt.service.errors import NotFoundError, ValidationError
 
 
 class FlakySender:
@@ -62,7 +65,7 @@ def test_enqueue_duplicate_does_not_roll_back_earlier_work(db: Session) -> None:
     assert _count(db) == 1
 
 
-def test_send_pending_marks_sent_and_retries_failures_up_to_limit(db: Session) -> None:
+def test_send_pending_marks_sent_and_retries_failures(db: Session) -> None:
     _put(db, "k1")
     db.commit()
     sender = FlakySender(fail_times=2)
@@ -81,19 +84,62 @@ def test_send_pending_marks_sent_and_retries_failures_up_to_limit(db: Session) -
     assert row.sent_at is not None and row.sent_at.tzinfo is not None
 
 
-def test_send_pending_marks_failed_after_max_attempts(db: Session) -> None:
+def test_send_pending_keeps_retrying_for_48_hours_then_marks_failed(db: Session) -> None:
     _put(db, "k1")
     db.commit()
+    created = _row(db, "k1").created_at
     sender = FlakySender(fail_times=100)
-    for _ in range(4):
-        assert send_pending(db, sender) == (0, 1)
+    for hours in range(0, 48, 4):  # 两天里每 4 小时一次，次数远超过去的 5 次上限
+        assert send_pending(db, sender, now=created + timedelta(hours=hours)) == (0, 1)
         assert _row(db, "k1").status == "pending"
-    assert send_pending(db, sender) == (0, 1)
+    assert send_pending(db, sender, now=created + timedelta(hours=48, minutes=1)) == (0, 1)
     row = _row(db, "k1")
-    assert (row.attempts, row.status) == (5, "failed")
+    assert (row.attempts, row.status) == (13, "failed")
     calls = sender.calls
-    assert send_pending(db, sender) == (0, 0)
+    assert send_pending(db, sender, now=created + timedelta(hours=50)) == (0, 0)
     assert sender.calls == calls
+
+
+def test_requeue_failed_mail_resets_age_clock(db: Session) -> None:
+    _put(db, "k1")
+    _put(db, "k2")
+    db.commit()
+    created = _row(db, "k1").created_at
+    late = created + timedelta(hours=49)
+    send_pending(db, FlakySender(fail_times=100), now=late)
+    assert {_row(db, k).status for k in ("k1", "k2")} == {"failed"}
+    [again] = requeue_failed(db, _row(db, "k1").id, late)
+    db.commit()
+    assert (again.status, again.attempts) == ("pending", 1)
+    assert again.created_at == late and again.last_error is not None
+    assert "重新排队" in again.last_error and "连接被拒绝" in again.last_error
+    assert send_pending(db, FlakySender(fail_times=0), now=late + timedelta(hours=1)) == (1, 0)
+    assert _row(db, "k1").status == "sent" and _row(db, "k2").status == "failed"
+    with pytest.raises(ValidationError, match="发送失败"):
+        requeue_failed(db, _row(db, "k1").id, late)  # 已发出的不能重新排队
+    with pytest.raises(NotFoundError):
+        requeue_failed(db, 999_999, late)
+    assert [r.dedupe_key for r in requeue_failed(db, None, late)] == ["k2"]
+
+
+def test_failed_admin_alert_is_logged_at_error_with_title(
+    db: Session, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SMTP_PASSWORD", "s3cr3t-pw")
+    assert enqueue(
+        db, None, "admin@x.com", "admin", "admin:1", "【系统异常】数据更新失败", "h", "t"
+    )
+    _put(db, "k1", subject="给使用者的信号")
+    db.commit()
+
+    def error() -> Exception:
+        return RuntimeError("login failed s3cr3t-pw")
+
+    with caplog.at_level(logging.ERROR, logger="qt.mail.outbox"):
+        send_pending(db, FlakySender(fail_times=100, error=error))
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "【系统异常】数据更新失败" in errors[0]
+    assert "s3cr3t-pw" not in errors[0]
 
 
 def test_send_pending_does_not_resend_sent_mail(db: Session) -> None:

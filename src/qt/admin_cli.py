@@ -27,6 +27,7 @@ from qt.db.engine import session_scope
 from qt.db.models import Book, LedgerEntry, Signal, Subscription, User
 from qt.features import build_panel
 from qt.jobs.daily import due_day
+from qt.mail.outbox import requeue_failed
 from qt.models import Position, Side
 from qt.runtime import (
     DEFAULT_CONFIG,
@@ -51,6 +52,7 @@ holding_app = typer.Typer(help="录入已有持仓", no_args_is_help=True)
 cash_app = typer.Typer(help="入金与出金", no_args_is_help=True)
 entry_app = typer.Typer(help="流水更正", no_args_is_help=True)
 book_app = typer.Typer(help="账本", no_args_is_help=True)
+outbox_app = typer.Typer(help="发件箱", no_args_is_help=True)
 admin_app.add_typer(user_app, name="user")
 admin_app.add_typer(sub_app, name="sub")
 admin_app.add_typer(trade_app, name="trade")
@@ -58,6 +60,7 @@ admin_app.add_typer(holding_app, name="holding")
 admin_app.add_typer(cash_app, name="cash")
 admin_app.add_typer(entry_app, name="entry")
 admin_app.add_typer(book_app, name="book")
+admin_app.add_typer(outbox_app, name="outbox")
 
 _MARKET_TZ = ZoneInfo("Asia/Shanghai")
 _MARKET_CLOSE = time(15, 0)
@@ -132,6 +135,8 @@ _EXIT_LABELS = {
     "manual": "自主卖出",
 }
 _FOLLOWUP_LABELS = {"exit": "离场后", "abandoned": "放弃买入后", "rejected": "被规则否决后"}
+_OUTBOX_STATUS_LABELS = {"pending": "待发", "sent": "已发", "failed": "发送失败"}
+_OUTBOX_ERROR_CHARS = 80  # outbox list 里错误信息最多显示的字数
 _RUN_STATUS_LABELS = {
     "running": "运行中（或中途中断）",
     "done": "完成",
@@ -1067,6 +1072,11 @@ def runs(
 ) -> None:
     """每日运行记录与失败原因。"""
     with _unit(ctx) as (_cli, s):
+        counts = admin_repo.count_outbox_by_status(s)
+        _emit(
+            f"发件箱：待发 {counts.get('pending', 0)} 封，发送失败 {counts.get('failed', 0)} 封"
+            "（qt admin outbox list 查看）"
+        )
         found = admin_repo.list_recent_runs(s, last)
         if not found:
             _emit("还没有运行记录")
@@ -1084,3 +1094,68 @@ def runs(
             )
             for line in _reason_lines(run.detail):
                 _emit(f"    {line}")
+
+
+# ---------- 发件箱 ----------
+
+
+def _outbox_status(text: str) -> str:
+    """--status 接受英文取值或中文名。"""
+    for value, label in _OUTBOX_STATUS_LABELS.items():
+        if text in (value, label):
+            return value
+    raise ValidationError(
+        "状态只能是：" + "、".join(f"{v}（{label}）" for v, label in _OUTBOX_STATUS_LABELS.items())
+    )
+
+
+@outbox_app.command("list")
+def outbox_list(
+    ctx: typer.Context,
+    status: Annotated[
+        str | None, typer.Option("--status", help="只看某个状态：pending、sent、failed")
+    ] = None,
+    last: Annotated[int, typer.Option("--last", help="显示最近多少封")] = 50,
+) -> None:
+    """列出发件箱里最近的邮件：状态、尝试次数与最近一次错误。"""
+    with _unit(ctx) as (_cli, s):
+        wanted = None if status is None else _outbox_status(status)
+        rows = admin_repo.list_outbox(s, wanted, last)
+        if not rows:
+            _emit("发件箱里没有符合条件的邮件")
+            return
+        _table(
+            ["编号", "入队时间", "状态", "种类", "收件人", "尝试", "主题", "最近错误"],
+            [
+                [
+                    str(row.id),
+                    row.created_at.astimezone(_MARKET_TZ).strftime("%Y-%m-%d %H:%M"),
+                    _OUTBOX_STATUS_LABELS.get(row.status, row.status),
+                    row.kind,
+                    row.to_addr,
+                    str(row.attempts),
+                    row.subject,
+                    (row.last_error or "")[:_OUTBOX_ERROR_CHARS],
+                ]
+                for row in rows
+            ],
+            right=[0, 5],
+        )
+
+
+@outbox_app.command("retry")
+def outbox_retry(
+    ctx: typer.Context,
+    outbox_id: Annotated[
+        int | None, typer.Argument(metavar="ID", help="要重新排队的邮件编号")
+    ] = None,
+    all_failed: Annotated[
+        bool, typer.Option("--all-failed", help="把全部发送失败的邮件重新排队")
+    ] = False,
+) -> None:
+    """把发送失败的邮件重新排队（重新开始 48 小时的重试期），由 worker 下一次补发。"""
+    with _unit(ctx) as (_cli, s):
+        if (outbox_id is None) == (not all_failed):
+            raise ValidationError("请指定一个邮件编号，或用 --all-failed 处理全部发送失败的邮件")
+        rows = requeue_failed(s, None if all_failed else outbox_id, now())
+        _emit(f"已重新排队 {len(rows)} 封邮件，worker 会在下一次补发时发送")

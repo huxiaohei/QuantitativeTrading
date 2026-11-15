@@ -1,7 +1,7 @@
 """每日任务：数据、检查、面板、逐个使用者推进两本账与写邮件、发送；重跑、补跑与出错隔离。"""
 
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -18,6 +18,7 @@ from qt.db.models import Base, BookDay, Outbox, Signal, Subscription, Trade, Use
 from qt.features import FeaturePanel, build_panel
 from qt.jobs import daily
 from qt.jobs.daily import catch_up, pending_days, run_day
+from qt.mail.outbox import MAX_PENDING_AGE
 from qt.mail.render import HoldingView, WeeklyView, render_weekly
 from qt.mail.send import Sender
 from qt.service.accounts import close_subscription, pause_subscription, subscription_config
@@ -261,7 +262,12 @@ def test_killed_between_users_and_mail_then_rerun_sends_each_mail_once(
     subscribe(db, "a@example.com", day)
     subscribe(db, "b@example.com", day)
 
-    def killed(s: Session, sender: Sender, max_attempts: int = 5) -> tuple[int, int]:
+    def killed(
+        s: Session,
+        sender: Sender,
+        now: datetime | None = None,
+        max_age: timedelta = MAX_PENDING_AGE,
+    ) -> tuple[int, int]:
         raise _Killed
 
     monkeypatch.setattr(daily, "send_pending", killed)
@@ -297,14 +303,21 @@ def test_dead_mail_alerts_admin_once_per_day(env: Env, db: Session) -> None:
     day = env.days[DAY]
     subscribe(db, "a@example.com", day)
     env.sender.fail_to = {"a@example.com"}
-    for _ in range(5):
+    for _ in range(6):  # 48 小时内反复失败只记次数，不放弃
         assert run_day(env.ctx, day, True, False) == "done"
+    db.rollback()
+    [row] = db.scalars(select(Outbox).where(Outbox.to_addr == "a@example.com"))
+    assert (row.status, row.attempts) == ("pending", 6)
+    assert not [m for m in env.sender.sent if m.to_addr == ADMIN]
+    row.created_at = env.clock.now - timedelta(hours=48, minutes=1)  # 入队已满 48 小时
+    db.commit()
+    assert run_day(env.ctx, day, True, False) == "done"
     db.rollback()
     [dead] = db.scalars(select(Outbox).where(Outbox.to_addr == "a@example.com"))
     assert dead.status == "failed"
     alerts = [m for m in env.sender.sent if m.to_addr == ADMIN]
     assert [m.subject for m in alerts] == ["【系统异常】邮件发送失败"]
-    assert "a@example.com" in alerts[0].text
+    assert "a@example.com" in alerts[0].text and "outbox retry" in alerts[0].text
     assert run_day(env.ctx, day, True, False) == "done"
     assert len([m for m in env.sender.sent if m.to_addr == ADMIN]) == 1
 

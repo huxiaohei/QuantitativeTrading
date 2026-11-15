@@ -152,13 +152,13 @@ def _failed_ids(s: Session) -> set[int]:
 
 
 def send_outbox(ctx: RunContext, day: date) -> tuple[int, int]:
-    """发送发件箱里的待发邮件；本次有邮件变为发送失败（不再重试）时告警管理员。
+    """发送发件箱里的待发邮件；本次有邮件变为发送失败（满 48 小时仍未发出）时告警管理员。
 
     用独立会话：send_pending 逐封提交，不能夹带别的未提交工作。返回（成功数，失败次数）。
     """
     with _session(ctx) as s:
         before = _failed_ids(s)
-        sent, failed = send_pending(s, ctx.sender)
+        sent, failed = send_pending(s, ctx.sender, ctx.now())
         dead = [
             row
             for row in s.scalars(
@@ -169,11 +169,12 @@ def send_outbox(ctx: RunContext, day: date) -> tuple[int, int]:
         if dead:
             lines = [
                 f"邮件 #{row.id}（{row.kind}，收件人 {row.to_addr}）"
-                f"已尝试 {row.attempts} 次仍失败：{row.last_error or ''}"
+                f"入队 48 小时内尝试 {row.attempts} 次仍未发出，已不再重试：{row.last_error or ''}"
                 for row in dead
             ]
+            lines.append("修好发信之后可用 qt admin outbox retry --all-failed 重新排队。")
             if alert_admin(s, ctx.admin_email, day, "邮件发送失败", lines):
-                more_sent, more_failed = send_pending(s, ctx.sender)
+                more_sent, more_failed = send_pending(s, ctx.sender, ctx.now())
                 sent, failed = sent + more_sent, failed + more_failed
         s.commit()
     return sent, failed

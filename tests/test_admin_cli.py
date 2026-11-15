@@ -28,6 +28,7 @@ from qt.db.models import (
     DailyRun,
     Followup,
     LedgerEntry,
+    Outbox,
     Signal,
     Subscription,
     User,
@@ -601,6 +602,64 @@ def test_runs_command_lists_failure_reason(world: World, db: Session, invoke: In
     assert r.stdout.index("2026-11-16") < r.stdout.index("2026-11-13")  # 最近的在前
     last_one = invoke("admin", "runs", "--last", "1")
     assert "2026-11-16" in last_one.stdout and "2026-11-13" not in last_one.stdout
+
+
+def _mail(db: Session, key: str, status: str, error: str | None = None) -> Outbox:
+    row = Outbox(
+        to_addr="u@x.com",
+        kind="buy",
+        dedupe_key=key,
+        subject=f"主题 {key}",
+        body_html="h",
+        body_text="t",
+        status=status,
+        attempts=3 if status != "pending" else 0,
+        last_error=error,
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+def test_outbox_list_and_retry(world: World, db: Session, invoke: Invoke, set_now: SetNow) -> None:
+    set_now(world.days[S], 20)
+    _mail(db, "k1", "sent")
+    dead1 = _mail(db, "k2", "failed", "ConnectionError: 连接被拒绝")
+    dead2 = _mail(db, "k3", "failed", "ConnectionError: 超时")
+    _mail(db, "k4", "pending")
+    listed = invoke("admin", "outbox", "list")
+    assert listed.exit_code == 0, listed.stdout
+    assert all(f"主题 {k}" in listed.stdout for k in ("k1", "k2", "k3", "k4"))
+    failed = invoke("admin", "outbox", "list", "--status", "failed")
+    assert "主题 k2" in failed.stdout and "主题 k1" not in failed.stdout
+    assert "连接被拒绝" in failed.stdout
+    bad = invoke("admin", "outbox", "list", "--status", "lost")
+    assert bad.exit_code == 1
+    r = invoke("admin", "outbox", "retry", str(dead1.id))
+    assert r.exit_code == 0 and "重新排队" in r.stdout
+    db.rollback()
+    db.refresh(dead1)
+    assert dead1.status == "pending"
+    assert dead1.created_at == datetime.combine(world.days[S], time(20, 0), tzinfo=SH)
+    again = invoke("admin", "outbox", "retry", str(dead1.id))
+    assert again.exit_code == 1 and "只有发送失败" in again.stdout
+    neither = invoke("admin", "outbox", "retry")
+    assert neither.exit_code == 1
+    everything = invoke("admin", "outbox", "retry", "--all-failed")
+    assert everything.exit_code == 0 and "1 封" in everything.stdout
+    db.rollback()
+    db.refresh(dead2)
+    assert dead2.status == "pending"
+
+
+def test_runs_command_shows_outbox_counts(world: World, db: Session, invoke: Invoke) -> None:
+    _mail(db, "k1", "pending")
+    _mail(db, "k2", "pending")
+    _mail(db, "k3", "failed", "boom")
+    _mail(db, "k4", "sent")
+    r = invoke("admin", "runs")
+    assert r.exit_code == 0, r.stdout
+    assert "发件箱：待发 2 封，发送失败 1 封" in r.stdout
 
 
 # ---------- 错误处理 ----------

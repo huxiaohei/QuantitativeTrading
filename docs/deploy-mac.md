@@ -124,7 +124,9 @@ ls mail_out/                                         # MAIL_BACKEND=file 时邮�
 | `qt admin book show --email E [--book manual\|system]` | 查看账本、持仓和最近流水 |
 | `qt admin signals --email E [--book ...] [--status S] [--days 30]` | 查看信号 |
 | `qt admin journal --email E [--book ...]` | 查看交易日志与收益跟踪 |
-| `qt admin runs [--last 10]` | 查看每日运行记录 |
+| `qt admin runs [--last 10]` | 查看每日运行记录（第一行是发件箱里待发、发送失败的邮件数） |
+| `qt admin outbox list [--status pending\|sent\|failed] [--last 50]` | 查看发件箱：状态、尝试次数、最近一次错误 |
+| `qt admin outbox retry ID` / `outbox retry --all-failed` | 把发送失败的邮件重新排队（重新开始 48 小时重试期） |
 | `qt run-day [--day YYYY-MM-DD] [--notify\|--no-notify] [--update\|--no-update]` | 手动跑某一天（缺省为当晚该跑的那天） |
 
 加 `--help` 可看每条命令的全部选项。
@@ -139,6 +141,10 @@ docker compose logs --since 24h worker                     # 最近 24 小时
 
 运行状态含义：`done` 正常完成；`done_with_errors` 完成但个别使用者处理出错（管理员邮箱会收到告警）；
 `data_failed` 数据更新或检查失败，当晚没有出信号，worker 每 30 分钟重试，次日 08:30 仍未完成会发超时告警。
+
+邮件发送失败（如 SMTP 暂时不可用）时，邮件留在发件箱里，worker 每 30 分钟补发一次；入队满 48 小时仍未发出
+才标记为发送失败并告警管理员。修好发信之后用 `qt admin outbox retry --all-failed` 重新排队。
+管理员告警邮件本身发不出时，worker 日志里会有一条 ERROR（带告警标题）。
 
 ## 6. 数据库备份
 

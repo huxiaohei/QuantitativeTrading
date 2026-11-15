@@ -2,10 +2,10 @@
 
 from datetime import date
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from qt.db.models import DailyRun, Followup, Subscription, User
+from qt.db.models import DailyRun, Followup, Outbox, Subscription, User
 
 
 def find_user_by_email(s: Session, email: str) -> User | None:
@@ -42,3 +42,17 @@ def list_recent_runs(s: Session, limit: int) -> list[DailyRun]:
     """最近 limit 个交易日的每日运行记录，日期从新到旧。"""
     stmt = select(DailyRun).order_by(DailyRun.trade_day.desc()).limit(limit)
     return list(s.scalars(stmt))
+
+
+def list_outbox(s: Session, status: str | None, limit: int) -> list[Outbox]:
+    """发件箱里最近的 limit 封邮件（全部使用者，可按状态过滤），编号从新到旧。"""
+    stmt = select(Outbox)
+    if status is not None:
+        stmt = stmt.where(Outbox.status == status)
+    return list(s.scalars(stmt.order_by(Outbox.id.desc()).limit(limit)))
+
+
+def count_outbox_by_status(s: Session) -> dict[str, int]:
+    """发件箱里各状态（pending、sent、failed）的邮件数；没有的状态不在其中。"""
+    stmt = select(Outbox.status, func.count()).group_by(Outbox.status)
+    return {str(row[0]): int(row[1]) for row in s.execute(stmt)}
