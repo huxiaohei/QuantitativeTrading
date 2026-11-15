@@ -393,14 +393,45 @@ def user_weekly(
 # ---------- 订阅 ----------
 
 
+def _start_day(
+    text: str | None, calendar: TradingCalendar, default: date, backdate_limit_days: int
+) -> date:
+    """订阅起始日：缺省取 default；自选的必须是交易日，不晚于 default，不早于回溯上限。"""
+    if text is None:
+        return default
+    day = _parse_day(text)
+    if not calendar.is_trading_day(day):
+        raise ValidationError(f"起始日 {day} 不是交易日")
+    if day > default:
+        raise ValidationError(f"起始日不能晚于下一个交易日 {default}")
+    try:
+        earliest = calendar.offset(_today(), -backdate_limit_days)
+    except ValueError:
+        earliest = calendar.first_day
+    if day < earliest:
+        raise ValidationError(
+            f"起始日 {day} 太早：最早只能选 {earliest}（{backdate_limit_days} 个交易日之前）"
+        )
+    return day
+
+
 @sub_app.command("create")
 def sub_create(
     ctx: typer.Context,
     email: Email,
     cash: Annotated[float, typer.Option("--cash", help="本金（元）")],
     set_: SetOption = None,
+    start: Annotated[
+        str | None,
+        typer.Option(
+            "--start",
+            help="起始日 YYYY-MM-DD；缺省为今天之后第一个交易日。可以选过去的交易日"
+            "（最早为 service.backdate_limit_days 个交易日之前），运行时逐日补算，"
+            "只给最新一天发邮件",
+        ),
+    ] = None,
 ) -> None:
-    """创建订阅（同时建立系统账与手动账），起始日为下一个交易日。"""
+    """创建订阅（同时建立系统账与手动账），起始日缺省为下一个交易日。"""
     with _unit(ctx) as (cli, s):
         overrides = _parse_overrides(set_)
         user = _user(s, email)
@@ -408,11 +439,10 @@ def sub_create(
         upcoming = calendar.between(_today() + timedelta(days=1), _FAR_FUTURE)
         if not upcoming:
             raise ValidationError("交易日历还没有覆盖到下一个交易日，请先运行 qt data update")
-        sub = accounts.create_subscription(s, user.id, cli.cfg(), cash, upcoming[0], overrides)
-        _emit(
-            f"已为 {user.email} 创建订阅 {sub.id}：本金 {money(cash)}，起始日 {upcoming[0]}"
-            "（下一个交易日）"
-        )
+        first = _start_day(start, calendar, upcoming[0], cli.cfg().service.backdate_limit_days)
+        sub = accounts.create_subscription(s, user.id, cli.cfg(), cash, first, overrides)
+        label = "下一个交易日" if first == upcoming[0] else "自选起始日，运行时会补算"
+        _emit(f"已为 {user.email} 创建订阅 {sub.id}：本金 {money(cash)}，起始日 {first}（{label}）")
         if overrides:
             _emit("参数覆盖：" + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items()))
 

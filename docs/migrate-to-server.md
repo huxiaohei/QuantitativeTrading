@@ -42,7 +42,8 @@ docker compose up -d db
 gunzip -c backups/qt-YYYYMMDD.sql.gz | docker compose exec -T db psql -U qt -d qt -v ON_ERROR_STOP=1
 ```
 
-备份是纯 SQL 文本（`pg_dump` 生成，已去掉属主与权限信息），可以导入一个全新的空库。
+备份是纯 SQL 文本（镜像里的 pg_dump 16 生成，已去掉属主与权限信息，与服务端同一主版本），可以导入一个全新的空库。
+这条恢复命令已在 postgres:16 上用同样的写法实测过（备份、导入空库、各表行数一致）。
 如果库里已经有表（例如已经执行过 `migrate`），先清空再导入：
 
 ```bash

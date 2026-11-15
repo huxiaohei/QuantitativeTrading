@@ -63,7 +63,19 @@ docker compose logs migrate
 
 `worker` 配置了 `restart: unless-stopped`：Docker 启动后它会自动起来，进程异常退出也会自动重启。它只在 `migrate` 成功之后才会启动。
 
-首次完整下载行情数据需要数小时，见仓库根目录 `README.md` 的 `qt data update`；`data/` 目录已有数据则无需重做。
+### 先下载行情数据，再让 worker 干活
+
+`worker` 一启动就会尝试补跑，而每日运行需要 `data/` 里已经有行情数据。所以**第一次**要按这个顺序：
+
+```bash
+docker compose up -d db migrate                  # 只起数据库并升级结构
+docker compose run --rm --no-deps worker qt data update   # 首次完整下载，约 3 到 6 小时，可中断后重跑续传
+docker compose up -d                             # 数据备好后再起 worker
+```
+
+如果 `data/` 里已经有数据（例如以前用 `uv run qt data update` 下载过），跳过中间那条即可。
+若直接 `docker compose up -d`，worker 在没有订阅时什么也不做；创建订阅之后它第一次运行才会去更新数据，
+首次会和上面一样要数小时，期间当晚没有信号。
 
 ## 4. 创建第一个使用者和订阅
 
@@ -74,20 +86,35 @@ docker compose logs migrate
 docker compose run --rm worker qt admin user add --email you@example.com --admin
 
 # 创建订阅：起始资金 150000，使用默认参数；也可以用 --set 改参数，如 --set strategy.stop_loss=0.10
+# （起始日缺省为下一个交易日；想立刻试运行见下文 --start）
 docker compose run --rm worker qt admin sub create --email you@example.com --cash 150000
 
 # 查看订阅与参数
 docker compose run --rm worker qt admin sub show --email you@example.com
 ```
 
-订阅的起始日是创建当天之后的第一个交易日，从那天晚上的运行开始出信号。每人同时只有一个生效的订阅。
+**第一批信号什么时候来：** 订阅缺省的起始日是创建当天之后的第一个交易日，所以今天创建的订阅，要等那个交易日 18:00 之后的运行才会出信号和邮件；
+现在立刻 `qt run-day` 不会有任何信号、也没有邮件（订阅还没开始）。每人同时只有一个生效的订阅。
+
+**想马上把整条链路走通（试运行）：** 创建订阅时用 `--start` 指定起始日，选**最近一个已收盘的交易日**
+（交易日 15:00 收盘后是当天，否则是上一个交易日）：
+
+```bash
+docker compose run --rm worker qt admin sub create --email you@example.com --cash 150000 --start 2026-11-13
+docker compose run --rm worker qt run-day            # 跑那一天，应产生信号并写出邮件
+docker compose run --rm worker qt run-day            # 再跑一次，不应有新增记录和邮件
+ls mail_out/                                         # MAIL_BACKEND=file 时邮件是这里的 .eml 文件
+```
+
+`--start` 必须是交易日、不晚于缺省起始日，最早只能是 10 个交易日之前（`service.backdate_limit_days`）；
+起始日在过去时，每日运行会按交易日逐日补算，只给最新一天发信号邮件，更早日子的信号标为“未通知”。
 
 ### 常用管理命令
 
 | 命令 | 用途 |
 | --- | --- |
 | `qt admin user add --email E [--admin]` / `user list` / `user weekly --email E --on\|--off` | 使用者管理、周报开关 |
-| `qt admin sub create --email E --cash N [--set 路径=值 ...]` | 创建订阅 |
+| `qt admin sub create --email E --cash N [--start 日期] [--set 路径=值 ...]` | 创建订阅；`--start` 可选过去的交易日 |
 | `qt admin sub set --email E --set 路径=值 ...` | 修改参数（从下一次运行起生效） |
 | `qt admin sub show / pause / resume / close --email E` | 查看、暂停、恢复、关闭订阅 |
 | `qt admin trade buy\|sell 代码 --email E --price P --shares N [--day D] [--fees F]` | 录入手动账的成交；日期缺省为最近已收盘的交易日 |

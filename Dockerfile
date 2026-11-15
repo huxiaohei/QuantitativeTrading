@@ -11,15 +11,25 @@ ENV TZ=Asia/Shanghai \
 
 WORKDIR /app
 
-# 数据库备份用 pg_dump：必须不低于服务端 postgres:16 的主版本。
-# 本镜像基于 Debian 13（trixie），自带 postgresql-client 17，无需另加 PGDG 源；
-# 若以后换成更老的基础镜像，需要从 apt.postgresql.org 安装 16 以上的客户端。
+# 数据库备份用 pg_dump：客户端主版本必须与服务端 postgres:16 一致，否则备份里会带有
+# 16 不认识的语句（如 SET transaction_timeout、\restrict），按文档恢复会失败。
+# Debian 13 自带的是 17，所以从 PGDG 官方 apt 源安装 postgresql-client-16；
+# 构建时检查主版本，不是 16 就让构建失败。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-16 \
+    && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/* \
-    && pg_dump --version
+    && pg_dump --version \
+    && pg_dump --version | grep -q ' 16\.'
 
-# 先装依赖（利用构建缓存），再拷贝源码并安装项目本身
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project
 

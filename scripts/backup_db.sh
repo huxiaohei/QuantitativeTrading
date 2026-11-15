@@ -25,9 +25,10 @@ echo "已备份到 $FINAL"
 
 # 清理超过保留天数的备份（按文件名里的日期判断，不依赖文件修改时间）
 CUTOFF="$(date -v-"${KEEP_DAYS}"d +%Y%m%d 2>/dev/null || date -d "-${KEEP_DAYS} days" +%Y%m%d)"
-for f in "$DIR"/qt-????????.sql.gz; do
+for f in "$DIR"/qt-*.sql.gz; do
     [ -e "$f" ] || continue
     name="$(basename "$f")"
+    [[ "$name" =~ ^qt-[0-9]{8}\.sql\.gz$ ]] || continue
     day="${name#qt-}"
     day="${day%.sql.gz}"
     if [ "$day" -lt "$CUTOFF" ]; then

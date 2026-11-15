@@ -77,7 +77,8 @@ docker compose logs -f worker         # 查看运行日志
 
 ```bash
 qt admin user add --email you@example.com --admin
-qt admin sub create --email you@example.com --cash 150000 [--set strategy.stop_loss=0.10]
+qt admin sub create --email you@example.com --cash 150000 [--start 2026-11-13] [--set strategy.stop_loss=0.10]
+                                                      # --start：起始日（缺省下一个交易日；选最近已收盘的交易日可立即试运行）
 qt admin sub show --email you@example.com
 qt admin book show --email you@example.com            # 手动账；加 --book system 看系统账
 qt admin trade buy 600001 --email you@example.com --price 10.5 --shares 1000

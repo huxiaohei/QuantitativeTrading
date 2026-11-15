@@ -160,9 +160,10 @@ def test_two_users_thirty_days_end_to_end(env: Env, db: Session) -> None:
         assert foreign  # 两人的股数确有区别，检查才有意义
         seen: set[str] = set()
         for mail in by_addr[addr]:
-            seen |= _numbers(mail.body_text)
-            assert other not in mail.body_text + mail.body_html
-            assert all(c not in mail.body_text + mail.body_html for c in own_cash[other])
+            everything = "\n".join((mail.subject, mail.body_text, mail.body_html))
+            seen |= _numbers(mail.subject + "\n" + mail.body_text)
+            assert other not in everything
+            assert all(c not in everything for c in own_cash[other])
         assert not foreign & seen
         assert own[addr] & seen  # 自己的股数确实写在邮件里
 

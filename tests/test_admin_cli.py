@@ -7,7 +7,7 @@
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -34,6 +34,7 @@ from qt.db.models import (
 )
 from qt.features import build_panel
 from qt.runtime import Runtime
+from qt.service import accounts
 from qt.service.accounts import create_subscription, create_user
 from qt.service.errors import ValidationError
 from qt.service.manual_ops import advance_manual_book
@@ -839,3 +840,64 @@ def test_success_message_is_printed_only_after_commit(
     monkeypatch.setattr(qt.admin_cli, "session_scope", failing_commit)
     r = invoke("admin", "user", "add", "--email", EMAIL)
     assert r.exit_code == 1 and "已创建" not in r.stdout and "模拟提交失败" in r.stdout
+
+
+def _create_with_start(invoke: Invoke, *extra: str) -> Result:
+    invoke("admin", "user", "add", "--email", EMAIL)
+    return invoke("admin", "sub", "create", "--email", EMAIL, "--cash", "1000", *extra)
+
+
+def _start_of(db: Session) -> date:
+    db.rollback()
+    user = db.scalars(select(User).where(User.email == EMAIL)).one()
+    sub = repo.get_open_subscription(db, user.id)
+    assert sub is not None
+    return sub.start_day
+
+
+def test_sub_create_start_defaults_to_next_trading_day(
+    world: World, db: Session, invoke: Invoke, set_now: SetNow
+) -> None:
+    set_now(world.days[262])
+    assert _create_with_start(invoke).exit_code == 0
+    assert _start_of(db) == world.days[263]
+
+
+def test_sub_create_accepts_a_past_trading_day_within_the_limit(
+    world: World, db: Session, invoke: Invoke, set_now: SetNow
+) -> None:
+    set_now(world.days[262])
+    limit = CFG.service.backdate_limit_days
+    for earliest in (world.days[262 - limit], world.days[263]):  # 回溯上限当天、以及默认的次日
+        r = _create_with_start(invoke, "--start", str(earliest))
+        assert r.exit_code == 0 and str(earliest) in r.stdout
+        assert _start_of(db) == earliest
+        user = db.scalars(select(User).where(User.email == EMAIL)).one()
+        sub = repo.get_open_subscription(db, user.id)
+        assert sub is not None
+        accounts.close_subscription(db, user.id, sub.id)
+        db.commit()
+
+
+def test_sub_create_rejects_bad_start_days(
+    world: World, db: Session, invoke: Invoke, set_now: SetNow
+) -> None:
+    set_now(world.days[262])
+    limit = CFG.service.backdate_limit_days
+    saturday = world.days[262] + timedelta(days=3)
+    cases = {
+        str(saturday): "不是交易日",
+        str(world.days[262 - limit - 1]): "太早",
+        str(world.days[264]): "不能晚于",
+        "2022-13-40": "日期",
+    }
+    first = True
+    for value, message in cases.items():
+        if first:
+            invoke("admin", "user", "add", "--email", EMAIL)
+            first = False
+        r = invoke("admin", "sub", "create", "--email", EMAIL, "--cash", "1000", "--start", value)
+        assert r.exit_code == 1 and message in r.stdout, (value, r.stdout)
+        assert "Traceback" not in r.stdout
+    db.rollback()
+    assert db.scalars(select(Subscription)).all() == []
