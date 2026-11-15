@@ -99,6 +99,10 @@ class RiskManager:
         self._pause_days = state.pause_days
         self._exits = dict(state.exits)
 
+    def set_config(self, cfg: RiskConfig) -> None:
+        """换用另一份配置（参数修改从生效日起作用）；已有的状态不变，正在进行的暂停保持原定天数。"""
+        self._cfg = cfg
+
     def buying_allowed(self) -> bool:
         """是否允许买入（暂停期间为假）。"""
         return not self._paused

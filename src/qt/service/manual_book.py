@@ -8,7 +8,7 @@
    同一天的流水按 entries 中的先后顺序应用（调用方按 id 升序传入）。被作废的流水与作废记录本身跳过。
 3. 收盘计值：总资产 = 现金 + Σ 股数 * 收盘价；持有天数加一、更新最高收益（当日转入的不重复加）。
 4. 份额净值：当日的入金、出金、转入（按当日收盘市值）不改变当日份额净值，只改变份额。
-5. 风控：用份额净值驱动回撤预警与暂停。
+5. 风控：用份额净值驱动回撤预警与暂停；风控参数取当日适用的那一份（参数修改从生效日起作用）。
 """
 
 from collections.abc import Mapping, Sequence
@@ -138,6 +138,21 @@ class ManualState:
     risk_events: list[RiskEvent]
     risk: RiskState
     cash_history: list[float]  # 每日日终现金
+
+
+# 风控参数时间表：(生效日, 配置) 按修改先后排列，第一项的生效日为 date.min
+RiskSchedule = Sequence[tuple[date, RiskConfig]]
+
+
+def risk_config_on(risk: RiskConfig | RiskSchedule, day: date) -> RiskConfig:
+    """day 当日适用的风控配置：时间表里生效日不晚于 day 的最后一项（单一配置则始终是它）。"""
+    if isinstance(risk, RiskConfig):
+        return risk
+    chosen = risk[0][1]
+    for effective, cfg in risk:
+        if effective <= day:
+            chosen = cfg
+    return chosen
 
 
 class LedgerReplayError(ValueError):
@@ -364,7 +379,7 @@ def _replay(
     entries: Sequence[Entry],
     market: Market,
     calendar: TradingCalendar,
-    risk_cfg: RiskConfig,
+    risk_cfg: RiskConfig | RiskSchedule,
     costs: CostModel,
     start_cash: float,
     start_day: date,
@@ -383,10 +398,11 @@ def _replay(
             )
         by_day.setdefault(e.apply_day, []).append(e)
 
-    risk = RiskManager(risk_cfg, calendar, costs)
+    risk = RiskManager(risk_config_on(risk_cfg, start_day), calendar, costs)
     book = _Replayer(market, calendar, risk, start_cash)
     prev: date | None = None
     for day in days:
+        risk.set_config(risk_config_on(risk_cfg, day))
         book.step(day, prev, by_day.get(day, []))
         prev = day
     return ManualState(
@@ -409,13 +425,16 @@ def replay(
     entries: Sequence[Entry],
     market: Market,
     calendar: TradingCalendar,
-    risk_cfg: RiskConfig,
+    risk_cfg: RiskConfig | RiskSchedule,
     costs: CostModel,
     start_cash: float,
     start_day: date,
     through: date,
 ) -> ManualState:
     """从账本起始日重放到 through（含），返回此刻的手动账状态。
+
+    risk_cfg 为单一配置或参数时间表（见 risk_config_on）：每天用当天适用的风控配置，
+    参数修改只从生效日起作用，不改写过去的预警与暂停。
 
     流水不一致（超卖、现金为负、日期不在账本交易日内）时抛 LedgerReplayError（ValueError 的子类）；
     经 validate_entry 校验过的流水不会出现这种情况。
@@ -504,7 +523,7 @@ def validate_entry(
     new: Entry,
     market: Market,
     calendar: TradingCalendar,
-    risk_cfg: RiskConfig,
+    risk_cfg: RiskConfig | RiskSchedule,
     costs: CostModel,
     start_cash: float,
     start_day: date,

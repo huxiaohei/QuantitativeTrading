@@ -24,7 +24,7 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from qt.calendar import TradingCalendar
-from qt.config import AppConfig
+from qt.config import AppConfig, RiskConfig
 from qt.costs import CostModel
 from qt.db import repo
 from qt.db.models import Book, BookDay, LedgerEntry, Signal, Subscription
@@ -33,7 +33,7 @@ from qt.db.models import Trade as TradeRow
 from qt.features import FeaturePanel
 from qt.models import BuyCandidate, ExitReason, Order, Side
 from qt.risk import RiskManager
-from qt.service.accounts import STRATEGY_NAME, subscription_config
+from qt.service.accounts import STRATEGY_NAME, risk_schedule, subscription_config
 from qt.service.errors import LedgerInconsistentError, ValidationError
 from qt.service.manual_book import (
     Entry,
@@ -42,6 +42,7 @@ from qt.service.manual_book import (
     ManualState,
     Market,
     replay,
+    risk_config_on,
     validate_entry,
 )
 from qt.service.signals import (
@@ -92,12 +93,13 @@ class _Book:
     book: Book
     cfg: AppConfig
     costs: CostModel
+    risk: list[tuple[date, RiskConfig]]  # 风控参数时间表，重放时逐日取当天适用的
 
 
 def _open_book(s: Session, sub: Subscription, cfg: AppConfig) -> _Book:
     book = repo.get_book_of_kind(s, sub.user_id, sub.id, "manual")
     merged = subscription_config(cfg, sub)
-    return _Book(sub, book, merged, CostModel(merged.costs))
+    return _Book(sub, book, merged, CostModel(merged.costs), risk_schedule(s, sub))
 
 
 def _writable_book(s: Session, user_id: int, subscription_id: int, cfg: AppConfig) -> _Book:
@@ -169,7 +171,7 @@ def _replay(
             entries,
             market,
             calendar,
-            b.cfg.risk,
+            b.risk,
             b.costs,
             b.sub.initial_cash,
             b.sub.start_day,
@@ -290,7 +292,7 @@ def _validate(
         new,
         market,
         calendar,
-        b.cfg.risk,
+        b.risk,
         b.costs,
         b.sub.initial_cash,
         b.sub.start_day,
@@ -943,7 +945,7 @@ def advance_manual_book(
     state = _replay(b, ledger.entries, market, calendar, day)
     if not state.days or state.days[-1] != day:
         raise LedgerInconsistentError(f"手动账重放没有得到 {day} 的结果")
-    risk = RiskManager(b.cfg.risk, calendar, b.costs)
+    risk = RiskManager(risk_config_on(b.risk, day), calendar, b.costs)
     risk.load_state(state.risk)
     night = _Night(
         s,

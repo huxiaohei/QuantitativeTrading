@@ -21,7 +21,7 @@ from qt.db.models import Base, Book, BookDay, LedgerEntry, Signal, Subscription,
 from qt.db.models import Rejection as RejectionRow
 from qt.features import build_panel
 from qt.models import Side
-from qt.service.accounts import create_subscription, create_user
+from qt.service.accounts import create_subscription, create_user, update_params
 from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
 from qt.service.manual_ops import (
     ManualDayResult,
@@ -763,3 +763,47 @@ def test_other_user_cannot_record_or_void(db: Session, plain: World) -> None:
         record_cash(db, other_id, sub.id, m, cal, cfg, today, "deposit", today, 100.0)
     with pytest.raises(NotFoundError):
         manual_state(db, other_id, sub.id, m, cal, cfg, today)
+
+
+# ---------- 参数修改只从生效日起作用 ----------
+
+
+def _risk_events(db: Session, sub: Subscription) -> list[tuple[date, str]]:
+    book = _manual_book(db, sub)
+    return [(e.day, e.kind) for e in repo.list_risk_events(db, sub.user_id, book.id)]
+
+
+def _change(
+    db: Session, sub: Subscription, w: World, overrides: dict[str, object], day: int
+) -> None:
+    update_params(db, sub.user_id, sub.id, CFG, overrides, w.days[day])
+    db.commit()
+
+
+def test_tightening_pause_line_applies_from_effective_day_only(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain)
+    _holding(db, sub, plain, "600002", 10.0, 8000, S)  # 600002 之后一路下跌，净值回撤约 5%
+    _nights(db, sub, plain, S, S + 10)
+    assert _risk_events(db, sub) == []
+    _change(db, sub, plain, {"risk.pause_drawdown": 0.03, "risk.warn_drawdown": 0.02}, S + 11)
+    before = manual_state(
+        db, sub.user_id, sub.id, plain.market, plain.calendar, plain.cfg, plain.days[S + 10]
+    )
+    assert not before.risk.paused and before.risk_events == []  # 生效日之前按旧参数
+    result = _night(db, sub, plain, S + 11)
+    assert [(e.day, e.kind) for e in result.risk_events] == [(plain.days[S + 11], "pause")]
+    assert _risk_events(db, sub) == [(plain.days[S + 11], "pause")]  # 没有补出过去的暂停
+
+
+def test_real_past_pause_survives_later_loosening(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain, {"risk.pause_drawdown": 0.03, "risk.warn_drawdown": 0.02})
+    _holding(db, sub, plain, "600002", 10.0, 8000, S)
+    _nights(db, sub, plain, S, S + 10)
+    events = _risk_events(db, sub)
+    [pause_day] = [d for d, kind in events if kind == "pause"]
+    assert pause_day < plain.days[S + 10]
+    _change(db, sub, plain, {"risk.pause_drawdown": 0.5, "risk.warn_drawdown": 0.4}, S + 11)
+    result = _night(db, sub, plain, S + 11)
+    assert result.state.risk.paused and result.state.risk.pause_day == pause_day
+    assert result.new_buy_signals == []
+    assert _risk_events(db, sub) == events

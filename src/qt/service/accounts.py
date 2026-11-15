@@ -65,6 +65,27 @@ def subscription_config(cfg: AppConfig, sub: Subscription) -> AppConfig:
     return cfg.model_copy(update={"strategy": strategy, "risk": risk})
 
 
+def _risk_of(params: Mapping[str, Any], sub: Subscription) -> RiskConfig:
+    try:
+        return RiskConfig.model_validate(params["risk"])
+    except (PydanticValidationError, KeyError) as exc:
+        raise ValidationError(f"订阅 {sub.id} 的历史风控参数已不符合当前规则：{exc}") from exc
+
+
+def risk_schedule(s: Session, sub: Subscription) -> list[tuple[date, RiskConfig]]:
+    """订阅风控参数的时间表 [(生效日, 配置)]，按修改先后排列，第一项的生效日为 date.min。
+
+    没有修改过时只有当前参数；修改过时，第一次修改之前用那次修改的 old，之后每次修改的 new
+    从它的生效日起作用。手动账重放据此逐日取当天适用的风控参数。
+    """
+    changes = repo.list_param_changes(s, sub.user_id, sub.id)
+    if not changes:
+        return [(date.min, _risk_of(sub.params, sub))]
+    schedule = [(date.min, _risk_of(changes[0].old, sub))]
+    schedule.extend((c.effective_day, _risk_of(c.new, sub)) for c in changes)
+    return schedule
+
+
 def _valid_email(address: str) -> bool:
     """只有一个 @、本地部分非空、域名含点且各段非空；不含空白与控制字符（含不可见格式字符）。"""
     if len(address) > _MAX_EMAIL_LENGTH:
