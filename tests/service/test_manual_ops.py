@@ -382,6 +382,124 @@ def test_recording_sell_links_signal_and_starts_cooldown(db: Session, plain: Wor
     assert rules == ["cooldown"]
 
 
+def _cooldown_rules(db: Session, book: Book, symbol: str) -> list[str]:
+    stmt = select(RejectionRow.rule).where(
+        RejectionRow.book_id == book.id, RejectionRow.symbol == symbol
+    )
+    return list(db.scalars(stmt))
+
+
+def test_void_and_rerecord_keeps_signal_link_and_cooldown(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain)
+    _holding(db, sub, plain, "600003", 12.0, 1000, S)
+    [sig] = _night(db, sub, plain, S).new_sell_signals
+    wrong = _trade(db, sub, plain, Side.SELL, "600003", S + 1, 10.1, 1000)
+    assert wrong.signal_id == sig.id
+    void_entry(
+        db,
+        sub.user_id,
+        sub.id,
+        plain.market,
+        plain.calendar,
+        plain.cfg,
+        plain.days[S + 1],
+        wrong.id,
+    )
+    db.commit()
+    # 更正后重新录入：仍关联原信号（信号保持已执行，不再改状态）
+    fixed = _trade(db, sub, plain, Side.SELL, "600003", S + 1, 10.0, 1000)
+    assert fixed.origin == "signal" and fixed.signal_id == sig.id
+    db.refresh(sig)
+    assert sig.status == "executed" and sig.status_day == plain.days[S + 1]
+    _night(db, sub, plain, S + 1)
+    book = _manual_book(db, sub)
+    [trade] = db.scalars(select(Trade).where(Trade.book_id == book.id))
+    assert trade.exit_reason == "stop_loss" and trade.fill_price == 10.0
+    assert _cooldown_rules(db, book, "600003") == ["cooldown"]
+
+
+def test_void_and_rerecord_buy_keeps_signal_link(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain)
+    [sig] = [s for s in _night(db, sub, plain, S).new_buy_signals if s.symbol == "600001"]
+    wrong = _trade(db, sub, plain, Side.BUY, "600001", S + 1, 10.0, 900)
+    void_entry(
+        db,
+        sub.user_id,
+        sub.id,
+        plain.market,
+        plain.calendar,
+        plain.cfg,
+        plain.days[S + 1],
+        wrong.id,
+    )
+    db.commit()
+    fixed = _trade(db, sub, plain, Side.BUY, "600001", S + 1, 10.0, 800)
+    assert fixed.origin == "signal" and fixed.signal_id == sig.id
+
+
+def test_late_sell_links_signal_voided_after_the_sale(db: Session, plain: World) -> None:
+    # 成本 11.79：第 260 至 262 天收盘 10.00 时亏损 15.2%（止损），第 263 天价格回升到止损线以上
+    sub = _subscribe(db, plain)
+    _holding(db, sub, plain, "600001", 11.79, 1000, S)
+    results = _nights(db, sub, plain, S, S + 3)
+    [sig] = results[S].new_sell_signals
+    db.refresh(sig)
+    assert sig.status == "voided" and sig.status_day == plain.days[S + 3]
+    # 使用者在第 263 天（信号仍有效时）卖出，第 264 天才补录
+    e = _trade(db, sub, plain, Side.SELL, "600001", S + 3, 10.05, 1000, today=S + 4)
+    assert e.origin == "signal" and e.signal_id == sig.id
+    db.refresh(sig)
+    assert sig.status == "voided"  # 不改状态
+    _night(db, sub, plain, S + 4)
+    book = _manual_book(db, sub)
+    [trade] = db.scalars(select(Trade).where(Trade.book_id == book.id))
+    assert trade.exit_reason == "stop_loss" and trade.signal_ref_price == 10.0
+    assert _cooldown_rules(db, book, "600001") == ["cooldown"]
+
+
+def test_late_buy_links_abandoned_signal_within_validity(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain)
+    results = _nights(db, sub, plain, S, S + 4)
+    [sig] = [s for s in results[S].new_buy_signals if s.symbol == "600001"]
+    assert sig.id in {s.id for s in results[S + 4].abandoned}
+    e = _trade(db, sub, plain, Side.BUY, "600001", S + 2, 10.0, 900, today=S + 4)
+    assert e.origin == "signal" and e.signal_id == sig.id
+    db.refresh(sig)
+    assert sig.status == "abandoned"  # 不改状态
+    state = manual_state(
+        db, sub.user_id, sub.id, plain.market, plain.calendar, plain.cfg, plain.days[S + 4]
+    )
+    assert state.origins["600001"] == "signal"
+    assert state.positions["600001"].entry_metrics["dividend_yield"] == pytest.approx(0.06)
+    # 有效期之后的买入不关联
+    late = _trade(db, sub, plain, Side.BUY, "600001", S + 4, 10.0, 100)
+    assert late.origin == "self" and late.signal_id is None
+
+
+def test_partial_sell_links_signal_and_rule_fires_again_for_rest(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain)
+    _holding(db, sub, plain, "600003", 12.0, 1000, S)
+    [sig] = _night(db, sub, plain, S).new_sell_signals
+    e = _trade(db, sub, plain, Side.SELL, "600003", S + 1, 10.0, 400)
+    assert e.signal_id == sig.id
+    db.refresh(sig)
+    assert sig.status == "executed"
+    result = _night(db, sub, plain, S + 1)
+    assert [(s.symbol, s.exit_reason, s.shares) for s in result.new_sell_signals] == [
+        ("600003", "stop_loss", 600)
+    ]
+    book = _manual_book(db, sub)
+    [trade] = db.scalars(select(Trade).where(Trade.book_id == book.id))
+    assert (trade.shares, trade.exit_reason) == (400, "stop_loss")
+
+
+def test_sell_of_transferred_holding_on_first_day_has_no_t1_note(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain)
+    _holding(db, sub, plain, "600003", 12.0, 1000, S)
+    e = _trade(db, sub, plain, Side.SELL, "600003", S, 10.0, 1000)
+    assert e.note == ""
+
+
 def test_self_directed_holding_gets_sell_checks_and_counts_in_risk(
     db: Session, variant: World
 ) -> None:

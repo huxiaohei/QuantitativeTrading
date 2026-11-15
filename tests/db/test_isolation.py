@@ -58,6 +58,25 @@ def test_get_book_refuses_other_users_book(db: Session) -> None:
         repo.get_user(db, 99999)
 
 
+def test_book_listings_refuse_other_users_book(db: Session) -> None:
+    user_a = create_user(db, "a@example.com")
+    user_b = create_user(db, "b@example.com")
+    sub_a = create_subscription(db, user_a.id, CFG, 1e5, DAY)
+    book = repo.list_books(db, user_a.id, sub_a.id)[0]
+    listings = (
+        repo.list_ledger_entries,
+        repo.list_signals,
+        repo.list_risk_events,
+        repo.list_book_days,
+    )
+    for listing in listings:
+        assert listing(db, user_a.id, book.id) == []
+        with pytest.raises(NotFoundError):
+            listing(db, user_b.id, book.id)
+    with pytest.raises(NotFoundError):
+        repo.get_ledger_entry(db, user_b.id, book.id, 1)
+
+
 def test_admin_repo_lists_across_users(db: Session) -> None:
     user_a = create_user(db, "a@example.com")
     user_b = create_user(db, "b@example.com")

@@ -135,6 +135,7 @@ def list_signals(
     statuses: Collection[str] | None = None,
 ) -> list[Signal]:
     """账本的信号，可按方向与状态过滤，按编号升序。"""
+    get_book(s, user_id, book_id)
     stmt = select(Signal).where(Signal.user_id == user_id, Signal.book_id == book_id)
     if side is not None:
         stmt = stmt.where(Signal.side == side)
@@ -145,12 +146,14 @@ def list_signals(
 
 def list_risk_events(s: Session, user_id: int, book_id: int) -> list[RiskEvent]:
     """账本的风控事件，按日期、编号升序。"""
+    get_book(s, user_id, book_id)
     stmt = select(RiskEvent).where(RiskEvent.user_id == user_id, RiskEvent.book_id == book_id)
     return list(s.scalars(stmt.order_by(RiskEvent.day, RiskEvent.id)))
 
 
 def list_book_days(s: Session, user_id: int, book_id: int) -> list[BookDay]:
     """账本的每日净值，按日期升序。"""
+    get_book(s, user_id, book_id)
     stmt = select(BookDay).where(BookDay.user_id == user_id, BookDay.book_id == book_id)
     return list(s.scalars(stmt.order_by(BookDay.day)))
 

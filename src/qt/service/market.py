@@ -23,9 +23,10 @@ def _as_date(value: object) -> date | None:
 
 
 def _as_float(value: object) -> float:
-    """表中的数值单元格转为 float；空值记为 0。"""
-    number = float(str(value))
-    return 0.0 if math.isnan(number) else number
+    """表中的数值单元格转为 float；空值（None、NaN）记为 0。"""
+    if not isinstance(value, int | float) or math.isnan(value):  # None、NaN 与非数值记为 0
+        return 0.0
+    return float(value)
 
 
 class StoreMarket:

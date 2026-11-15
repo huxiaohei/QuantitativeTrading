@@ -140,6 +140,10 @@ class ManualState:
     cash_history: list[float]  # 每日日终现金
 
 
+class LedgerReplayError(ValueError):
+    """replay 发现流水不一致（超卖、现金为负、日期不在账本交易日内）。"""
+
+
 class _LedgerProblem(Exception):
     """重放中发现流水不一致。kind 为 position（持仓为负）、cash（现金为负）或 other。"""
 
@@ -413,13 +417,13 @@ def replay(
 ) -> ManualState:
     """从账本起始日重放到 through（含），返回此刻的手动账状态。
 
-    流水不一致（超卖、现金为负、日期不在账本交易日内）时抛 ValueError；
+    流水不一致（超卖、现金为负、日期不在账本交易日内）时抛 LedgerReplayError（ValueError 的子类）；
     经 validate_entry 校验过的流水不会出现这种情况。
     """
     try:
         return _replay(entries, market, calendar, risk_cfg, costs, start_cash, start_day, through)
     except _LedgerProblem as p:
-        raise ValueError(f"手动账流水不一致：{p.message}") from p
+        raise LedgerReplayError(f"手动账流水不一致：{p.message}") from p
 
 
 def _check_void(entries: Sequence[Entry], new: Entry) -> None:

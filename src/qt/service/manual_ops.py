@@ -38,6 +38,7 @@ from qt.service.errors import LedgerInconsistentError, ValidationError
 from qt.service.manual_book import (
     Entry,
     EntryKind,
+    LedgerReplayError,
     ManualState,
     Market,
     replay,
@@ -174,7 +175,7 @@ def _replay(
             b.sub.start_day,
             through,
         )
-    except ValueError as exc:
+    except LedgerReplayError as exc:
         raise LedgerInconsistentError(f"账本现有流水已不一致，请联系管理员：{exc}") from exc
 
 
@@ -213,6 +214,10 @@ def _rewrite_derived(
         )
     )
     sells = _sell_entries_in_order(ledger.entries, through)
+    if len(sells) != len(state.trades):
+        raise LedgerInconsistentError(
+            f"手动账有 {len(sells)} 笔卖出流水，重放却得到 {len(state.trades)} 笔交易"
+        )
     row_of = {r.id: r for r in ledger.rows}
     for entry, trade in zip(sells, state.trades, strict=True):
         if entry.symbol != trade.symbol:
@@ -307,22 +312,48 @@ def _estimate_fees(b: _Book, side: Side, price: float, shares: float, day: date)
     return gross - exact.sell_proceeds(price, shares, day)
 
 
-def _find_open_signal(
-    s: Session, b: _Book, side: Side, symbol: str, trade_day: date
-) -> Signal | None:
-    """录入成交时自动关联的未结信号：信号日早于成交日；买入信号还要求成交日不晚于有效期。
+def _in_window(sig: Signal, side: Side, trade_day: date) -> bool:
+    """成交日落在信号的有效窗口内：信号日 < 成交日；买入信号还要求成交日 <= 有效期。"""
+    if not sig.signal_day < trade_day:
+        return False
+    if side is Side.BUY:
+        return sig.valid_until is not None and trade_day <= sig.valid_until
+    return True
 
-    有多个时取信号日最近的一个。
+
+def _find_link(
+    s: Session, b: _Book, ledger: _Ledger, side: Side, symbol: str, trade_day: date
+) -> tuple[Signal | None, bool]:
+    """录入成交时要关联的信号，返回 (信号, 是否要置为已执行)。
+
+    规则见 record_trade；多个符合时取信号日最近的。
     """
-    found: Signal | None = None
-    for sig in repo.list_signals(s, b.book.user_id, b.book.id, side.value, _OPEN):
-        if sig.symbol != symbol or not sig.signal_day < trade_day:
-            continue
-        if side is Side.BUY and (sig.valid_until is None or trade_day > sig.valid_until):
-            continue
-        if found is None or sig.signal_day > found.signal_day:
-            found = sig
-    return found
+    signals = [
+        sig
+        for sig in repo.list_signals(s, b.book.user_id, b.book.id, side.value)
+        if sig.symbol == symbol and _in_window(sig, side, trade_day)
+    ]
+    open_ = [sig for sig in signals if sig.status in _OPEN]
+    if open_:
+        return max(open_, key=lambda sig: sig.signal_day), True
+    voided = {e.voids_entry_id for e in ledger.entries if e.kind is EntryKind.VOID}
+    linked_live = {r.signal_id for r in ledger.rows if r.kind != "void" and r.id not in voided}
+
+    def late(sig: Signal) -> bool:
+        if sig.status == SignalStatus.EXECUTED.value:
+            return sig.id not in linked_live  # 关联的流水都已作废：更正后重新录入
+        if side is Side.SELL:
+            return (
+                sig.status == SignalStatus.VOIDED.value
+                and sig.void_note == _VOID_NO_LONGER
+                and trade_day <= sig.status_day
+            )
+        return sig.status == SignalStatus.ABANDONED.value
+
+    late_ = [sig for sig in signals if late(sig)]
+    if late_:
+        return max(late_, key=lambda sig: sig.signal_day), False
+    return None, False
 
 
 def _trade_notes(
@@ -347,17 +378,25 @@ def _trade_notes(
             "之间，请核对"
         )
     if side is Side.SELL:
-        prior = calendar.between(b.sub.start_day, trade_day)  # 校验已保证最后一天是 trade_day
-        held = 0.0
-        if len(prior) >= 2:
-            state = _replay(b, ledger.entries, market, calendar, prior[-2])
-            pos = state.positions.get(symbol)
-            held = 0.0 if pos is None else pos.shares
-        if shares > held + _EPS:
-            notes.append(
-                f"卖出 {shares:g} 股超过前一交易日日终持有的 {held:g} 股；"
-                "A 股当日买入的股票次日才能卖出（T+1），请核对日期"
-            )
+        # 可卖股数 = 当日日终持股（不含本笔）减去当日买入的股数；转入的持仓本来就持有，可以卖
+        voided = {e.voids_entry_id for e in ledger.entries if e.kind is EntryKind.VOID}
+        bought = sum(
+            e.shares
+            for e in ledger.entries
+            if e.kind is EntryKind.BUY
+            and e.id not in voided
+            and e.symbol == symbol
+            and e.trade_day == trade_day
+        )
+        if bought > 0:
+            pos = _replay(b, ledger.entries, market, calendar, trade_day).positions.get(symbol)
+            sellable = (0.0 if pos is None else pos.shares) - bought
+            if shares > sellable + _EPS:
+                notes.append(
+                    f"卖出 {shares:g} 股超过可卖的 {max(sellable, 0.0):g} 股"
+                    f"（当日买入 {bought:g} 股）；"
+                    "A 股当日买入的股票次日才能卖出（T+1），请核对日期"
+                )
     return "；".join(notes)
 
 
@@ -378,15 +417,20 @@ def record_trade(
 ) -> LedgerEntry:
     """录入一笔买入或卖出成交。费用不填时按全站费用规则估算并标为估算值。
 
-    自动关联：买入关联同一本账里同一股票、未结、信号日 < 成交日 <= 有效期的买入信号；
-    卖出关联同一股票未结的卖出信号（信号日 < 成交日）。关联上的信号置为已执行，流水记为
-    origin=signal，否则为 self。价格超出当日最高最低价或卖出违反 T+1 时只在 note 里提示。
+    自动关联同一本账里同一股票、方向相同、成交日在窗口内的信号
+    （信号日 < 成交日，买入另需成交日 <= 有效期）：
+    1. 未结（created/notified）的信号：关联并置为已执行；
+    2. 没有时，不改状态地关联：已执行但关联流水全部作废的（作废后重新录入）、
+       卖出信号因"条件不再满足"作废且成交日 <= 作废日的、买入信号已放弃的（晚录入）。
+    多个符合时取信号日最近的。关联上流水记为 origin=signal，否则为 self；
+    卖出原因与买入指标随之带入。
+    价格超出当日最高最低价或卖出违反 T+1 时只在 note 里提示。
     """
     b = _writable_book(s, user_id, subscription_id, cfg)
     ledger = _load_ledger(s, b, market)
     estimated = fees is None
     fee = _estimate_fees(b, side, price, shares, trade_day) if fees is None else fees
-    signal = _find_open_signal(s, b, side, symbol, trade_day)
+    signal, execute = _find_link(s, b, ledger, side, symbol, trade_day)
     exit_reason: ExitReason | None = None
     metrics: dict[str, float] = {}
     if signal is not None and side is Side.SELL and signal.exit_reason is not None:
@@ -428,7 +472,7 @@ def record_trade(
     )
     s.add(row)
     s.flush()
-    if signal is not None:
+    if signal is not None and execute:
         mark_signal(s, signal, SignalStatus.EXECUTED, trade_day)
     _refresh_after_entry(s, b, market, calendar)
     repo.add_audit(
