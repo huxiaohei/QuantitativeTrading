@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from qt.backtest.report import run_period
+from qt.backtest.state import load_state
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig
 from qt.data.schema import Table
@@ -487,9 +488,17 @@ def test_weekly_holding_with_unknown_cost_shows_dash() -> None:
 
 
 class FlakyBarsSource(FakeSource):
-    """bars 对 failures 里的股票前若干次抛异常（模拟网络抖动），之后正常返回。"""
+    """bars 对 failures 里的股票前若干次抛异常（模拟网络抖动），之后正常返回；
+    broken_dividends 里的股票的分红接口每次都抛异常。"""
 
     failures: dict[str, int]
+    broken_dividends: frozenset[str] = frozenset()
+
+    def dividends(self, symbol: str) -> pd.DataFrame:
+        if symbol in self.broken_dividends:
+            self.calls.append(("dividends", (symbol,)))
+            raise RuntimeError(f"模拟分红接口出错：{symbol}")
+        return super().dividends(symbol)
 
     def bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
         left = self.failures.get(symbol, 0)
@@ -501,7 +510,11 @@ class FlakyBarsSource(FakeSource):
 
 
 def _holding_whose_bar_is_missing(
-    env: Env, db: Session, failures: int, source_has_bar: bool = True
+    env: Env,
+    db: Session,
+    failures: int,
+    source_has_bar: bool = True,
+    dividends_broken: bool = False,
 ) -> tuple[Subscription, FlakyBarsSource]:
     """手动账持有 600001；本地日线只到前一个交易日，数据源按 failures 次数失败。"""
     days = env.days
@@ -529,6 +542,11 @@ def _holding_whose_bar_is_missing(
         industries=env.store.read(Table.INDUSTRIES),
     )
     source.failures = {"600001": failures}
+    if dividends_broken:  # 分红文件已过期，当晚的更新会去下载它
+        source.broken_dividends = frozenset({"600001"})
+        stale = evening(day) - timedelta(days=60)
+        env.store.set_modified_time(Table.DIVIDENDS, "600001", stale)
+        env.store.set_modified_time(Table.FINANCIALS, "600001", stale)
     env.source = source
     own = env.store.read(Table.BARS, symbols=["600001"])
     kept = own[own["day"] < pd.Timestamp(day)].reset_index(drop=True)
@@ -639,3 +657,91 @@ def test_rerunning_a_past_day_updates_data_to_the_latest_closed_day(env: Env, db
     assert run_day(env.ctx, days[DAY], True, True) == "done"
     ends = {args[2] for name, args in source.calls if name in ("benchmark", "bars")}
     assert ends == {days[DAY + 3]}  # 不按过去的那天截断基准、不把 ST 变化记到过去
+
+
+def test_suspended_holding_with_failing_fundamentals_runs_normally(env: Env, db: Session) -> None:
+    day = env.days[DAY]
+    sub, source = _holding_whose_bar_is_missing(
+        env, db, failures=0, source_has_bar=False, dividends_broken=True
+    )
+    assert run_day(env.ctx, day, True, True) == "done"
+    assert processed_through(db, sub, "manual") == day
+    assert ("dividends", ("600001",)) in source.calls  # 分红接口确实在更新时出错
+    run = daily_run(db, day)
+    assert run is not None and "600001" in run.detail["download_failed"]  # 仍记录并告警
+    assert any(m.subject == "【系统异常】部分股票下载失败" for m in env.sender.sent)
+
+
+def test_bar_failure_cleared_by_clean_retry_is_treated_as_suspension(env: Env, db: Session) -> None:
+    day = env.days[DAY]
+    sub, _ = _holding_whose_bar_is_missing(env, db, failures=1, source_has_bar=False)
+    assert run_day(env.ctx, day, True, True) == "done"
+    assert processed_through(db, sub, "manual") == day
+    run = daily_run(db, day)
+    assert run is not None and "600001" in run.detail["download_failed"]
+
+
+def test_pending_system_buy_order_with_failed_bar_download_fails_the_run(
+    env: Env, db: Session
+) -> None:
+    days = env.days
+    _add_bystander(env.store)
+    sub = subscribe(db, "a@example.com", days[DAY])
+    assert run_day(env.ctx, days[DAY], True, False) == "done"  # 系统账挂出买单，次日开盘成交
+    db.rollback()
+    system = repo.get_book_of_kind(db, sub.user_id, sub.id, "system")
+    state_row = repo.get_system_state(db, sub.user_id, system.id)
+    assert state_row is not None
+    pending, _ = load_state(state_row.state)
+    assert "600001" in {o.symbol for o in pending.buy_orders} and not pending.positions
+    manual = repo.get_book_of_kind(db, sub.user_id, sub.id, "manual")
+    for sig in repo.list_signals(db, sub.user_id, manual.id, "buy"):
+        if sig.symbol == "600001":  # 只留系统账的挂单这一个理由
+            sig.status = "voided"
+    db.commit()
+    nxt = days[DAY + 1]
+    source = FlakyBarsSource(
+        trade_days=env.store.read(Table.TRADE_DAYS),
+        securities=env.store.read(Table.SECURITIES),
+        bars=env.store.read(Table.BARS),
+        dividends=env.store.read(Table.DIVIDENDS),
+        financials=env.store.read(Table.FINANCIALS),
+        industries=env.store.read(Table.INDUSTRIES),
+    )
+    source.failures = {"600001": 99}
+    env.source = source
+    own = env.store.read(Table.BARS, symbols=["600001"])
+    env.store.write(
+        Table.BARS, own[own["day"] < pd.Timestamp(nxt)].reset_index(drop=True), symbol="600001"
+    )
+    env.clock.now = evening(nxt)
+    assert run_day(env.ctx, nxt, True, True) == "data_failed"
+    retried = [c for c in source.calls if c[0] == "bars" and c[1][0] == "600001"]
+    assert len(retried) == 2  # 更新一次、再下载一次
+    assert processed_through(db, sub, "system") == days[DAY]
+    assert processed_through(db, sub, "manual") == days[DAY]
+    run = daily_run(db, nxt)
+    assert run is not None and "600001" in str(run.detail["problems"])
+
+
+def test_catch_up_check_failure_keeps_download_failures_in_detail(env: Env, db: Session) -> None:
+    days = env.days
+    sub = subscribe(db, "a@example.com", days[DAY])
+    _drop_bars(env.store, ["600001", "600002"], days[DAY])  # 当日覆盖率 50%：检查不通过
+    source = mirror_source(env.store, FlakyBarsSource)
+    assert isinstance(source, FlakyBarsSource)
+    source.failures = {}
+    source.fail_symbols = {"600003"}
+    own = env.store.read(Table.BARS, symbols=["600003"])
+    env.store.write(
+        Table.BARS,
+        own[own["day"] < pd.Timestamp(days[DAY])].reset_index(drop=True),
+        symbol="600003",
+    )
+    env.source = source
+    env.clock.now = evening(days[DAY])
+    assert catch_up(env.ctx) == [(days[DAY], "data_failed")]
+    run = daily_run(db, days[DAY])
+    assert run is not None and run.stage == "check"
+    assert "600003" in run.detail["download_failed"]
+    assert processed_through(db, sub, "system") is None

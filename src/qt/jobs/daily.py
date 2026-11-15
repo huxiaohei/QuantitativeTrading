@@ -353,12 +353,23 @@ def _due_subscriptions(s: Session, day: date) -> list[Subscription]:
 def _holdings(
     s: Session, sub: Subscription, cfg: AppConfig, panels: _Panels, day: date
 ) -> set[str]:
-    """订阅两本账当前持有的股票。"""
+    """订阅两本账当前持有或当日可能成交的股票。
+
+    系统账：持仓与待成交的买单、卖单（它们在 day 开盘撮合，缺当日日线会被当成停牌而顺延）；
+    手动账：持仓与未结的买入信号（使用者可能正在按它买入）。
+    """
     held: set[str] = set()
     system = repo.get_book_of_kind(s, sub.user_id, sub.id, "system")
     row = repo.get_system_state(s, sub.user_id, system.id)
     if row is not None:
-        held |= set(load_state(row.state)[0].positions)
+        engine = load_state(row.state)[0]
+        held |= set(engine.positions)
+        held |= {o.symbol for o in [*engine.buy_orders, *engine.sell_orders]}
+    manual = repo.get_book_of_kind(s, sub.user_id, sub.id, "manual")
+    held |= {
+        sig.symbol
+        for sig in repo.list_signals(s, sub.user_id, manual.id, "buy", ("created", "notified"))
+    }
     state = manual_state(s, sub.user_id, sub.id, panels.market, panels.calendar, cfg, day)
     return held | set(state.positions)
 
@@ -399,9 +410,10 @@ def _missing_bars(panels: _Panels, day: date, symbols: set[str]) -> list[str]:
 def _retry_missing_bars(
     ctx: RunContext, run: _Run, panels: _Panels, day: date, wanted: set[str], downloaded: Downloaded
 ) -> tuple[list[str], bool]:
-    """持仓与候选里缺当日日线的，再下载一次；返回 (仍缺且记录过下载失败的说明, 是否重建了面板)。
+    """要检查的股票里缺当日日线的，再下载一次日线；返回 (再下载仍出错的说明, 是否重建了面板)。
 
-    仍缺日线、但数据源正常回答（没有记录任何下载失败）的视为停牌，照常运行。
+    只看日线：再下载时数据源正常回答但没有当日日线的视为停牌，照常运行，更新时记下的失败
+    （日线或分红、财务）就此作罢；分红、财务的下载失败只记录、告警，不阻断。
     """
     missing = _missing_bars(panels, day, wanted)
     if not missing:
@@ -415,10 +427,9 @@ def _retry_missing_bars(
         "failed": retry_failed,
     }
     lines = [
-        f"{symbol} 在 {day} 没有日线，再下载一次仍失败："
-        f"{retry_failed.get(symbol) or downloaded.failed[symbol]}"
+        f"{symbol} 在 {day} 没有日线，再下载一次仍失败：{retry_failed[symbol]}"
         for symbol in still
-        if symbol in retry_failed or symbol in downloaded.failed
+        if symbol in retry_failed
     ]
     return lines, True
 
@@ -581,9 +592,10 @@ def _run_day(
     notify 为假（补跑的更早日子）时新信号记为未通知、不写使用者邮件；update_data 为真时先刷新
     交易日历并增量更新（到 day 与最近已收盘交易日中较晚者）。downloaded 为调用方（补跑）
     已做过的那次数据更新的结果。
-    本次运行有数据更新时：下载失败的股票记入 detail 并告警；持仓（任一本账）或候选缺当日
-    日线的再下载一次，仍缺且记录过下载失败的，本日为 data_failed（不给任何人出信号）；
-    没有失败记录的视为停牌。
+    本次运行有数据更新时：下载失败的股票（日线、分红、财务）记入 detail 并告警；要检查的股票
+    （两本账的持仓、系统账待成交的买卖单、手动账未结的买入信号、当晚候选）缺当日日线的，
+    再下载一次日线：再下载仍出错的，本日为 data_failed（不给任何人出信号）；数据源正常回答
+    但没有当日日线的视为停牌（之前的下载失败就此作罢）。分红、财务下载失败不阻断运行。
     day 不是交易日时抛 ValueError。
     """
     stored = _stored_calendar(ctx.store)
@@ -605,6 +617,8 @@ def _run_day(
             return _data_failed(
                 ctx, run, "data", "数据更新发现问题", {"problems": problems}, problems
             )
+    elif downloaded is not None:  # 补跑：那次更新的下载失败也记入每一天的 detail
+        _note_download_failures(ctx, run, downloaded)
 
     run.stage("check")
     calendar = stored or TradingCalendar([])
@@ -620,9 +634,6 @@ def _run_day(
         return _data_failed(
             ctx, run, "check", "数据完整性检查未通过", {"problems": problems}, problems
         )
-
-    elif downloaded is not None:
-        _note_download_failures(ctx, run, downloaded)
 
     run.stage("panel")
     missing: list[str] = []
