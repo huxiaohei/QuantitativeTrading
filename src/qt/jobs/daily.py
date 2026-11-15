@@ -7,7 +7,7 @@
 """
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -28,6 +28,7 @@ from qt.data.update import (
     check_integrity,
     latest_closed_day,
     load_calendar,
+    refresh_bars,
     refresh_fundamentals,
     update_all,
 )
@@ -61,6 +62,7 @@ FINISHED = (DONE, DONE_WITH_ERRORS)
 _MAX_ERROR_CHARS = 500
 _LOOKBACK_SLACK_DAYS = 5  # 跟踪记录回看窗口 = 补记上限 + 这几天
 _MAX_PREVIOUS_RUNS = 20  # daily_runs.detail 里保留的历次运行记录条数
+_MAX_ALERT_SYMBOLS = 50  # 下载失败告警里最多逐只列出的股票数
 
 
 @dataclass(frozen=True)
@@ -211,18 +213,49 @@ def _progress(stage: str, done: int, total: int) -> None:
     _log.info("数据更新 %s 已处理 %d/%d 只股票", stage, done, total)
 
 
-def _update_data(ctx: RunContext, as_of: date) -> list[str]:
-    """增量更新到 as_of（交易日历须已刷新），返回需要视为数据问题的描述。"""
+@dataclass(frozen=True)
+class Downloaded:
+    """本次数据更新的目标日与逐只下载失败（symbol -> 错误信息）。"""
+
+    as_of: date
+    failed: Mapping[str, str]
+
+
+def _update_data(ctx: RunContext, as_of: date) -> tuple[list[str], Downloaded]:
+    """增量更新到 as_of（交易日历须已刷新），返回 (需要视为数据问题的描述, 下载失败)。"""
     report = update_all(
         ctx.source, ctx.store, ctx.cfg, as_of, progress=_progress, refresh_trade_days=False
     )
     _log.info(
-        "数据更新完成：更新 %d 只，跳过 %d 只，失败 %d 只",
+        "数据更新完成：更新 %d 只，跳过 %d 只，失败 %d 只（其中下载出错 %d 只）",
         report.updated,
         report.skipped,
         len(report.failed),
+        len(report.download_failed),
     )
-    return list(report.problems)
+    return list(report.problems), Downloaded(as_of, dict(report.download_failed))
+
+
+def _note_download_failures(ctx: RunContext, run: "_Run", downloaded: Downloaded) -> None:
+    """下载失败的股票记入 detail；有失败时告警管理员（按更新目标日去重，补跑多天只告警一次）。"""
+    failed = dict(sorted(downloaded.failed.items()))
+    run.detail["download_failed"] = failed
+    if not failed:
+        return
+    lines = [f"{symbol}：{message}" for symbol, message in failed.items()]
+    if len(lines) > _MAX_ALERT_SYMBOLS:
+        more = len(lines) - _MAX_ALERT_SYMBOLS
+        lines = [*lines[:_MAX_ALERT_SYMBOLS], f"……另有 {more} 只，见 qt admin runs"]
+    alert(
+        ctx,
+        downloaded.as_of,
+        "部分股票下载失败",
+        [
+            f"更新到 {downloaded.as_of} 时以下 {len(failed)} 只股票下载出错，沿用本地已有数据；"
+            "其中如有持仓股票缺当日日线，会再下载一次，仍失败则当晚不出信号：",
+            *lines,
+        ],
+    )
 
 
 def _data_failed(
@@ -296,10 +329,13 @@ def _holdings(
     return held | set(state.positions)
 
 
-def _recheck_symbols(ctx: RunContext, run: _Run, panels: _Panels, day: date) -> list[str]:
-    """所有生效订阅两本账的持仓，加上各订阅用当晚快照初筛出的买入候选（不落库）。"""
+def _wanted_symbols(
+    ctx: RunContext, run: _Run, panels: _Panels, day: date
+) -> tuple[set[str], set[str]]:
+    """所有生效订阅两本账的持仓，与各订阅用当晚快照初筛出的买入候选（不落库）。"""
     snapshot = panels.panel.snapshot(day)
-    wanted: set[str] = set()
+    holdings: set[str] = set()
+    candidates: set[str] = set()
     errors: list[str] = []
     with _session(ctx) as s:
         for sub in _due_subscriptions(s, day):
@@ -307,19 +343,56 @@ def _recheck_symbols(ctx: RunContext, run: _Run, panels: _Panels, day: date) -> 
                 held = _holdings(s, sub, ctx.cfg, panels, day)
                 merged = subscription_config(ctx.cfg, sub)
                 strategy = HighDividendLow(merged.strategy, merged.universe)
-                wanted |= held
-                wanted |= {c.symbol for c in strategy.buy_candidates(day, snapshot, held)}
+                holdings |= held
+                candidates |= {c.symbol for c in strategy.buy_candidates(day, snapshot, held)}
             except Exception as exc:  # 该使用者在推进时会再出错并单独告警
                 errors.append(f"订阅 {sub.id}：{describe(exc)}")
         s.rollback()
     if errors:
         run.detail["recheck_errors"] = errors
-    return sorted(wanted)
+    return holdings, candidates
 
 
-def _recheck_fundamentals(ctx: RunContext, run: _Run, panels: _Panels, day: date) -> None:
+def _missing_bars(panels: _Panels, day: date, symbols: set[str]) -> list[str]:
+    """symbols 里 day 当天没有日线、且尚未退市的股票。"""
+    return sorted(
+        symbol
+        for symbol in symbols
+        if panels.panel.bar(day, symbol) is None and not panels.market.delisted_before(day, symbol)
+    )
+
+
+def _retry_missing_bars(
+    ctx: RunContext, run: _Run, panels: _Panels, day: date, wanted: set[str], downloaded: Downloaded
+) -> tuple[list[str], bool]:
+    """持仓与候选里缺当日日线的，再下载一次；返回 (仍缺且记录过下载失败的说明, 是否重建了面板)。
+
+    仍缺日线、但数据源正常回答（没有记录任何下载失败）的视为停牌，照常运行。
+    """
+    missing = _missing_bars(panels, day, wanted)
+    if not missing:
+        return [], False
+    retry_failed = refresh_bars(ctx.source, ctx.store, ctx.cfg, missing, downloaded.as_of)
+    panels.rebuild()
+    still = _missing_bars(panels, day, set(missing))
+    run.detail["bars_retried"] = {
+        "symbols": missing,
+        "still_missing": still,
+        "failed": retry_failed,
+    }
+    lines = [
+        f"{symbol} 在 {day} 没有日线，再下载一次仍失败："
+        f"{retry_failed.get(symbol) or downloaded.failed[symbol]}"
+        for symbol in still
+        if symbol in retry_failed or symbol in downloaded.failed
+    ]
+    return lines, True
+
+
+def _recheck_fundamentals(
+    ctx: RunContext, run: _Run, panels: _Panels, day: date, symbols: list[str]
+) -> None:
     """重新下载持仓与候选的分红和财务，再重建面板；个别失败记入 detail 并告警，不中止。"""
-    symbols = _recheck_symbols(ctx, run, panels, day)
     run.detail["rechecked"] = symbols
     if not symbols:
         return
@@ -446,11 +519,21 @@ def _mail_stage(
 # ---------- 一天 ----------
 
 
-def run_day(ctx: RunContext, day: date, notify: bool, update_data: bool) -> str:
+def run_day(
+    ctx: RunContext,
+    day: date,
+    notify: bool,
+    update_data: bool,
+    downloaded: Downloaded | None = None,
+) -> str:
     """完整跑一个交易日，返回 daily_runs.status。
 
     notify 为假（补跑的更早日子）时新信号记为未通知、不写使用者邮件；update_data 为真时先刷新
-    交易日历并增量更新到 day。day 不是交易日时抛 ValueError。
+    交易日历并增量更新到 day。downloaded 为调用方（补跑）已做过的那次数据更新的结果。
+    本次运行有数据更新时：下载失败的股票记入 detail 并告警；持仓（任一本账）或候选缺当日
+    日线的再下载一次，仍缺且记录过下载失败的，本日为 data_failed（不给任何人出信号）；
+    没有失败记录的视为停牌。
+    day 不是交易日时抛 ValueError。
     """
     stored = _stored_calendar(ctx.store)
     if stored is not None and not stored.is_trading_day(day):
@@ -461,11 +544,12 @@ def run_day(ctx: RunContext, day: date, notify: bool, update_data: bool) -> str:
     if update_data:
         try:
             _refresh_trade_days(ctx)
-            problems = _update_data(ctx, day)
+            problems, downloaded = _update_data(ctx, day)
         except Exception as exc:
             _log.exception("数据更新失败")
             error = describe(exc)
             return _data_failed(ctx, run, "data", "数据更新失败", {"error": error}, [error])
+        _note_download_failures(ctx, run, downloaded)
         if problems:
             return _data_failed(
                 ctx, run, "data", "数据更新发现问题", {"problems": problems}, problems
@@ -486,15 +570,29 @@ def run_day(ctx: RunContext, day: date, notify: bool, update_data: bool) -> str:
             ctx, run, "check", "数据完整性检查未通过", {"problems": problems}, problems
         )
 
+    elif downloaded is not None:
+        _note_download_failures(ctx, run, downloaded)
+
     run.stage("panel")
+    missing: list[str] = []
     try:
         panels = _Panels(ctx, calendar, day)
-        _recheck_fundamentals(ctx, run, panels, day)
+        held, candidates = _wanted_symbols(ctx, run, panels, day)
+        if downloaded is not None:
+            missing, rebuilt = _retry_missing_bars(
+                ctx, run, panels, day, held | candidates, downloaded
+            )
+            if rebuilt and not missing:
+                held, candidates = _wanted_symbols(ctx, run, panels, day)
+        if not missing:
+            _recheck_fundamentals(ctx, run, panels, day, sorted(held | candidates))
         names = security_names(ctx.store)
     except Exception as exc:
         _log.exception("构建指标面板失败")
         error = describe(exc)
         return _data_failed(ctx, run, "panel", "指标面板构建失败", {"error": error}, [error])
+    if missing:
+        return _data_failed(ctx, run, "panel", "持仓股票行情缺失", {"problems": missing}, missing)
 
     run.stage("users")
     user_errors = _users_stage(ctx, panels, day, notify, names)
@@ -585,7 +683,7 @@ def catch_up(ctx: RunContext) -> list[tuple[date, str]]:
     try:
         if refresh_error is not None:
             raise SharedTableError(refresh_error)
-        problems = _update_data(ctx, as_of)
+        problems, downloaded = _update_data(ctx, as_of)
     except Exception as exc:
         _log.exception("补跑前的数据更新失败")
         error = describe(exc)
@@ -594,13 +692,14 @@ def catch_up(ctx: RunContext) -> list[tuple[date, str]]:
         return [(days[0], status)]
     if problems:
         run = _Run(ctx, days[0])
+        _note_download_failures(ctx, run, downloaded)
         status = _data_failed(
             ctx, run, "data", "数据更新发现问题", {"problems": problems}, problems
         )
         return [(days[0], status)]
     results: list[tuple[date, str]] = []
     for day in days:
-        status = run_day(ctx, day, notify=day == as_of, update_data=False)
+        status = run_day(ctx, day, notify=day == as_of, update_data=False, downloaded=downloaded)
         results.append((day, status))
         if status == DATA_FAILED:
             break

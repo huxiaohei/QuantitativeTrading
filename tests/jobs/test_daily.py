@@ -464,3 +464,96 @@ def test_weekly_holding_with_unknown_cost_shows_dash() -> None:
     )
     text = render_weekly(date(2022, 1, 7), report).text
     assert "成本：—" in text and "浮动盈亏：—" in text
+
+
+# ---------- 持仓股票的日线下载失败 ----------
+
+
+class FlakyBarsSource(FakeSource):
+    """bars 对 failures 里的股票前若干次抛异常（模拟网络抖动），之后正常返回。"""
+
+    failures: dict[str, int]
+
+    def bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
+        left = self.failures.get(symbol, 0)
+        if left > 0:
+            self.failures[symbol] = left - 1
+            self.calls.append(("bars", (symbol, start, end)))
+            raise RuntimeError(f"模拟下载失败：{symbol}")
+        return super().bars(symbol, start, end)
+
+
+def _holding_whose_bar_is_missing(
+    env: Env, db: Session, failures: int, source_has_bar: bool = True
+) -> tuple[Subscription, FlakyBarsSource]:
+    """手动账持有 600001；本地日线只到前一个交易日，数据源按 failures 次数失败。"""
+    days = env.days
+    day = days[DAY]
+    _add_bystander(env.store)  # 5 只股票：缺一只时覆盖率仍有 80%
+    sub = subscribe(db, "a@example.com", day)
+    panel = build_panel(env.store, env.calendar, CFG, days[0], day)
+    market = StoreMarket(env.store, panel, CFG)
+    record_holding(
+        db, sub.user_id, sub.id, market, env.calendar, CFG, day, "600001", days[DAY - 5], 10.0, 1000
+    )
+    db.commit()
+    full = env.store.read(Table.BARS)
+    bars = (
+        full
+        if source_has_bar
+        else full[~((full["symbol"] == "600001") & (full["day"] == pd.Timestamp(day)))]
+    )
+    source = FlakyBarsSource(
+        trade_days=env.store.read(Table.TRADE_DAYS),
+        securities=env.store.read(Table.SECURITIES),
+        bars=bars.reset_index(drop=True),
+        dividends=env.store.read(Table.DIVIDENDS),
+        financials=env.store.read(Table.FINANCIALS),
+        industries=env.store.read(Table.INDUSTRIES),
+    )
+    source.failures = {"600001": failures}
+    env.source = source
+    own = env.store.read(Table.BARS, symbols=["600001"])
+    kept = own[own["day"] < pd.Timestamp(day)].reset_index(drop=True)
+    env.store.write(Table.BARS, kept, symbol="600001")
+    return sub, source
+
+
+def test_holding_with_failed_download_fails_the_run(env: Env, db: Session) -> None:
+    day = env.days[DAY]
+    sub, source = _holding_whose_bar_is_missing(env, db, failures=99)
+    assert run_day(env.ctx, day, True, True) == "data_failed"
+    db.rollback()
+    assert db.scalar(select(func.count()).select_from(Signal)) == 0
+    assert processed_through(db, sub, "manual") is None
+    run = daily_run(db, day)
+    assert run is not None and "600001" in str(run.detail["problems"])
+    assert "600001" in run.detail["download_failed"]
+    subjects = [m.subject for m in env.sender.sent]
+    assert all(m.to_addr == ADMIN for m in env.sender.sent)
+    assert "【系统异常】持仓股票行情缺失" in subjects
+    assert "【系统异常】部分股票下载失败" in subjects
+    assert len([c for c in source.calls if c[0] == "bars" and c[1][0] == "600001"]) == 2
+
+
+def test_holding_download_retried_once_then_run_is_normal(env: Env, db: Session) -> None:
+    day = env.days[DAY]
+    sub, _ = _holding_whose_bar_is_missing(env, db, failures=1)
+    assert run_day(env.ctx, day, True, True) == "done"
+    assert processed_through(db, sub, "manual") == day
+    bars = env.store.read(Table.BARS, symbols=["600001"])
+    assert pd.Timestamp(day) in set(bars["day"])
+    run = daily_run(db, day)
+    assert run is not None and "600001" in run.detail["download_failed"]
+    assert any(m.subject == "【系统异常】部分股票下载失败" for m in env.sender.sent)
+    assert any(m.to_addr == "a@example.com" for m in env.sender.sent)
+
+
+def test_suspended_holding_without_download_failure_runs_normally(env: Env, db: Session) -> None:
+    day = env.days[DAY]
+    sub, _ = _holding_whose_bar_is_missing(env, db, failures=0, source_has_bar=False)
+    assert run_day(env.ctx, day, True, True) == "done"
+    assert processed_through(db, sub, "manual") == day
+    run = daily_run(db, day)
+    assert run is not None and run.detail["download_failed"] == {}
+    assert not [m for m in env.sender.sent if m.to_addr == ADMIN]

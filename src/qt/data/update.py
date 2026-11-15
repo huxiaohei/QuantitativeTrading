@@ -3,7 +3,7 @@
 import logging
 import zlib
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any, Protocol, cast, runtime_checkable
 from zoneinfo import ZoneInfo
@@ -115,12 +115,15 @@ class UpdateReport:
     updated/skipped 按日线计：有新日线写入记为 updated，其余（日线已最新、已退市且太久没有新数据、
     退市早于下载起点、新股尚无行情）记为 skipped。failed 为 symbol -> 错误信息；
     problems 是需要让命令行以非零码退出的数据问题（如行业覆盖率不足）。
+    download_failed 是 failed 的子集：逐只下载日线、分红、财务时出了异常的股票（不含行业查询失败、
+    已退市取不到日线、退市日期缺失这几类），每日任务据此判断持仓缺日线是下载失败还是停牌。
     """
 
     updated: int
     skipped: int
     failed: Mapping[str, str]
     problems: Sequence[str] = ()
+    download_failed: Mapping[str, str] = field(default_factory=dict[str, str])
 
 
 def count_no_bars(failed: Mapping[str, str]) -> int:
@@ -484,6 +487,7 @@ def update_all(
     wanted = list(in_universe.index) if symbols is None else list(dict.fromkeys(symbols))
 
     failed: dict[str, str] = {}
+    download_failed: dict[str, str] = {}
     is_listed = in_universe["delist_date"].isna().to_dict()
     listed_wanted = [s for s in wanted if is_listed.get(s, False)]
     calendar_days = store.read(Table.TRADE_DAYS)
@@ -525,6 +529,7 @@ def update_all(
                 guard.ok()
             except Exception as exc:  # 单只股票失败不影响其他股票
                 _record(failed, symbol, f"{type(exc).__name__}: {exc}")
+                download_failed[symbol] = f"{type(exc).__name__}: {exc}"
                 guard.failed(exc)
             if progress is not None and i % progress_every == 0:
                 progress("日线", i, len(wanted))
@@ -542,7 +547,38 @@ def update_all(
         if symbol in attempted:  # 本次没有尝试下载的不记失败
             message = f"{DELIST_MISSING_PREFIX}：退市表没有退市日期且无日线，未写入 securities"
             failed[symbol] = f"{message}；{failed[symbol]}" if symbol in failed else message
-    return UpdateReport(updated=updated, skipped=skipped, failed=failed, problems=problems)
+    return UpdateReport(
+        updated=updated,
+        skipped=skipped,
+        failed=failed,
+        problems=problems,
+        download_failed=download_failed,
+    )
+
+
+def refresh_bars(
+    source: DataSource, store: ParquetStore, cfg: AppConfig, symbols: Sequence[str], as_of: date
+) -> dict[str, str]:
+    """再请求一次这些股票到 as_of 的日线（只补本地最后一根之后的部分），返回 symbol -> 错误信息。
+
+    与 update_all 用同一段逐只更新代码；数据源正常回答但没有新日线（停牌）不算失败。
+    """
+    if isinstance(source, AsOfAware):
+        source.set_as_of(as_of)
+    secs = store.read(Table.SECURITIES)
+    delisted = {
+        str(s) for s, d in zip(secs["symbol"], secs["delist_date"], strict=True) if not pd.isna(d)
+    }
+    latest = latest_trading_day(load_calendar(store), as_of)
+    failed: dict[str, str] = {}
+    for symbol in symbols:
+        try:
+            _update_bars(source, store, cfg, symbol, symbol in delisted, as_of, latest)
+        except _NoBarsError:
+            failed[symbol] = f"{NO_BARS_PREFIX}：已退市股票取不到日线"
+        except Exception as exc:  # 单只失败不影响其他股票
+            failed[symbol] = f"{type(exc).__name__}: {exc}"
+    return failed
 
 
 def _ipo_exempt_until(calendar: TradingCalendar, list_date: pd.Timestamp) -> date | None:
