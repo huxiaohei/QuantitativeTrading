@@ -150,11 +150,12 @@ def _signed_pct(value: float | None) -> str:
     return _DASH if value is None else f"{value * 100:+.2f}%"
 
 
-def _command(side: str, v: SignalView) -> str:
-    return f"qt admin trade {side} --symbol {v.symbol} --shares {v.shares} --price <实际成交价>"
+def _command(side: str, v: SignalView, to_email: str) -> str:
+    head = f"qt admin trade {side} --email {to_email} {v.symbol}"
+    return f"{head} --price <实际成交价> --shares {v.shares}"
 
 
-def _buy_card(v: SignalView, with_command: bool) -> _Card:
+def _buy_card(v: SignalView, to_email: str | None) -> _Card:
     metrics = "；".join(f"{k} {val:.2f}" for k, val in v.metrics.items()) or _DASH
     fields = [
         ("数量", f"{v.shares} 股"),
@@ -166,8 +167,8 @@ def _buy_card(v: SignalView, with_command: bool) -> _Card:
     ]
     if v.valid_until is not None:
         fields.append(("有效至", v.valid_until.isoformat()))
-    if with_command:
-        fields.append(("录入命令", _command("buy", v)))
+    if to_email is not None:
+        fields.append(("录入命令", _command("buy", v, to_email)))
     return _Card(f"{v.symbol} {v.name}", fields)
 
 
@@ -177,7 +178,7 @@ def _exit_label(v: SignalView) -> str:
     return EXIT_REASON_LABELS.get(v.exit_reason, v.exit_reason)
 
 
-def _sell_card(v: SignalView, with_command: bool) -> _Card:
+def _sell_card(v: SignalView, to_email: str | None) -> _Card:
     fields = [
         ("数量", f"{v.shares} 股"),
         ("参考价", f"{v.ref_price:.2f}（{_PRICE_NOTE}）"),
@@ -186,8 +187,8 @@ def _sell_card(v: SignalView, with_command: bool) -> _Card:
     ]
     if v.valid_until is not None:
         fields.append(("有效至", v.valid_until.isoformat()))
-    if with_command:
-        fields.append(("录入命令", _command("sell", v)))
+    if to_email is not None:
+        fields.append(("录入命令", _command("sell", v, to_email)))
     return _Card(f"{v.symbol} {v.name}", fields)
 
 
@@ -273,11 +274,12 @@ def render_buy_signals(
     manual: Sequence[SignalView],
     system: Sequence[SignalView],
     books: BooksSummary,
+    to_email: str,
 ) -> Mail:
     subject = f"【买入信号】{day} {len(manual)} 只"
     sections = [
-        _Section(MANUAL_HEADING, [_buy_card(v, True) for v in manual]),
-        _Section(SYSTEM_HEADING, [_buy_card(v, False) for v in system]),
+        _Section(MANUAL_HEADING, [_buy_card(v, to_email) for v in manual]),
+        _Section(SYSTEM_HEADING, [_buy_card(v, None) for v in system]),
     ]
     intro = f"按你设定的规则计算，{day} 收盘后产生以下买入信号。"
     return _compose(subject, "buy_signal.html.j2", intro, sections, _books_lines(books), True)
@@ -289,12 +291,13 @@ def render_sell_signals(
     system: Sequence[SignalView],
     books: BooksSummary,
     reminder: bool,
+    to_email: str,
 ) -> Mail:
     prefix = "【卖出信号·再次提醒】" if reminder else "【卖出信号】"
     subject = f"{prefix}{day} {len(manual)} 只"
     sections = [
-        _Section(MANUAL_HEADING, [_sell_card(v, True) for v in manual]),
-        _Section(SYSTEM_HEADING, [_sell_card(v, False) for v in system]),
+        _Section(MANUAL_HEADING, [_sell_card(v, to_email) for v in manual]),
+        _Section(SYSTEM_HEADING, [_sell_card(v, None) for v in system]),
     ]
     intro = f"按你设定的规则计算，{day} 收盘后以下持仓触发卖出条件。"
     if reminder:

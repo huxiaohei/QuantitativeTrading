@@ -48,7 +48,7 @@ def _describe_error(exc: Exception) -> str:
     """错误文本：带类型、限长，并抹掉环境里的 SMTP 密码。"""
     text = f"{type(exc).__name__}: {exc}"
     password = os.environ.get("SMTP_PASSWORD", "")
-    if password:
+    if password:  # 密码为空时 replace 会在每个字符间插入星号，必须跳过
         text = text.replace(password, "***")
     return text[:_MAX_ERROR_CHARS]
 

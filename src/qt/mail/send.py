@@ -5,6 +5,7 @@
 
 import os
 import smtplib
+import ssl
 import time
 import uuid
 from email.message import EmailMessage
@@ -45,13 +46,17 @@ class SmtpSender:
 
     def send(self, to_addr: str, subject: str, html: str, text: str) -> None:
         msg = build_message(self._from, to_addr, subject, html, text)
+        # 默认上下文校验服务器证书与主机名，密码不会走在未验证的通道上
+        context = ssl.create_default_context()
         if self._port == _SSL_PORT:
-            with smtplib.SMTP_SSL(self._host, self._port, timeout=_SMTP_TIMEOUT_SECONDS) as smtp:
+            with smtplib.SMTP_SSL(
+                self._host, self._port, timeout=_SMTP_TIMEOUT_SECONDS, context=context
+            ) as smtp:
                 smtp.login(self._user, self._password)
                 smtp.send_message(msg)
         else:
             with smtplib.SMTP(self._host, self._port, timeout=_SMTP_TIMEOUT_SECONDS) as smtp:
-                smtp.starttls()
+                smtp.starttls(context=context)
                 smtp.login(self._user, self._password)
                 smtp.send_message(msg)
 

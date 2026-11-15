@@ -1,5 +1,6 @@
 """邮件渲染：标题、固定文案、转义、免责声明。"""
 
+from collections.abc import Callable
 from datetime import date
 
 import pytest
@@ -20,6 +21,7 @@ from qt.mail.render import (
 )
 
 DAY = date(2026, 11, 16)
+EMAIL = "u@example.com"
 DISCLAIMER = (
     "以上内容是按你设定的规则计算的结果，不构成投资建议。历史回测不代表未来收益，盈亏自负。"
 )
@@ -88,7 +90,7 @@ def _no_banned(m: Mail) -> None:
 
 
 def test_buy_signal_mail_content() -> None:
-    m = render_buy_signals(DAY, [_buy()], [_buy("600002", "系统股份")], BOOKS)
+    m = render_buy_signals(DAY, [_buy()], [_buy("600002", "系统股份")], BOOKS, to_email=EMAIL)
     assert m.subject == "【买入信号】2026-11-16 1 只"
     _both(
         m,
@@ -116,7 +118,7 @@ def test_buy_signal_mail_content() -> None:
 
 
 def test_buy_signal_without_stop_or_take_price_shows_dash() -> None:
-    m = render_buy_signals(DAY, [_buy(stop_price=None, take_price=None)], [], BOOKS)
+    m = render_buy_signals(DAY, [_buy(stop_price=None, take_price=None)], [], BOOKS, to_email=EMAIL)
     assert "止损位：—" in m.text
     assert "止盈位：—" in m.text
 
@@ -124,27 +126,25 @@ def test_buy_signal_without_stop_or_take_price_shows_dash() -> None:
 @pytest.mark.parametrize(
     "mail_factory",
     [
-        lambda: render_buy_signals(DAY, [_buy()], [], BOOKS),
-        lambda: render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=False),
-        lambda: render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=True),
+        lambda: render_buy_signals(DAY, [_buy()], [], BOOKS, to_email=EMAIL),
+        lambda: render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=False, to_email=EMAIL),
+        lambda: render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=True, to_email=EMAIL),
         lambda: render_abandon_reminder(DAY, [_buy()]),
         lambda: render_weekly(DAY, _weekly()),
         lambda: render_risk_alert(DAY, _risk("drawdown_warning"), BOOKS),
     ],
 )
-def test_signal_type_mails_end_with_disclaimer(mail_factory: object) -> None:
-    assert callable(mail_factory)
+def test_signal_type_mails_end_with_disclaimer(mail_factory: Callable[[], Mail]) -> None:
     m = mail_factory()
-    assert isinstance(m, Mail)
     assert m.text.rstrip().endswith(DISCLAIMER)
     assert DISCLAIMER in m.html
     _no_banned(m)
 
 
 def test_sell_reminder_subject_and_reason_label() -> None:
-    first = render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=False)
+    first = render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=False, to_email=EMAIL)
     assert first.subject == "【卖出信号】2026-11-16 1 只"
-    again = render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=True)
+    again = render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=True, to_email=EMAIL)
     assert again.subject.startswith("【卖出信号·再次提醒】")
     assert again.subject == "【卖出信号·再次提醒】2026-11-16 1 只"
     labels = {
@@ -156,9 +156,11 @@ def test_sell_reminder_subject_and_reason_label() -> None:
         "delisted": "已退市",
     }
     for reason, label in labels.items():
-        m = render_sell_signals(DAY, [_sell(reason)], [], BOOKS, reminder=False)
+        m = render_sell_signals(DAY, [_sell(reason)], [], BOOKS, reminder=False, to_email=EMAIL)
         _both(m, label)
-    m = render_sell_signals(DAY, [_sell()], [_sell(symbol="600009")], BOOKS, reminder=False)
+    m = render_sell_signals(
+        DAY, [_sell()], [_sell(symbol="600009")], BOOKS, reminder=False, to_email=EMAIL
+    )
     _both(m, "手动账（请据此操作）", "系统账（自动执行，仅供对照）", "qt admin trade sell")
     assert m.html.index("手动账") < m.html.index("系统账")
 
@@ -167,7 +169,9 @@ def test_all_exit_reasons_have_labels() -> None:
     from qt.models import ExitReason
 
     for reason in ExitReason:
-        m = render_sell_signals(DAY, [_sell(reason.value)], [], BOOKS, reminder=False)
+        m = render_sell_signals(
+            DAY, [_sell(reason.value)], [], BOOKS, reminder=False, to_email=EMAIL
+        )
         assert reason.value not in m.text
 
 
@@ -222,8 +226,19 @@ def _weekly() -> WeeklyView:
 def test_weekly_mail() -> None:
     m = render_weekly(date(2026, 11, 13), _weekly())
     assert m.subject == "【周报】2026-11-13"
-    _both(m, "手动账", "系统账", "600001", "示例股份", "+1.20%", "-0.40%", "+0.80%", "+7.14%")
-    _both(m, "11-10 买入信号", "11-11 买入 600001")
+    _both(m, "600001", "示例股份", "11-10 买入信号", "11-11 买入 600001")
+    for line in (
+        "手动账：净值 102,345.60，本周 +1.20%",
+        "系统账：净值 101,000.00，本周 -0.40%",
+        "基准本周：+0.80%",
+        "浮动盈亏：+7.14%",
+        "成本：9.80",
+        "现价：10.50",
+    ):
+        assert line in m.text, line
+    for fragment in ("+1.20%", "-0.40%", "+0.80%", "+7.14%", "102,345.60", "101,000.00"):
+        assert fragment in m.html, fragment
+    assert m.text.rstrip().endswith(DISCLAIMER)
 
 
 def test_weekly_without_benchmark() -> None:
@@ -244,7 +259,7 @@ def test_admin_alert_has_no_disclaimer() -> None:
 
 def test_html_escapes_user_derived_strings() -> None:
     evil = '<script>alert("x")</script>'
-    m = render_buy_signals(DAY, [_buy(name=evil, reason=evil)], [], BOOKS)
+    m = render_buy_signals(DAY, [_buy(name=evil, reason=evil)], [], BOOKS, to_email=EMAIL)
     assert evil not in m.html
     assert "&lt;script&gt;" in m.html
     assert evil in m.text  # 纯文本不转义
@@ -259,6 +274,17 @@ def test_html_escapes_user_derived_strings() -> None:
 
 
 def test_empty_manual_section_still_renders() -> None:
-    m = render_buy_signals(DAY, [], [_buy()], BOOKS)
+    m = render_buy_signals(DAY, [], [_buy()], BOOKS, to_email=EMAIL)
     assert "手动账（请据此操作）" in m.text
     assert "（无）" in m.text
+
+
+def test_entry_command_is_exact_cli_shape() -> None:
+    buy = render_buy_signals(DAY, [_buy()], [_buy("600002")], BOOKS, to_email=EMAIL)
+    cmd = "qt admin trade buy --email u@example.com 600001 --price <实际成交价> --shares 1000"
+    assert cmd in buy.text
+    assert cmd.replace("<", "&lt;").replace(">", "&gt;") in buy.html
+    assert buy.text.count("qt admin trade") == 1  # 系统账不带录入命令
+    sell = render_sell_signals(DAY, [_sell()], [], BOOKS, reminder=False, to_email=EMAIL)
+    sell_cmd = "qt admin trade sell --email u@example.com 600001 --price <实际成交价> --shares 1000"
+    assert sell_cmd in sell.text

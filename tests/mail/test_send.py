@@ -3,6 +3,7 @@
 import email
 import email.message
 import email.policy
+import ssl
 from pathlib import Path
 from types import TracebackType
 from typing import ClassVar, Self
@@ -51,8 +52,16 @@ class FakeSmtp:
 
     instances: ClassVar[list["FakeSmtp"]] = []
 
-    def __init__(self, host: str, port: int, timeout: float | None = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
         self.host, self.port = host, port
+        self.context = context
+        self.starttls_context: ssl.SSLContext | None = None
         self.calls: list[str] = []
         self.login_args: tuple[str, str] | None = None
         self.sent: list[email.message.EmailMessage] = []
@@ -69,8 +78,9 @@ class FakeSmtp:
     ) -> None:
         return None
 
-    def starttls(self) -> None:
+    def starttls(self, context: ssl.SSLContext | None = None) -> None:
         self.calls.append("starttls")
+        self.starttls_context = context
 
     def login(self, user: str, password: str) -> None:
         self.calls.append("login")
@@ -161,3 +171,19 @@ def test_make_sender_unknown_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MAIL_BACKEND", "carrier-pigeon")
     with pytest.raises(RuntimeError, match="MAIL_BACKEND"):
         make_sender()
+
+
+def _assert_verifying(context: ssl.SSLContext | None) -> None:
+    assert context is not None
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+
+
+def test_smtp_ssl_passes_verifying_context(fake_smtp: type[FakeSmtp]) -> None:
+    SmtpSender("smtp.x.com", 465, "u", "pw", "from@x.com").send("to@x.com", "s", "<p>h</p>", "t")
+    _assert_verifying(fake_smtp.instances[0].context)
+
+
+def test_smtp_starttls_passes_verifying_context(fake_smtp: type[FakeSmtp]) -> None:
+    SmtpSender("smtp.x.com", 587, "u", "pw", "from@x.com").send("to@x.com", "s", "<p>h</p>", "t")
+    _assert_verifying(fake_smtp.instances[0].starttls_context)

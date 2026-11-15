@@ -142,3 +142,13 @@ def test_send_pending_error_text_does_not_leak_password(
     send_pending(db, sender)
     err = _row(db, "k1").last_error
     assert err is not None and "login failed" in err and "s3cr3t-pw" not in err
+
+
+def test_empty_smtp_password_does_not_mangle_error(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SMTP_PASSWORD", "")
+    _put(db, "k1")
+    db.commit()
+    send_pending(db, FlakySender(fail_times=1, error=lambda: RuntimeError("boom")))
+    assert _row(db, "k1").last_error == "RuntimeError: boom"
