@@ -16,6 +16,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
+from itertools import pairwise
 from typing import Protocol
 
 from qt.calendar import TradingCalendar
@@ -23,7 +24,7 @@ from qt.config import RiskConfig
 from qt.costs import LOT_SIZE, CostModel
 from qt.models import ExitReason, Position
 from qt.risk import RiskEvent, RiskManager, RiskState
-from qt.service.errors import ValidationError
+from qt.service.errors import LedgerInconsistentError, ValidationError
 
 # 股数与金额的浮点容差
 _EPS = 1e-6
@@ -298,7 +299,9 @@ class _Replayer:
         """转入持仓：不动现金，按使用者成本建仓并补算持有天数与最高收益；返回当日收盘市值。"""
         symbol = _symbol(e)
         if symbol in self.positions:
-            raise _LedgerProblem("other", f"{day} 转入 {symbol} 时它已在持仓中，不能重复转入")
+            raise _LedgerProblem(
+                "other", f"{day} 转入 {symbol} 时它已在持仓中，不能重复转入，请改为录入买入"
+            )
         self.positions[symbol] = Position(
             symbol=symbol,
             shares=e.shares,
@@ -313,30 +316,23 @@ class _Replayer:
         return e.shares * self.market.last_close(day, symbol)
 
     def _backfill_peak(self, day: date, e: Entry) -> float:
-        """用买入日到当日的收盘价与期间分红送转补算最高收益。
+        """用买入日到当日的收盘价补算最高收益（只看价格）。
 
-        使用者填写的股数视为当日的持股：先按期间送转倒推出买入日的股数，再逐日向前推进；
-        期间现金分红只用于计算收益，不进这本账的现金。
+        使用者填写的股数视为当日的持股：按期间送转倒推出各日的持股再乘收盘价。
+        转入前的现金分红不计入，与转入持仓的 cash_received 从 0 开始保持一致。
         """
         symbol = _symbol(e)
         cost = e.price * e.shares
+        period = self.calendar.between(e.trade_day, day)
         growth = 1.0
-        prev: date | None = None
-        for d in self.calendar.between(e.trade_day, day):
-            if prev is not None:
-                growth *= 1 + self.dividends_in(symbol, prev, d)[1]
-            prev = d
+        for prev, d in pairwise(period):
+            growth *= 1 + self.dividends_in(symbol, prev, d)[1]
         shares = e.shares / growth
-        cash = 0.0
         peak = 0.0
-        prev = None
-        for d in self.calendar.between(e.trade_day, day):
-            if prev is not None:
-                cash_ps, bonus_ps = self.dividends_in(symbol, prev, d)
-                cash += shares * cash_ps
-                shares += shares * bonus_ps
-            peak = max(peak, (shares * self.market.last_close(d, symbol) + cash) / cost - 1)
-            prev = d
+        for i, d in enumerate(period):
+            if i > 0:
+                shares *= 1 + self.dividends_in(symbol, period[i - 1], d)[1]
+            peak = max(peak, shares * self.market.last_close(d, symbol) / cost - 1)
         return peak
 
     def _mark_to_market(self, day: date, fresh: set[str]) -> float:
@@ -449,6 +445,10 @@ def _check_fields(
     day = new.trade_day
     if day > today:
         raise ValidationError(f"日期 {day} 不能晚于今天（{today}）")
+    if kind is EntryKind.TRANSFER_IN and day < calendar.first_day:
+        raise ValidationError(
+            f"转入的买入日期 {day} 早于行情数据的起点，最早可填 {calendar.first_day}"
+        )
     if not calendar.is_trading_day(day):
         raise ValidationError(f"{day} 不是交易日")
     if kind is not EntryKind.TRANSFER_IN:
@@ -472,14 +472,23 @@ def _check_fields(
         raise ValidationError("金额必须为正")
     if not new.fees >= 0:
         raise ValidationError("费用不能为负")
-    if kind is EntryKind.TRANSFER_IN and (
-        new.effective_day < day or not calendar.is_trading_day(new.effective_day)
-    ):
-        raise ValidationError(f"转入的生效日 {new.effective_day} 必须是不早于买入日 {day} 的交易日")
-    if kind in (EntryKind.BUY, EntryKind.TRANSFER_IN) and market.delisted_before(
-        day, str(new.symbol)
-    ):
-        raise ValidationError(f"{new.symbol} 在 {day} 之前已退市，不能买入或转入")
+    if kind is EntryKind.TRANSFER_IN:
+        _check_transfer_effective_day(new, calendar, today)
+    symbol = new.symbol
+    buying = kind in (EntryKind.BUY, EntryKind.TRANSFER_IN)
+    if buying and symbol is not None and market.delisted_before(new.apply_day, symbol):
+        raise ValidationError(f"{symbol} 在 {new.apply_day} 之前已退市，不能买入或转入")
+
+
+def _check_transfer_effective_day(new: Entry, calendar: TradingCalendar, today: date) -> None:
+    """转入的生效日：不早于买入日的交易日，且不晚于今天起（含）的第一个交易日。"""
+    upcoming = calendar.between(today, date.max)[:1]
+    latest = upcoming[0] if upcoming else today
+    eff = new.effective_day
+    if eff < new.trade_day or eff > latest or not calendar.is_trading_day(eff):
+        raise ValidationError(
+            f"转入的生效日 {eff} 必须是不早于买入日 {new.trade_day}、不晚于 {latest} 的交易日"
+        )
 
 
 def validate_entry(
@@ -499,15 +508,27 @@ def validate_entry(
     """校验一条待追加的流水，不合法时抛 ValidationError（消息可直接展示给使用者）。
 
     entries 为账本现有的全部流水（按 id 升序）。除逐项检查外，把新流水追加到末尾后从账本
-    起始日重放到今天：任何一天出现超卖或现金为负都拒绝。这样同时覆盖"卖出不超过当日持仓"
-    "出金不超过当日现金"、回溯录入让之后某笔卖出超卖、以及作废后出现负持仓或负现金。
+    起始日重放到"今天与全部流水生效日中较晚者"：任何一天出现超卖、现金为负、转入时已持有
+    都拒绝。这样同时覆盖"卖出不超过当日持仓""出金不超过当日现金"、回溯录入让之后某笔卖出
+    超卖、作废后出现负持仓或负现金，以及与尚未生效的转入冲突。
+    现有流水在不加新流水时就已不一致，抛 LedgerInconsistentError（不归咎于本次录入）。
     """
     if new.kind is EntryKind.VOID:
         _check_void(entries, new)
     else:
         _check_fields(new, market, calendar, start_day, today, backdate_limit_days, known_symbols)
+    # 重放到今天与所有已录入流水（含尚未生效的转入）生效日中的较晚者
+    voided = {e.voids_entry_id for e in [*entries, new] if e.kind is EntryKind.VOID}
+    live = [e for e in [*entries, new] if e.kind is not EntryKind.VOID and e.id not in voided]
+    through = max([today, *(e.apply_day for e in live)])
     try:
-        _replay([*entries, new], market, calendar, risk_cfg, costs, start_cash, start_day, today)
+        _replay(entries, market, calendar, risk_cfg, costs, start_cash, start_day, through)
+    except _LedgerProblem as p:
+        raise LedgerInconsistentError(
+            f"账本现有流水已不一致（与本次录入无关），请联系管理员：{p.message}"
+        ) from p
+    try:
+        _replay([*entries, new], market, calendar, risk_cfg, costs, start_cash, start_day, through)
     except _LedgerProblem as p:
         if new.kind is not EntryKind.VOID:
             raise ValidationError(p.message) from p

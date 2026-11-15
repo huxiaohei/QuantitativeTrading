@@ -12,6 +12,13 @@ class TradingCalendar:
         self._days: list[date] = sorted(set(days))
         self._set: frozenset[date] = frozenset(self._days)
 
+    @property
+    def first_day(self) -> date:
+        """日历中最早的交易日；空日历抛 ValueError。"""
+        if not self._days:
+            raise ValueError("交易日历为空")
+        return self._days[0]
+
     def is_trading_day(self, day: date) -> bool:
         """是否为交易日。"""
         return day in self._set

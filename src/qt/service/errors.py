@@ -7,3 +7,7 @@ class NotFoundError(Exception):
 
 class ValidationError(Exception):
     """输入不合法或当前状态不允许该操作。"""
+
+
+class LedgerInconsistentError(Exception):
+    """账本现有流水本身已不一致（系统问题，不是本次输入的错），需要管理员处理。"""

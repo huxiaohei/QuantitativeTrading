@@ -10,7 +10,7 @@ from qt.calendar import TradingCalendar
 from qt.costs import CostModel
 from qt.models import ExitReason
 from qt.risk import RiskEventKind
-from qt.service.errors import ValidationError
+from qt.service.errors import LedgerInconsistentError, ValidationError
 from qt.service.manual_book import (
     CorporateAction,
     Entry,
@@ -227,15 +227,16 @@ def test_transfer_in_days_held_keeps_counting_after_effective_day() -> None:
     assert st.positions[S2].days_held == 33
 
 
-def test_transfer_in_peak_return_backfill_counts_dividends_in_period() -> None:
+def test_transfer_in_peak_return_backfill_excludes_pre_transfer_cash_dividends() -> None:
     m = FakeMarket()
     bought = DAYS[B - 10]
     m.set_price(S2, bought, 8.0)
     m.add_dividend(S2, DAYS[B - 5], 1.0)
     m.set_price(S2, DAYS[B - 3], 10.0)
     st = run([transfer(1, bought, D1, 1000, 8.0)], m, D1)
-    # 10.00 收盘 + 每股 1.00 分红：(10000 + 1000) / 8000 - 1
-    assert st.positions[S2].peak_return == pytest.approx(0.375)
+    # 只看价格：10.00 / 8.00 - 1；转入前的现金分红不计（与 cash_received 从 0 开始一致）
+    assert st.positions[S2].peak_return == pytest.approx(0.25)
+    assert st.positions[S2].ret(10.0) == pytest.approx(st.positions[S2].peak_return)
     assert st.cash == pytest.approx(START)  # 转入之前的分红不进这本账的现金
 
 
@@ -382,8 +383,16 @@ def _saturday_before(day: date) -> date:
     return d
 
 
+# 周六录入：转入的生效日为下周一
+WEEKEND = DAYS[B + 44] + timedelta(days=1)
+NEXT = DAYS[B + 45]
+
+
 def _check(
-    new: Entry, market: FakeMarket | None = None, ledger: Sequence[Entry] = tuple(LEDGER)
+    new: Entry,
+    market: FakeMarket | None = None,
+    ledger: Sequence[Entry] = tuple(LEDGER),
+    today: date = TODAY,
 ) -> None:
     validate_entry(
         ledger,
@@ -394,7 +403,7 @@ def _check(
         COSTS,
         START,
         D1,
-        today=TODAY,
+        today=today,
         backdate_limit_days=10,
         known_symbols=KNOWN,
     )
@@ -420,6 +429,7 @@ def _check(
         (sell(9, DAYS[B + 33], 600, 11.0), "超过持仓"),  # 当日够卖，但让之后那笔卖出超卖
         (buy(9, TODAY, 100_000, 10.0), "超过现金"),
         (transfer(9, DAYS[B + 41], DAYS[B + 41], 1000, 8.0), "不能晚于今天"),
+        (transfer(9, DAYS[B - 3], DAYS[B + 42], 1000, 8.0), "生效日"),
         (transfer(9, DAYS[B - 3], DAYS[B + 33], 1000, 8.0, symbol=S1), "已在持仓中"),
     ],
 )
@@ -450,5 +460,38 @@ def test_validate_entry_accepts_valid_entries() -> None:
 
 
 def test_transfer_in_may_have_any_past_buy_date() -> None:
-    _check(transfer(9, DAYS[B - 750], DAYS[B + 41], 1000, 8.0))  # 3 年前买入，下一交易日生效
+    # 3 年前买入，周六录入、下周一生效
+    _check(transfer(9, DAYS[B - 750], NEXT, 1000, 8.0), today=WEEKEND)
     _check(transfer(9, DAYS[B - 750], TODAY, 1000, 8.0))
+
+
+def test_transfer_in_rejected_when_symbol_held_at_future_effective_day() -> None:
+    ledger = [*LEDGER, buy(5, DAYS[B + 44], 100, 10.0, symbol=S2)]
+    with pytest.raises(ValidationError, match="已在持仓中"):
+        _check(transfer(9, DAYS[B - 3], NEXT, 1000, 8.0), ledger=ledger, today=WEEKEND)
+
+
+def test_buy_rejected_when_pending_future_transfer_of_same_symbol() -> None:
+    ledger = [*LEDGER, transfer(5, DAYS[B - 3], NEXT, 1000, 8.0)]
+    friday = DAYS[B + 44]
+    _check(buy(9, friday, 100, 10.0), ledger=ledger, today=WEEKEND)  # 其他股票不受影响
+    with pytest.raises(ValidationError, match="已在持仓中"):
+        _check(buy(9, friday, 100, 10.0, symbol=S2), ledger=ledger, today=WEEKEND)
+
+
+def test_transfer_in_delisting_checked_at_effective_day() -> None:
+    m = FakeMarket()
+    m.delist(S2, DAYS[B - 50])  # 买入在退市之前，但生效日已退市
+    with pytest.raises(ValidationError, match="已退市"):
+        _check(transfer(9, DAYS[B - 100], TODAY, 1000, 8.0), m)
+
+
+def test_transfer_in_buy_date_before_calendar_start_names_earliest_date() -> None:
+    with pytest.raises(ValidationError, match=f"最早可填 {DAYS[0]}"):
+        _check(transfer(9, DAYS[0] - timedelta(days=7), TODAY, 1000, 8.0))
+
+
+def test_inconsistent_existing_ledger_is_not_blamed_on_new_entry() -> None:
+    broken = [buy(1, DAYS[B + 30], 100, 10.0), sell(2, DAYS[B + 31], 200, 10.0)]
+    with pytest.raises(LedgerInconsistentError, match="现有流水"):
+        _check(deposit(9, TODAY, 1_000.0), ledger=broken)
