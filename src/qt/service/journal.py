@@ -14,8 +14,9 @@ from qt.calendar import TradingCalendar
 from qt.db import admin_repo
 from qt.db.models import Book, Followup, Rejection, Signal, Trade
 
-# followups 表的固定列：跟踪天数 -> 列名
-_COLUMNS = {20: "ret_20", 60: "ret_60"}
+# 只回填最近这么多个交易日（跟踪天数最大值再加这个数）内的事件，更早还空着的不再查
+_FILL_SLACK_DAYS = 30
+_HORIZONS = (20, 60)  # followups 表只有 ret_20、ret_60 两列
 
 
 class AdjMarket(Protocol):
@@ -34,58 +35,77 @@ class AdjMarket(Protocol):
         ...
 
 
-def open_followups(s: Session, book: Book, day: date, market: AdjMarket) -> int:
-    """为这本账在 day 发生的事件各建一条跟踪记录，返回新建条数；重复调用不会重复建。
+def _window_start(calendar: TradingCalendar, day: date, n: int) -> date:
+    """截至 day（含）最近 n 个交易日的第一天；日历不够长时取日历第一天。"""
+    if calendar.count_between(calendar.first_day, day) + 1 <= n:
+        return calendar.first_day
+    return calendar.offset(day, -(n - 1))
 
-    事件：当日卖出的交易（exit）、当晚变为放弃的买入信号（abandoned）、当日首次被否决的候选
-    （rejected）。事件日及之前没有任何复权收盘价的股票不建。只 flush，不提交。
+
+def open_followups(
+    s: Session,
+    book: Book,
+    day: date,
+    market: AdjMarket,
+    calendar: TradingCalendar,
+    lookback_days: int,
+) -> int:
+    """为这本账在回看窗口内发生、还没有记录的事件各建一条跟踪记录，返回新建条数。
+
+    窗口是截至 day（含）最近 lookback_days 个交易日，补上晚录入、补录过去日期的卖出与跑漏的晚上。
+    事件：卖出的交易（exit）、变为放弃的买入信号（abandoned）、首次被否决的候选（rejected），
+    事件日取交易的卖出日、信号的状态日、否决的首日。基准价为事件日的最后一个复权收盘价，
+    事件日及之前没有任何复权收盘价的不建。重复调用不会重复建。只 flush，不提交。
     """
-    events: list[tuple[str, str]] = []
+    start = _window_start(calendar, day, lookback_days)
+    events: list[tuple[str, str, date]] = []
     events += [
-        ("exit", t.symbol)
+        ("exit", t.symbol, t.exit_day)
         for t in s.scalars(
             select(Trade).where(
-                Trade.book_id == book.id, Trade.user_id == book.user_id, Trade.exit_day == day
+                Trade.book_id == book.id,
+                Trade.user_id == book.user_id,
+                Trade.exit_day.between(start, day),
             )
         )
     ]
     events += [
-        ("abandoned", g.symbol)
+        ("abandoned", g.symbol, g.status_day)
         for g in s.scalars(
             select(Signal).where(
                 Signal.book_id == book.id,
                 Signal.user_id == book.user_id,
                 Signal.side == "buy",
                 Signal.status == "abandoned",
-                Signal.status_day == day,
+                Signal.status_day.between(start, day),
             )
         )
     ]
     events += [
-        ("rejected", r.symbol)
+        ("rejected", r.symbol, r.first_day)
         for r in s.scalars(
             select(Rejection).where(
                 Rejection.book_id == book.id,
                 Rejection.user_id == book.user_id,
-                Rejection.first_day == day,
+                Rejection.first_day.between(start, day),
             )
         )
     ]
     existing = {
-        (f.event, f.symbol)
+        (f.event, f.symbol, f.event_day)
         for f in s.scalars(
             select(Followup).where(
                 Followup.book_id == book.id,
                 Followup.user_id == book.user_id,
-                Followup.event_day == day,
+                Followup.event_day.between(start, day),
             )
         )
     }
     created = 0
-    for event, symbol in dict.fromkeys(events):  # 去重并保持顺序
-        if (event, symbol) in existing:
+    for event, symbol, event_day in dict.fromkeys(events):  # 去重并保持顺序
+        if (event, symbol, event_day) in existing:
             continue
-        base = market.last_adj_close(day, symbol)
+        base = market.last_adj_close(event_day, symbol)
         if base is None or base <= 0:
             continue
         s.add(
@@ -94,7 +114,7 @@ def open_followups(s: Session, book: Book, day: date, market: AdjMarket) -> int:
                 user_id=book.user_id,
                 symbol=symbol,
                 event=event,
-                event_day=day,
+                event_day=event_day,
                 base_adj_close=base,
             )
         )
@@ -116,20 +136,19 @@ def fill_followups(
     该日也还没到就等。已退市（存储里到期日及之后再没有价格）的格子留空。只 flush，不提交。
     """
     for h in horizons:
-        if h not in _COLUMNS:
-            raise ValueError(f"跟踪天数只支持 {sorted(_COLUMNS)}，收到 {h}")
+        if h not in _HORIZONS:
+            raise ValueError(f"跟踪天数只支持 {list(_HORIZONS)}，收到 {h}")
+    if not horizons:
+        return 0
+    since = _window_start(calendar, day, max(horizons) + _FILL_SLACK_DAYS)
     filled = 0
-    for f in admin_repo.list_unfilled_followups(s, day):
+    for f in admin_repo.list_unfilled_followups(s, since, day):
         for h in horizons:
-            column = _COLUMNS[h]
-            if getattr(f, column) is not None:
+            if (f.ret_20 if h == 20 else f.ret_60) is not None:
                 continue
-            try:
-                due = calendar.offset(f.event_day, h)
-            except ValueError:
-                continue  # 日历还没排到那一天
-            if due > day:
-                continue
+            if calendar.count_between(f.event_day, day) < h:
+                continue  # 第 h 个交易日还没到（日历也还没排到）
+            due = calendar.offset(f.event_day, h)
             last = market.last_adj_day(f.symbol)
             if last is None or last < due:
                 continue  # 已退市（或数据未到）：留空
@@ -143,7 +162,11 @@ def fill_followups(
             )
             if price is None:
                 continue
-            setattr(f, column, price / f.base_adj_close - 1)
+            ret = price / f.base_adj_close - 1
+            if h == 20:
+                f.ret_20 = ret
+            else:
+                f.ret_60 = ret
             filled += 1
     s.flush()
     return filled

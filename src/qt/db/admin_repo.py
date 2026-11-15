@@ -24,12 +24,14 @@ def list_active_subscriptions(s: Session) -> list[Subscription]:
     return list(s.scalars(stmt))
 
 
-def list_unfilled_followups(s: Session, before: date) -> list[Followup]:
-    """事件日早于 before、且 20 日或 60 日收益还没填的跟踪记录（全部使用者），按编号排序。"""
+def list_unfilled_followups(s: Session, since: date, before: date) -> list[Followup]:
+    """事件日在 [since, before) 内、20 日或 60 日收益还没填的跟踪记录（全部使用者），按编号排序。"""
     stmt = (
         select(Followup)
         .where(
-            Followup.event_day < before, or_(Followup.ret_20.is_(None), Followup.ret_60.is_(None))
+            Followup.event_day >= since,
+            Followup.event_day < before,
+            or_(Followup.ret_20.is_(None), Followup.ret_60.is_(None)),
         )
         .order_by(Followup.id)
     )

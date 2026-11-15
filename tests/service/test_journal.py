@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig, load_config
 from qt.data.store import ParquetStore
-from qt.db import repo
+from qt.db import admin_repo, repo
 from qt.db.models import Book, Followup, Signal, Subscription, Trade
 from qt.db.models import Rejection as RejectionRow
 from qt.features import build_panel
@@ -163,7 +163,7 @@ def _seed_events(db: Session, w: World, book: Book) -> None:
 def test_followup_created_for_exit_abandoned_and_first_rejection(db: Session, world: World) -> None:
     book = _book(db)
     _seed_events(db, world, book)
-    assert open_followups(db, book, world.days[EVENT], world.market) == 3
+    assert open_followups(db, book, world.days[EVENT], world.market, world.calendar, 1) == 3
     followups = _followups(db)
     assert {(f.event, f.symbol) for f in followups} == {
         ("exit", "600002"),
@@ -179,15 +179,15 @@ def test_followup_not_duplicated_on_rerun_or_repeated_rejection(db: Session, wor
     book = _book(db)
     _seed_events(db, world, book)
     day = world.days[EVENT]
-    assert open_followups(db, book, day, world.market) == 3
-    assert open_followups(db, book, day, world.market) == 0
+    assert open_followups(db, book, day, world.market, world.calendar, 1) == 3
+    assert open_followups(db, book, day, world.market, world.calendar, 1) == 0
     db.commit()
     assert len(_followups(db)) == 3
     # 同一只股票后来又被否决：合并进原事件（只延长 last_day），首日不是当日，不新建
     for r in db.scalars(select(RejectionRow).where(RejectionRow.symbol == "600004")):
         r.last_day = world.days[EVENT + 5]
     db.flush()
-    assert open_followups(db, book, world.days[EVENT + 5], world.market) == 0
+    assert open_followups(db, book, world.days[EVENT + 5], world.market, world.calendar, 5) == 0
     assert len(_followups(db)) == 3
 
 
@@ -199,8 +199,8 @@ def test_followup_base_uses_last_price_when_suspended_and_skips_without_price(
     _trade(db, book, "600003", d[EVENT + 20])  # 当日停牌：取此前最后一个复权价
     _trade(db, book, "600005", d[EVENT])  # 此前一个价格都没有
     db.commit()
-    assert open_followups(db, book, d[EVENT + 20], world.market) == 1
-    assert open_followups(db, book, d[EVENT], world.market) == 0
+    assert open_followups(db, book, d[EVENT + 20], world.market, world.calendar, 1) == 1
+    assert open_followups(db, book, d[EVENT], world.market, world.calendar, 1) == 0
     [f] = _followups(db)
     assert (f.symbol, f.event_day, f.base_adj_close) == ("600003", d[EVENT + 20], 10.0)
 
@@ -215,7 +215,7 @@ def _opened(
     }
     add[event]()
     db.commit()
-    open_followups(db, book, w.days[EVENT], w.market)
+    open_followups(db, book, w.days[EVENT], w.market, w.calendar, 1)
     db.commit()
     return _followups(db)[-1]
 
@@ -275,3 +275,30 @@ def test_store_market_adj_close(world: World) -> None:
     assert m.adj_close(d[EVENT + 20], "600003") is None  # 停牌
     assert m.adj_close(date(2024, 1, 6), "600002") is None  # 非交易日
     assert m.adj_close(d[0], "999999") is None
+
+
+def test_late_recorded_exit_gets_followup_with_real_exit_day_and_window_is_bounded(
+    db: Session, world: World
+) -> None:
+    book = _book(db)
+    d, m, cal = world.days, world.market, world.calendar
+    _trade(db, book, "600002", d[EVENT - 1])  # 前一晚的卖出，今晚才录入
+    _trade(db, book, "600003", d[EVENT - 9])  # 窗口（5 个交易日）之外
+    db.commit()
+    assert open_followups(db, book, d[EVENT], m, cal, 5) == 1
+    [f] = _followups(db)
+    assert (f.event, f.symbol, f.event_day) == ("exit", "600002", d[EVENT - 1])
+    assert open_followups(db, book, d[EVENT], m, cal, 5) == 0  # 重跑不新建
+    assert open_followups(db, book, d[EVENT + 1], m, cal, 5) == 0  # 次晚窗口重叠也不重复
+    assert len(_followups(db)) == 1
+
+
+def test_old_unfilled_followups_are_not_listed_forever(db: Session, world: World) -> None:
+    f = _opened(db, world, "600004", "rejected")  # 退市，永远填不上
+    d, cal, m = world.days, world.calendar, world.market
+    assert fill_followups(db, cal, m, d[EVENT + 20 + 30], [20]) == 0  # 窗口内仍会查
+    assert fill_followups(db, cal, m, d[EVENT + 20 + 31], [20]) == 0  # 超出窗口：不再查
+    db.refresh(f)
+    assert f.ret_20 is None
+    assert admin_repo.list_unfilled_followups(db, d[EVENT + 1], d[EVENT + 90]) == []
+    assert admin_repo.list_unfilled_followups(db, d[EVENT], d[EVENT + 90]) == [f]
