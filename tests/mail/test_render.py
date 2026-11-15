@@ -94,7 +94,7 @@ def test_buy_signal_mail_content() -> None:
     assert m.subject == "【买入信号】2026-11-16 1 只"
     _both(
         m,
-        "手动账（请据此操作）",
+        "手动账（你的实际账户，信号以此为准）",
         "系统账（自动执行，仅供对照）",
         "600001",
         "示例股份",
@@ -161,7 +161,12 @@ def test_sell_reminder_subject_and_reason_label() -> None:
     m = render_sell_signals(
         DAY, [_sell()], [_sell(symbol="600009")], BOOKS, reminder=False, to_email=EMAIL
     )
-    _both(m, "手动账（请据此操作）", "系统账（自动执行，仅供对照）", "qt admin trade sell")
+    _both(
+        m,
+        "手动账（你的实际账户，信号以此为准）",
+        "系统账（自动执行，仅供对照）",
+        "qt admin trade sell",
+    )
     assert m.html.index("手动账") < m.html.index("系统账")
 
 
@@ -275,7 +280,7 @@ def test_html_escapes_user_derived_strings() -> None:
 
 def test_empty_manual_section_still_renders() -> None:
     m = render_buy_signals(DAY, [], [_buy()], BOOKS, to_email=EMAIL)
-    assert "手动账（请据此操作）" in m.text
+    assert "手动账（你的实际账户，信号以此为准）" in m.text
     assert "（无）" in m.text
 
 

@@ -15,7 +15,7 @@ from jinja2 import Environment, PackageLoader
 DISCLAIMER = (
     "以上内容是按你设定的规则计算的结果，不构成投资建议。历史回测不代表未来收益，盈亏自负。"
 )
-MANUAL_HEADING = "手动账（请据此操作）"
+MANUAL_HEADING = "手动账（你的实际账户，信号以此为准）"
 SYSTEM_HEADING = "系统账（自动执行，仅供对照）"
 _PRICE_NOTE = "今日收盘价，实际成交在下一个交易日，价格会有出入"
 _NONE_TEXT = "（无）"

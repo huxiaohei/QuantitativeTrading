@@ -7,7 +7,8 @@
 """
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -63,6 +64,11 @@ _MAX_ERROR_CHARS = 500
 _LOOKBACK_SLACK_DAYS = 5  # 跟踪记录回看窗口 = 补记上限 + 这几天
 _MAX_PREVIOUS_RUNS = 20  # daily_runs.detail 里保留的历次运行记录条数
 _MAX_ALERT_SYMBOLS = 50  # 下载失败告警里最多逐只列出的股票数
+RUN_LOCK_KEY = 0x71745F6461696C79  # PostgreSQL 咨询锁的键："qt_daily"：同一时间只允许一个每日运行
+
+
+class DailyRunBusy(RuntimeError):
+    """另一个每日运行（qt run-day 或 qt worker）正在进行，本次没有运行。"""
 
 
 @dataclass(frozen=True)
@@ -200,6 +206,21 @@ def _send_quietly(ctx: RunContext, day: date, run: "_Run | None" = None) -> None
         run.detail["mail"] = {"sent": sent, "failed": failed}
 
 
+@contextmanager
+def _exclusive(ctx: RunContext) -> Generator[None]:
+    """持有每日运行的咨询锁（会话级，进程退出或连接断开时自动释放）；拿不到抛 DailyRunBusy。"""
+    with ctx.engine.connect() as conn:
+        got = bool(conn.execute(select(func.pg_try_advisory_lock(RUN_LOCK_KEY))).scalar_one())
+        conn.commit()
+        if not got:
+            raise DailyRunBusy("另一个每日运行正在进行，本次没有运行；等它结束后再试")
+        try:
+            yield
+        finally:
+            conn.execute(select(func.pg_advisory_unlock(RUN_LOCK_KEY)))
+            conn.commit()
+
+
 # ---------- 数据 ----------
 
 
@@ -235,6 +256,18 @@ def _update_data(ctx: RunContext, as_of: date) -> tuple[list[str], Downloaded]:
         len(report.download_failed),
     )
     return list(report.problems), Downloaded(as_of, dict(report.download_failed))
+
+
+def _update_target(ctx: RunContext, day: date) -> date:
+    """数据更新的目标日：重跑过去的某天时更新到最近一个已收盘的交易日，而不是那一天。
+
+    按过去的日子更新会截断基准指数、把 ST 名单的变化记到过去那天。
+    """
+    try:
+        closed = latest_closed_day(ctx.now(), load_calendar(ctx.store))
+    except DataIntegrityError:
+        return day
+    return max(day, closed)
 
 
 def _note_download_failures(ctx: RunContext, run: "_Run", downloaded: Downloaded) -> None:
@@ -443,7 +476,7 @@ def _advance_user(
         for book in books:
             open_followups(s, book, d, market, calendar, lookback)
         if tonight:
-            queue_signal_mails(s, sub, d, result, ctx.cfg, names)
+            queue_signal_mails(s, sub, d, result, ctx.cfg, names, calendar, lookback)
 
 
 def _process_subscription(
@@ -527,10 +560,27 @@ def run_day(
     update_data: bool,
     downloaded: Downloaded | None = None,
 ) -> str:
+    """完整跑一个交易日，返回 daily_runs.status（见 _run_day）。
+
+    同一时间只允许一个每日运行：另一个 qt run-day 或 qt worker 正在运行时抛 DailyRunBusy，
+    不写任何记录、不告警。
+    """
+    with _exclusive(ctx):
+        return _run_day(ctx, day, notify, update_data, downloaded)
+
+
+def _run_day(
+    ctx: RunContext,
+    day: date,
+    notify: bool,
+    update_data: bool,
+    downloaded: Downloaded | None,
+) -> str:
     """完整跑一个交易日，返回 daily_runs.status。
 
     notify 为假（补跑的更早日子）时新信号记为未通知、不写使用者邮件；update_data 为真时先刷新
-    交易日历并增量更新到 day。downloaded 为调用方（补跑）已做过的那次数据更新的结果。
+    交易日历并增量更新（到 day 与最近已收盘交易日中较晚者）。downloaded 为调用方（补跑）
+    已做过的那次数据更新的结果。
     本次运行有数据更新时：下载失败的股票记入 detail 并告警；持仓（任一本账）或候选缺当日
     日线的再下载一次，仍缺且记录过下载失败的，本日为 data_failed（不给任何人出信号）；
     没有失败记录的视为停牌。
@@ -545,7 +595,7 @@ def run_day(
     if update_data:
         try:
             _refresh_trade_days(ctx)
-            problems, downloaded = _update_data(ctx, day)
+            problems, downloaded = _update_data(ctx, _update_target(ctx, day))
         except Exception as exc:
             _log.exception("数据更新失败")
             error = describe(exc)
@@ -644,9 +694,16 @@ def first_start_day(s: Session) -> date | None:
     return min(starts) if starts else None
 
 
-def run_deadline_at(day: date, run_deadline: str) -> datetime:
-    """交易日 day 的完成期限：次日 run_deadline（上海时间）。"""
-    return datetime.combine(day + timedelta(days=1), parse_clock(run_deadline), tzinfo=MARKET_TZ)
+def run_deadline_at(day: date, run_deadline: str, calendar: TradingCalendar) -> datetime:
+    """交易日 day 的完成期限：下一个交易日的 run_deadline（上海时间）。
+
+    周五的数据失败可以在周末一直重试，周一开盘前完成即可。日历排不到下一个交易日时取次日。
+    """
+    try:
+        following = calendar.offset(day, 1)
+    except ValueError:
+        following = day + timedelta(days=1)
+    return datetime.combine(following, parse_clock(run_deadline), tzinfo=MARKET_TZ)
 
 
 def due_day(now: datetime, calendar: TradingCalendar, run_time: str) -> date:
@@ -661,9 +718,15 @@ def due_day(now: datetime, calendar: TradingCalendar, run_time: str) -> date:
 def catch_up(ctx: RunContext) -> list[tuple[date, str]]:
     """按日期顺序补上所有没跑完的交易日，返回 [(交易日, 状态)]。
 
-    先刷新交易日历并做一次数据更新（到 as_of），之后逐日 run_day，只有 as_of 那天通知；
+    先刷新交易日历并做一次数据更新（到 as_of），之后逐日运行，只有 as_of 那天通知；
     某天 data_failed 即停止，更晚的日子留到下次（系统账必须按顺序推进）。
+    另一个每日运行正在进行时抛 DailyRunBusy（见 run_day）。
     """
+    with _exclusive(ctx):
+        return _catch_up(ctx)
+
+
+def _catch_up(ctx: RunContext) -> list[tuple[date, str]]:
     with _session(ctx) as s:
         first = first_start_day(s)
     if first is None:
@@ -700,11 +763,11 @@ def catch_up(ctx: RunContext) -> list[tuple[date, str]]:
         return [(days[0], status)]
     results: list[tuple[date, str]] = []
     for day in days:
-        status = run_day(ctx, day, notify=day == as_of, update_data=False, downloaded=downloaded)
+        status = _run_day(ctx, day, notify=day == as_of, update_data=False, downloaded=downloaded)
         results.append((day, status))
         if status == DATA_FAILED:
             break
-    _note_late_days(ctx, results, as_of)
+    _note_late_days(ctx, results, as_of, calendar)
     return results
 
 
@@ -721,14 +784,16 @@ def _warn_stale_calendar(
     _send_quietly(ctx, today)
 
 
-def _note_late_days(ctx: RunContext, results: Sequence[tuple[date, str]], as_of: date) -> None:
+def _note_late_days(
+    ctx: RunContext, results: Sequence[tuple[date, str]], as_of: date, calendar: TradingCalendar
+) -> None:
     """补跑了已过完成期限的日子（这些日子的信号没有发给使用者）：告知管理员一次。"""
     now = ctx.now()
     deadline = ctx.cfg.service.run_deadline
     late = [
         d
         for d, status in results
-        if status in FINISHED and d != as_of and run_deadline_at(d, deadline) <= now
+        if status in FINISHED and d != as_of and run_deadline_at(d, deadline, calendar) <= now
     ]
     if not late:
         return

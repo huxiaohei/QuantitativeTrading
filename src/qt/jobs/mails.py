@@ -154,10 +154,14 @@ def queue_signal_mails(
     result: ManualDayResult,
     cfg: AppConfig,
     names: Mapping[str, str],
+    calendar: TradingCalendar,
+    lookback_days: int,
 ) -> int:
     """按手动账当晚的结果写买入、卖出、再提醒、风控、放弃提醒邮件，返回新入队的封数。
 
     买卖信号邮件只在手动账当晚有该类信号时才写，系统账同日的信号附在后面作对照。
+    风控与放弃提醒按事件的实际日期写（去重键用事件日）：最近 lookback_days 个交易日内（含当晚）
+    还没发过的都补发，覆盖补跑的日子（那几晚不通知）与回溯录入补出的风控事件。
     """
     user = repo.get_user(s, sub.user_id)
     if user.status != "active":
@@ -193,16 +197,30 @@ def queue_signal_mails(
         put("sell-remind", f"sell-remind:{manual.id}:{day}", mail)
     risk_cfg = subscription_config(cfg, sub).risk
     thresholds = {"warn": risk_cfg.warn_drawdown, "pause": risk_cfg.pause_drawdown}
-    for event in result.risk_events:
-        put(
-            "risk",
-            f"risk:{manual.id}:{day}:{event.kind}",
-            _risk_mail(day, event, thresholds, books),
-        )
-    if result.abandoned:
-        mail = render_abandon_reminder(day, views(result.abandoned))
-        put("abandon", f"abandon:{manual.id}:{day}", mail)
+    since = _window_start(calendar, day, lookback_days)
+    for event in repo.list_risk_events(s, sub.user_id, manual.id):
+        if since <= event.day <= day:
+            put(
+                "risk",
+                f"risk:{manual.id}:{event.day}:{event.kind}",
+                _risk_mail(event.day, event, thresholds, books),
+            )
+    abandoned: dict[date, list[Signal]] = {}
+    for sig in repo.list_signals(s, sub.user_id, manual.id, "buy", ("abandoned",)):
+        if since <= sig.status_day <= day:
+            abandoned.setdefault(sig.status_day, []).append(sig)
+    for when, signals in sorted(abandoned.items()):
+        mail = render_abandon_reminder(when, views(signals))
+        put("abandon", f"abandon:{manual.id}:{when}", mail)
     return queued
+
+
+def _window_start(calendar: TradingCalendar, day: date, lookback_days: int) -> date:
+    """最近 lookback_days 个交易日（含 day）的第一天；日历不够长时取日历起点。"""
+    try:
+        return calendar.offset(day, -(lookback_days - 1))
+    except ValueError:
+        return calendar.first_day
 
 
 def _risk_mail(

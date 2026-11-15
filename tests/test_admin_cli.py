@@ -186,6 +186,25 @@ def test_user_and_subscription_lifecycle_via_cli(
     assert r.exit_code == 0 and "已关闭" in r.stdout
 
 
+def test_sub_set_reports_the_first_day_that_will_use_new_params(
+    world: World, db: Session, invoke: Invoke, set_now: SetNow
+) -> None:
+    sub = _subscribe(db, world)  # 起始日 S，还没有运行过
+    set_now(world.days[S], 19)  # 已过 18:00，但当晚的运行还没处理这个订阅
+    r = invoke("admin", "sub", "set", "--email", EMAIL, "--set", "risk.max_positions=5")
+    assert r.exit_code == 0, r.stdout
+    assert f"{world.days[S]}" in r.stdout and f"{world.days[S + 1]}" not in r.stdout
+    db.rollback()
+    [change] = repo.list_param_changes(db, sub.user_id, sub.id)
+    assert change.effective_day == world.days[S]
+    _nights(db, world, sub, S, S + 1)  # 两本账推进到 S+1
+    book = repo.get_book_of_kind(db, sub.user_id, sub.id, "system")
+    book.processed_through = world.days[S + 1]
+    db.commit()
+    r = invoke("admin", "sub", "set", "--email", EMAIL, "--set", "risk.max_positions=6")
+    assert r.exit_code == 0 and f"{world.days[S + 2]}" in r.stdout
+
+
 def test_sub_create_twice_and_bad_input_are_business_errors(
     world: World, db: Session, invoke: Invoke, set_now: SetNow
 ) -> None:
@@ -650,6 +669,31 @@ def test_outbox_list_and_retry(world: World, db: Session, invoke: Invoke, set_no
     db.rollback()
     db.refresh(dead2)
     assert dead2.status == "pending"
+
+
+def test_runs_command_prints_problems_and_download_failures_in_full(
+    world: World, db: Session, invoke: Invoke
+) -> None:
+    started = datetime(2026, 11, 13, 18, 0, tzinfo=SH)
+    problems = [f"6000{i:02d} 在 2026-11-13 复权收盘价单日变动 +30.0%" for i in range(12)]
+    db.add(
+        DailyRun(
+            trade_day=date(2026, 11, 13),
+            status="data_failed",
+            stage="check",
+            started_at=started,
+            finished_at=started,
+            detail={
+                "problems": problems,
+                "download_failed": {"600100": "RuntimeError: 连接被重置"},
+            },
+        )
+    )
+    db.commit()
+    r = invoke("admin", "runs")
+    assert r.exit_code == 0, r.stdout
+    assert all(p in r.stdout for p in problems)
+    assert "600100" in r.stdout and "连接被重置" in r.stdout
 
 
 def test_runs_command_shows_outbox_counts(world: World, db: Session, invoke: Invoke) -> None:

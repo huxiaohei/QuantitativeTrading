@@ -74,11 +74,19 @@ def list_books(s: Session, user_id: int, subscription_id: int) -> list[Book]:
     return list(s.scalars(stmt.order_by(Book.id)))
 
 
-def get_book_of_kind(s: Session, user_id: int, subscription_id: int, kind: str) -> Book:
-    """订阅下指定种类（system 或 manual）的账本。"""
+def get_book_of_kind(
+    s: Session, user_id: int, subscription_id: int, kind: str, for_update: bool = False
+) -> Book:
+    """订阅下指定种类（system 或 manual）的账本。
+
+    for_update 为真时对账本行加行锁（SELECT … FOR UPDATE，到事务结束），并用数据库里的最新值刷新：
+    同一本账的写操作（每晚推进与管理员录入）由此串行。
+    """
     stmt = select(Book).where(
         Book.user_id == user_id, Book.subscription_id == subscription_id, Book.kind == kind
     )
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     book = s.scalars(stmt).first()
     if book is None:
         raise NotFoundError("账本不存在")

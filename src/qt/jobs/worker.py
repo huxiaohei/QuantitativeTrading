@@ -1,4 +1,5 @@
-"""定时进程：每 60 秒醒一次，到点或休眠醒来发现已过点就补跑；数据失败每 30 分钟重试，超时告警。
+"""定时进程：每 60 秒醒一次，到点或休眠醒来发现已过点就补跑；数据失败每 30 分钟重试到下一个交易日
+的完成期限，超时告警。
 
 不用一次性长睡眠：电脑休眠恢复后，下一个 60 秒节拍就能发现错过了运行时刻。
 """
@@ -18,6 +19,7 @@ from qt.jobs.daily import (
     DONE,
     DONE_WITH_ERRORS,
     MARKET_TZ,
+    DailyRunBusy,
     RunContext,
     alert,
     catch_up,
@@ -111,6 +113,9 @@ class _Worker:
         self.retry_until = self._retry_until(now)
         try:
             results = catch_up(self.ctx)
+        except DailyRunBusy:
+            _log.info("另一个每日运行正在进行，%s 后再试", RETRY_INTERVAL)
+            return
         except Exception as exc:
             _log.exception("每日运行出错")
             self._report(now, exc)
@@ -126,7 +131,7 @@ class _Worker:
             run_backup(self.ctx, self.backup, now)
 
     def _retry_until(self, now: datetime) -> datetime | None:
-        """重试截止：当晚要跑的交易日的完成期限（次日 run_deadline）。
+        """重试截止：当晚要跑的交易日的完成期限（下一个交易日的 run_deadline）。
 
         已过期限（如休眠醒来时）或读不到日历时为 None：一直每 30 分钟重试，直到下一次到点。
         """
@@ -138,7 +143,7 @@ class _Worker:
             night = due_day(now, calendar, service.run_time)
         except (DataIntegrityError, ValueError):
             return None
-        until = run_deadline_at(night, service.run_deadline)
+        until = run_deadline_at(night, service.run_deadline, calendar)
         return until if until > now else None
 
     def _report(self, now: datetime, exc: Exception) -> None:
@@ -170,28 +175,33 @@ class _Worker:
         self.flush_outbox(now)
 
     def check_deadline(self, now: datetime, calendar: TradingCalendar) -> None:
-        """期限已过的最近一个交易日还没跑完：给管理员发一次超时告警（每个交易日一次）。"""
-        service = self.ctx.cfg.service
+        """期限已过的最近一个交易日还没跑完：给管理员发一次超时告警（每个交易日一次）。
+
+        期限是下一个交易日的 run_deadline。告警入队成功之后才记为已处理，入队出错下个节拍再试。
+        """
+        deadline_text = self.ctx.cfg.service.run_deadline
         local = now.astimezone(MARKET_TZ)
-        back = 1 if local.time() >= parse_clock(service.run_deadline) else 2
         try:
-            day = latest_trading_day(calendar, local.date() - timedelta(days=back))
-        except DataIntegrityError:
+            day = latest_trading_day(calendar, local.date() - timedelta(days=1))
+            if run_deadline_at(day, deadline_text, calendar) > now:
+                day = calendar.offset(day, -1)
+        except (DataIntegrityError, ValueError):
             return
         if day in self.settled:
             return
         with Session(self.ctx.engine) as s:
             pending = day in pending_days(s, calendar, day, first_start_day(s))
-        self.settled.add(day)
         if not pending:
+            self.settled.add(day)
             return
-        deadline = run_deadline_at(day, service.run_deadline)
+        deadline = run_deadline_at(day, deadline_text, calendar)
         alert(
             self.ctx,
             day,
             "每日运行超时",
             [f"交易日 {day} 的每日运行到 {deadline:%Y-%m-%d %H:%M} 仍未完成，本日没有发出信号。"],
         )
+        self.settled.add(day)
         send_outbox(self.ctx, day)
 
     def flush_outbox(self, now: datetime) -> None:

@@ -33,7 +33,7 @@ from qt.data.update import (
     update_all,
 )
 from qt.jobs.backup import backup_from_env
-from qt.jobs.daily import RunContext, due_day, run_day
+from qt.jobs.daily import DailyRunBusy, RunContext, due_day, run_day
 from qt.jobs.worker import run_forever
 from qt.mail.send import make_sender
 from qt.runtime import DEFAULT_CONFIG, DEFAULT_DATA_DIR, ConfigOption, DataDirOption, Runtime, now
@@ -241,6 +241,9 @@ def run_day_command(
             else due_day(ctx.now(), load_calendar(ctx.store), ctx.cfg.service.run_time)
         )
         status = run_day(ctx, target, notify=notify, update_data=update)
+    except DailyRunBusy as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
     except (ValueError, DataIntegrityError) as exc:
         typer.echo(f"无法运行：{exc}")
         raise typer.Exit(code=1) from exc

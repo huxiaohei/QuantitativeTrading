@@ -324,6 +324,15 @@ class _Replayer:
             raise _LedgerProblem(
                 "other", f"{day} 转入 {symbol} 时它已在持仓中，不能重复转入，请改为录入买入"
             )
+        try:
+            peak = self._backfill_peak(day, e)
+            value = e.shares * self.market.last_close(day, symbol)
+        except KeyError as exc:  # 行情里没有这只股票当时的任何收盘价
+            raise _LedgerProblem(
+                "other",
+                f"{symbol} 在买入日 {e.trade_day} 及以前没有行情数据，无法补算持有期间的价格，"
+                "不能转入；请确认代码与买入日，或等行情数据更新后再录入",
+            ) from exc
         self.positions[symbol] = Position(
             symbol=symbol,
             shares=e.shares,
@@ -332,10 +341,10 @@ class _Replayer:
             industry=e.industry,
             entry_metrics=e.entry_metrics,
             days_held=len(self.calendar.between(e.trade_day, day)),
-            peak_return=self._backfill_peak(day, e),
+            peak_return=peak,
         )
         self.origins[symbol] = e.origin or "self"
-        return e.shares * self.market.last_close(day, symbol)
+        return value
 
     def _backfill_peak(self, day: date, e: Entry) -> float:
         """用买入日到当日的收盘价补算最高收益（只看价格）。

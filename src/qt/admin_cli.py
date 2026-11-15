@@ -26,7 +26,6 @@ from qt.db import admin_repo, repo
 from qt.db.engine import session_scope
 from qt.db.models import Book, LedgerEntry, Signal, Subscription, User
 from qt.features import build_panel
-from qt.jobs.daily import due_day
 from qt.mail.outbox import requeue_failed
 from qt.models import Position, Side
 from qt.runtime import (
@@ -452,9 +451,29 @@ def sub_create(
             _emit("参数覆盖：" + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items()))
 
 
+def _next_unprocessed_day(s: Session, sub: Subscription, calendar: TradingCalendar) -> date:
+    """订阅两本账下一个要处理的交易日（较早的那本）；从没推进过为起始日。
+
+    改参数之后，每日运行从这一天起使用新参数（系统账、手动账一致），已推进过的日子不变。
+    """
+    starts: list[date] = []
+    for kind in ("system", "manual"):
+        book = repo.get_book_of_kind(s, sub.user_id, sub.id, kind)
+        if book.processed_through is None:
+            starts.append(sub.start_day)
+            continue
+        try:
+            starts.append(calendar.offset(book.processed_through, 1))
+        except ValueError as exc:
+            raise ValidationError(
+                "交易日历还没有覆盖到下一次运行的日期，请先运行 qt data update"
+            ) from exc
+    return min(starts)
+
+
 @sub_app.command("set")
 def sub_set(ctx: typer.Context, email: Email, set_: SetOption = None) -> None:
-    """修改订阅参数；账本与历史不动，下一次运行起生效。"""
+    """修改订阅参数；账本与历史不动，从下一次运行处理的交易日起生效。"""
     with _unit(ctx) as (cli, s):
         overrides = _parse_overrides(set_)
         if not overrides:
@@ -462,20 +481,16 @@ def sub_set(ctx: typer.Context, email: Email, set_: SetOption = None) -> None:
         user = _user(s, email)
         sub = _open_sub(s, user)
         cfg = cli.cfg()
-        calendar = cli.calendar()
-        due = due_day(now(), calendar, cfg.service.run_time)
-        try:
-            effective = calendar.offset(due, 1)
-        except ValueError as exc:
-            raise ValidationError(
-                "交易日历还没有覆盖到下一次运行的日期，请先运行 qt data update"
-            ) from exc
+        effective = _next_unprocessed_day(s, sub, cli.calendar())
         accounts.update_params(s, user.id, sub.id, cfg, overrides, effective)
         _emit(
             f"已修改 {user.email} 的参数："
             + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items())
         )
-        _emit(f"从下一次运行（{effective}）起生效，已有账本与历史不变")
+        _emit(
+            f"从下一次运行处理的交易日 {effective} 起生效（该日还没有运行过，运行时即使用新参数）；"
+            "已推进过的日子、已有账本与历史不变"
+        )
 
 
 @sub_app.command("show")
@@ -1042,6 +1057,15 @@ def _reason_lines(detail: dict[str, Any]) -> list[str]:
     error = detail.get("error")
     if error:
         lines.append(f"原因：{error}")
+    for problem in cast("list[Any]", detail.get("problems") or []):
+        lines.append(f"数据问题：{problem}")
+    failed = cast("dict[str, Any]", detail.get("download_failed") or {})
+    if failed:
+        lines.append(f"下载失败 {len(failed)} 只（已沿用本地数据）：")
+        lines.extend(f"  {symbol}：{message}" for symbol, message in failed.items())
+    retried = detail.get("bars_retried")
+    if retried:
+        lines.append(f"缺当日日线、已再下载一次：{_json_text(retried)}")
     for item in cast("list[dict[str, Any]]", detail.get("user_errors") or []):
         lines.append(
             f"使用者 {item.get('user_id')}（订阅 {item.get('subscription_id')}）处理出错："

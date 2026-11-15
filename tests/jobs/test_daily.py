@@ -21,9 +21,10 @@ from qt.jobs.daily import catch_up, pending_days, run_day
 from qt.mail.outbox import MAX_PENDING_AGE
 from qt.mail.render import HoldingView, WeeklyView, render_weekly
 from qt.mail.send import Sender
+from qt.models import Side
 from qt.service.accounts import close_subscription, pause_subscription, subscription_config
 from qt.service.manual_book import Market
-from qt.service.manual_ops import ManualDayResult, record_holding
+from qt.service.manual_ops import ManualDayResult, record_holding, record_trade
 from qt.service.market import StoreMarket
 from tests.fakes import TRADING_SYMBOLS, FakeSource, make_industries, make_securities
 from tests.jobs.conftest import (
@@ -86,7 +87,10 @@ def test_run_day_advances_both_books_and_sends_one_buy_mail(env: Env, db: Sessio
     assert [m.subject for m in env.sender.sent] == ["【买入信号】2022-01-03 4 只"]
     mail = env.sender.sent[0]
     assert mail.to_addr == "a@example.com"
-    assert "手动账（请据此操作）" in mail.text and "系统账（自动执行，仅供对照）" in mail.text
+    assert (
+        "手动账（你的实际账户，信号以此为准）" in mail.text
+        and "系统账（自动执行，仅供对照）" in mail.text
+    )
     assert "股息率" in mail.text and "建议买入" not in mail.text and "推荐" not in mail.text
     assert {s.status for s in book_signals(db, sub, "manual")} == {"notified"}
     run = daily_run(db, day)
@@ -570,3 +574,68 @@ def test_suspended_holding_without_download_failure_runs_normally(env: Env, db: 
     run = daily_run(db, day)
     assert run is not None and run.detail["download_failed"] == {}
     assert not [m for m in env.sender.sent if m.to_addr == ADMIN]
+
+
+# ---------- 补跑日子里的风控事件与放弃提醒 ----------
+
+
+def test_abandon_mail_for_catch_up_day_is_sent_on_next_notified_night(
+    env: Env, db: Session
+) -> None:
+    days = env.days
+    subscribe(db, "a@example.com", days[DAY])
+    assert run_day(env.ctx, days[DAY], True, False) == "done"  # 四个买入信号，有效期 3 个交易日
+    env.sender.sent.clear()
+    env.clock.now = evening(days[DAY + 5])
+    assert [st for _, st in catch_up(env.ctx)] == ["done"] * 5  # DAY+4 放弃，那晚不通知
+    abandon = [m for m in env.sender.sent if m.subject.startswith("【信号已过期】")]
+    assert len(abandon) == 1 and f"截至 {days[DAY + 4]}" in abandon[0].text
+    env.sender.sent.clear()
+    env.clock.now = evening(days[DAY + 6])
+    assert catch_up(env.ctx) == [(days[DAY + 6], "done")]
+    assert not [m for m in env.sender.sent if m.subject.startswith("【信号已过期】")]
+
+
+def test_risk_event_from_backdated_entry_is_mailed_next_night(env: Env, db: Session) -> None:
+    days = env.days
+    sub = subscribe(
+        db, "a@example.com", days[DAY], {"risk.pause_drawdown": 0.003, "risk.warn_drawdown": 0.001}
+    )
+    assert run_day(env.ctx, days[DAY], True, False) == "done"
+    assert run_day(env.ctx, days[DAY + 1], True, False) == "done"
+    env.sender.sent.clear()
+    panel = build_panel(env.store, env.calendar, CFG, days[0], days[DAY + 1])
+    market = StoreMarket(env.store, panel, CFG)
+    # DAY+1 已处理完之后才录入当天一笔高于收盘价的买入：重写派生表补出 DAY+1 的暂停事件
+    record_trade(
+        db,
+        sub.user_id,
+        sub.id,
+        market,
+        env.calendar,
+        CFG,
+        days[DAY + 1],
+        Side.BUY,
+        "600001",
+        days[DAY + 1],
+        10.5,
+        3000,
+    )
+    db.commit()
+    assert run_day(env.ctx, days[DAY + 2], True, False) == "done"
+    risk = [m for m in env.sender.sent if m.subject.startswith("【风控提醒】")]
+    assert len(risk) == 1 and str(days[DAY + 1]) in risk[0].text and "暂停买入" in risk[0].subject
+    env.sender.sent.clear()
+    assert run_day(env.ctx, days[DAY + 3], True, False) == "done"
+    assert not [m for m in env.sender.sent if m.subject.startswith("【风控提醒】")]
+
+
+def test_rerunning_a_past_day_updates_data_to_the_latest_closed_day(env: Env, db: Session) -> None:
+    days = env.days
+    subscribe(db, "a@example.com", days[DAY])
+    env.clock.now = evening(days[DAY + 3])
+    source = mirror_source(env.store)
+    env.source = source
+    assert run_day(env.ctx, days[DAY], True, True) == "done"
+    ends = {args[2] for name, args in source.calls if name in ("benchmark", "bars")}
+    assert ends == {days[DAY + 3]}  # 不按过去的那天截断基准、不把 ST 变化记到过去

@@ -532,3 +532,17 @@ def test_unrelated_entry_on_still_broken_ledger_is_rejected() -> None:
     market, ledger = _revised_dividend_ledger()
     with pytest.raises(LedgerInconsistentError, match=r"入金.*作废"):
         _check(buy(9, TODAY, 100, 10.0), market, ledger)
+
+
+class NoBarsMarket(FakeMarket):
+    """S2 是已知代码，但没有任何行情（如刚上市还没下载到日线）。"""
+
+    def last_close(self, day: date, symbol: str) -> float:
+        if symbol == S2:
+            raise KeyError(symbol)
+        return super().last_close(day, symbol)
+
+
+def test_transfer_in_of_symbol_without_bars_is_a_validation_error() -> None:
+    with pytest.raises(ValidationError, match="没有行情"):
+        _check(transfer(9, DAYS[B - 3], TODAY, 1000, 8.0), NoBarsMarket())

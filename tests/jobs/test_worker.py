@@ -1,17 +1,26 @@
 """定时进程：何时到点、休眠唤醒后立即补跑、数据失败重试与超时告警；以及两个命令。"""
 
-from collections.abc import Callable, Sequence
-from datetime import date, datetime, timedelta
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from qt import cli
 from qt.jobs import worker
-from qt.jobs.daily import RunContext
+from qt.jobs.daily import (
+    RUN_LOCK_KEY,
+    DailyRunBusy,
+    RunContext,
+    catch_up,
+    run_day,
+    run_deadline_at,
+)
 from qt.jobs.worker import is_due, run_forever
 from tests.jobs.conftest import (
     ADMIN,
@@ -121,11 +130,44 @@ def test_worker_keeps_retrying_tonight_after_backlog_fails(env: Env, db: Session
     source = mirror_source(env.store, BrokenSource)
     env.source = source
     friday = days[DAY + 4]
+    monday = days[DAY + 5]
+    assert (friday.weekday(), monday.weekday()) == (4, 0)
     env.clock.now = evening(friday, 20, 0)
+    saturday = friday + timedelta(days=1)
     with pytest.raises(_Stop):
-        run_forever(env.ctx, _ticking(env, evening(friday + timedelta(days=1), 9, 0), []))
-    # 重试截止按当晚（周五）的期限：20:00 启动 1 次，20:30 至次日 08:00 共 24 次
-    assert len([c for c in source.calls if c[0] == "securities"]) == 25
+        run_forever(env.ctx, _ticking(env, evening(saturday, 10, 0), []))
+    # 期限是下一个交易日（周一）08:30，周六上午仍在重试：20:00 启动 1 次，之后每 30 分钟一次
+    attempts = len([c for c in source.calls if c[0] == "securities"])
+    assert attempts == 1 + 28
+    timeouts = [m.text for m in env.sender.sent if m.subject == "【系统异常】每日运行超时"]
+    assert len([t for t in timeouts if f"交易日 {days[DAY + 3]} " in t]) == 1  # 周四的已过期
+    assert not [t for t in timeouts if f"交易日 {friday} " in t]  # 周五的还没到期
+    expected = datetime.combine(monday, time(8, 30), tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert run_deadline_at(friday, "08:30", env.calendar) == expected
+
+
+def test_deadline_alert_is_retried_when_queueing_it_fails(
+    env: Env, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    days = env.days
+    subscribe(db, "a@example.com", days[DAY])
+    env.source = mirror_source(env.store, BrokenSource)
+    real_alert = worker.alert
+    failed_once: list[str] = []
+
+    def flaky_alert(ctx: RunContext, day: date, title: str, lines: Sequence[str]) -> None:
+        if title == "每日运行超时" and not failed_once:
+            failed_once.append(title)
+            raise RuntimeError("模拟数据库暂时不可用")
+        real_alert(ctx, day, title, lines)
+
+    monkeypatch.setattr(worker, "alert", flaky_alert)
+    env.clock.now = evening(days[DAY], 18, 30)
+    with pytest.raises(_Stop):
+        run_forever(env.ctx, _ticking(env, evening(days[DAY + 1], 10, 0), []))
+    assert failed_once  # 第一次入队失败
+    subjects = [m.subject for m in env.sender.sent]
+    assert subjects.count("【系统异常】每日运行超时") == 1  # 下一个节拍补上，仍只一封
 
 
 def test_worker_survives_unexpected_error_and_alerts(
@@ -213,3 +255,43 @@ def test_make_context_requires_admin_email(tmp_path: Path, monkeypatch: pytest.M
     ctx = cli.make_context(config, tmp_path)
     assert ctx.admin_email == "boss@example.com"
     assert ctx.now().tzinfo is not None
+
+
+# ---------- 同一时间只有一个每日运行 ----------
+
+
+@contextmanager
+def _another_run(env: Env) -> Generator[None]:
+    """模拟另一个进程（qt run-day 或 qt worker）正在运行：占住每日运行的咨询锁。"""
+    with env.engine.connect() as conn:
+        assert conn.execute(select(func.pg_try_advisory_lock(RUN_LOCK_KEY))).scalar_one()
+        try:
+            yield
+        finally:
+            conn.execute(select(func.pg_advisory_unlock(RUN_LOCK_KEY)))
+
+
+def test_second_daily_run_exits_without_running_or_alerting(
+    env: Env, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    day = env.days[DAY]
+    sub = subscribe(db, "a@example.com", day)
+    ctx = env.ctx
+    with _another_run(env):
+        with pytest.raises(DailyRunBusy, match="另一个每日运行正在进行"):
+            run_day(ctx, day, True, False)
+        with pytest.raises(DailyRunBusy):
+            catch_up(ctx)
+
+        def make_context(config: Path, data_dir: Path) -> RunContext:
+            return ctx
+
+        monkeypatch.setattr(cli, "make_context", make_context)
+        r = CliRunner().invoke(cli.app, ["run-day", "--day", str(day), "--no-update"])
+        assert r.exit_code == 1 and "另一个每日运行正在进行" in r.output
+        assert "Traceback" not in r.output
+        with pytest.raises(_Stop):  # worker：启动时补跑拿不到锁，只记日志，不告警
+            run_forever(ctx, _ticking(env, env.clock.now + timedelta(minutes=2), []))
+    assert daily_run(db, day) is None and env.sender.sent == []
+    assert processed_through(db, sub, "manual") is None
+    assert run_day(ctx, day, True, False) == "done"  # 锁释放之后照常运行

@@ -8,7 +8,8 @@ from typing import Any
 
 import pandas as pd
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import Engine, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from qt.calendar import TradingCalendar
@@ -392,6 +393,18 @@ def test_sell_signal_emitted_once_reminded_once_then_silent(db: Session, plain: 
     assert reminded.id == sig.id and reminded.reminded_day == plain.days[S + 3]
     db.refresh(sig)
     assert sig.status == "notified"
+
+
+def test_sell_reminder_is_kept_for_the_next_notified_night(db: Session, plain: World) -> None:
+    sub = _subscribe(db, plain)
+    _holding(db, sub, plain, "600003", 12.0, 1000, S)
+    [sig] = _night(db, sub, plain, S).new_sell_signals
+    for i in range(S + 1, S + 4):  # 补跑的日子不通知，也不消耗唯一的一次提醒
+        assert _night(db, sub, plain, i, notify=False).reminders == [], i
+    db.refresh(sig)
+    assert sig.reminded_day is None
+    [reminded] = _night(db, sub, plain, S + 4).reminders
+    assert reminded.id == sig.id and reminded.reminded_day == plain.days[S + 4]
 
 
 def test_sell_signal_voided_when_condition_no_longer_holds(db: Session, plain: World) -> None:
@@ -807,3 +820,77 @@ def test_real_past_pause_survives_later_loosening(db: Session, plain: World) -> 
     assert result.state.risk.paused and result.state.risk.pause_day == pause_day
     assert result.new_buy_signals == []
     assert _risk_events(db, sub) == events
+
+
+# ---------- 每晚推进与录入互斥 ----------
+
+
+def _book_is_locked(engine: Engine, book_id: int) -> bool:
+    """另开一个连接，用 NOWAIT 试着锁账本行：被别的事务 FOR UPDATE 锁着时立即报错。
+
+    用 FOR NO KEY UPDATE：它与插入外键引用该行时自动加的 KEY SHARE 锁不冲突，只与 FOR UPDATE 冲突。
+    """
+    with Session(engine) as other:
+        try:
+            other.execute(
+                select(Book.id)
+                .where(Book.id == book_id)
+                .with_for_update(nowait=True, key_share=True)
+            ).all()
+        except OperationalError:
+            return True
+        finally:
+            other.rollback()
+    return False
+
+
+def test_entry_and_nightly_advance_lock_the_manual_book(
+    db: Session, db_engine: Engine, plain: World
+) -> None:
+    sub = _subscribe(db, plain)
+    book_id = _manual_book(db, sub).id
+    db.commit()
+    assert not _book_is_locked(db_engine, book_id)
+    record_cash(
+        db,
+        sub.user_id,
+        sub.id,
+        plain.market,
+        plain.calendar,
+        plain.cfg,
+        plain.days[S],
+        "deposit",
+        plain.days[S],
+        1_000.0,
+    )
+    assert _book_is_locked(db_engine, book_id)  # 录入的事务提交前，每晚推进拿不到这本账
+    db.commit()
+    _night(db, sub, plain, S)
+    # 重跑已处理过的一天（不写任何东西）也先锁账本：推进的事务结束前，录入拿不到这本账
+    advance_manual_book(
+        db, sub, plain.cfg, plain.market.panel, plain.market, plain.calendar, plain.days[S], True
+    )
+    assert _book_is_locked(db_engine, book_id)
+    db.rollback()
+    assert not _book_is_locked(db_engine, book_id)
+
+
+# ---------- 有效期未知（日历当时还没覆盖到）的买入信号 ----------
+
+
+def test_buy_signal_without_valid_until_expires_and_links_by_trading_days(
+    db: Session, plain: World
+) -> None:
+    sub = _subscribe(db, plain)
+    short = TradingCalendar(plain.days[: S + 2])  # 日历只到信号日后一天，算不出有效期
+    first = advance_manual_book(
+        db, sub, plain.cfg, plain.market.panel, plain.market, short, plain.days[S], True
+    )
+    db.commit()
+    assert first.new_buy_signals and all(s.valid_until is None for s in first.new_buy_signals)
+    linked = _trade(db, sub, plain, Side.BUY, "600001", S + 3, 10.0, 100)  # 第 3 个交易日仍有效
+    assert linked.origin == "signal" and linked.signal_id is not None
+    for i in range(S + 1, S + 4):
+        assert _night(db, sub, plain, i).abandoned == [], i
+    abandoned = _night(db, sub, plain, S + 4).abandoned
+    assert sorted(_symbols(abandoned)) == ["600002", "600003", "600004"]

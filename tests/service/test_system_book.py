@@ -461,3 +461,70 @@ def test_first_advance_starts_all_cash(db: Session, plain: Market) -> None:
     row = db.get(BookDay, (book.id, day))
     assert row is not None and (row.equity, row.cash, row.unit_nav) == (CASH, CASH, 1.0)
     assert book.processed_through == day
+
+
+# ---------- 验收保险：退市日有挂单、买单因现金不足作废 ----------
+
+SQUEEZE_DELIST = 407  # 600003 止损卖单挂着的那天退市
+SQUEEZE: dict[str, object] = {"risk.max_position_pct": 0.33, "risk.max_industry_pct": 0.5}
+
+
+def _make_squeezed(store: ParquetStore) -> list[date]:
+    """首批四只买单按收盘价定量后几乎用尽现金，次日四只都高开 3%：最后一笔买不起一手而作废；
+    600003 在止损卖单挂着的那天退市（挂单作废，按上一交易日收盘价清算）。"""
+    days = populate_trading_store(store)
+    for symbol in TRADING_SYMBOLS:
+        bars = store.read(Table.BARS, symbols=[symbol])
+        closes = [float(c) for c in bars["close"]]
+        opens = list(closes)
+        opens[SIGNAL_DAY + 1] = round(closes[SIGNAL_DAY] * 1.03, 2)
+        frame = make_ohlc_bars(symbol, days, opens, closes)
+        frame["high"] = pd.Series([max(o, c) for o, c in zip(opens, closes, strict=True)])
+        frame["amount"] = pd.Series([1e8] * len(days), dtype="float64")
+        if symbol == "600003":
+            frame = frame[frame["day"] < pd.Timestamp(days[SQUEEZE_DELIST])].reset_index(drop=True)
+        store.write(Table.BARS, frame, symbol=symbol)
+    rows = [
+        (s, "sh_main", date(2010, 1, 1), days[SQUEEZE_DELIST] if s == "600003" else None)
+        for s in TRADING_SYMBOLS
+    ]
+    store.write(Table.SECURITIES, make_securities(rows))
+    return days
+
+
+def test_database_path_with_delisting_pending_order_and_no_cash_void_equals_backtest(
+    db: Session, tmp_path: Path
+) -> None:
+    store = ParquetStore(tmp_path)
+    market = _market(store, _make_squeezed(store))
+    start, end = market.days[0], market.days[-1]
+    sub = _subscribe(db, start, SQUEEZE)
+    db.commit()
+    _advance(db, sub, market, market.days)
+    whole = run_period(subscription_config(CFG, sub), market.store, start, end)
+    book = _system_book(db, sub)
+    days = list(db.scalars(select(BookDay).where(BookDay.book_id == book.id).order_by(BookDay.day)))
+    assert [r.day for r in days] == list(whole.equity.index)
+    assert [r.equity for r in days] == pytest.approx(list(whole.equity), rel=0, abs=0)
+    assert [r.equity.hex() for r in days] == [v.hex() for v in whole.equity]
+    assert [r.cash for r in days] == pytest.approx(list(whole.cash), rel=0, abs=0)
+    trades = list(db.scalars(select(Trade).where(Trade.book_id == book.id).order_by(Trade.id)))
+    assert [(t.symbol, t.exit_day, t.cost, t.proceeds, t.exit_reason) for t in trades] == [
+        (t.symbol, t.exit_day, t.cost, t.proceeds, t.exit_reason.value) for t in whole.trades
+    ]
+    state_row = db.get(SystemState, book.id)
+    assert state_row is not None
+    final, _ = load_state(state_row.state)
+    assert final.cash == whole.cash.iloc[-1]
+    assert list(final.positions.values()) == whole.open_positions
+    # 两种作废都确实发生，备注与原因一致
+    delist_day = market.days[SQUEEZE_DELIST]
+    assert ("600003", delist_day, ExitReason.DELISTED) in {
+        (t.symbol, t.exit_day, t.exit_reason) for t in whole.trades
+    }
+    voided = {(s.side, s.symbol, s.void_note) for s in _signals(db, book) if s.status == "voided"}
+    assert ("sell", "600003", "股票退市，挂单取消") in voided
+    assert ("buy", "600004", "现金不足，买不起一手，买单取消") in voided
+    assert [(o.symbol, o.signal_day) for o in whole.expired_buys] == [
+        ("600004", market.days[SIGNAL_DAY])
+    ]

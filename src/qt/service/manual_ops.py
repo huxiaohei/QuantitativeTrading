@@ -96,8 +96,9 @@ class _Book:
     risk: list[tuple[date, RiskConfig]]  # 风控参数时间表，重放时逐日取当天适用的
 
 
-def _open_book(s: Session, sub: Subscription, cfg: AppConfig) -> _Book:
-    book = repo.get_book_of_kind(s, sub.user_id, sub.id, "manual")
+def _open_book(s: Session, sub: Subscription, cfg: AppConfig, lock: bool = False) -> _Book:
+    """lock 为真时对手动账行加锁到事务结束：每晚推进与管理员录入不会同时改同一本账。"""
+    book = repo.get_book_of_kind(s, sub.user_id, sub.id, "manual", for_update=lock)
     merged = subscription_config(cfg, sub)
     return _Book(sub, book, merged, CostModel(merged.costs), risk_schedule(s, sub))
 
@@ -107,7 +108,7 @@ def _writable_book(s: Session, user_id: int, subscription_id: int, cfg: AppConfi
     sub = repo.get_subscription(s, user_id, subscription_id)
     if sub.status == "closed":
         raise ValidationError("订阅已关闭，手动账只能查看，不能再录入")
-    return _open_book(s, sub, cfg)
+    return _open_book(s, sub, cfg, lock=True)
 
 
 # ---------- 由数据库行构建流水 ----------
@@ -316,12 +317,24 @@ def _estimate_fees(b: _Book, side: Side, price: float, shares: float, day: date)
     return gross - exact.sell_proceeds(price, shares, day)
 
 
-def _in_window(sig: Signal, side: Side, trade_day: date) -> bool:
-    """成交日落在信号的有效窗口内：信号日 < 成交日；买入信号还要求成交日 <= 有效期。"""
+def _buy_valid_on(sig: Signal, day: date, calendar: TradingCalendar, valid_days: int) -> bool:
+    """day 是否还在买入信号的有效期内（含最后一天）。
+
+    有效期为空（生成信号时日历还没覆盖到）时按信号日之后经过的交易日数判断，与有效期的定义一致。
+    """
+    if sig.valid_until is not None:
+        return day <= sig.valid_until
+    return calendar.count_between(sig.signal_day, day) <= valid_days
+
+
+def _in_window(
+    sig: Signal, side: Side, trade_day: date, calendar: TradingCalendar, valid_days: int
+) -> bool:
+    """成交日落在信号的有效窗口内：信号日 < 成交日；买入信号还要求成交日在有效期内。"""
     if not sig.signal_day < trade_day:
         return False
     if side is Side.BUY:
-        return sig.valid_until is not None and trade_day <= sig.valid_until
+        return _buy_valid_on(sig, trade_day, calendar, valid_days)
     return True
 
 
@@ -358,15 +371,15 @@ def _find_link(
 
     规则见 record_trade；多个符合时取信号日最近的。
     """
+    valid_days = b.cfg.service.signal_valid_days
     signals = [
         sig
         for sig in repo.list_signals(s, b.book.user_id, b.book.id, side.value)
-        if sig.symbol == symbol and _in_window(sig, side, trade_day)
+        if sig.symbol == symbol and _in_window(sig, side, trade_day, calendar, valid_days)
     ]
     open_ = [sig for sig in signals if sig.status in _OPEN]
     if open_:
         return max(open_, key=lambda sig: sig.signal_day), True
-    valid_days = b.cfg.service.signal_valid_days
 
     def late(sig: Signal) -> bool:
         if sig.status == SignalStatus.EXECUTED.value:  # 更正后重新录入
@@ -808,7 +821,8 @@ def _sell_side(n: _Night) -> tuple[list[Signal], list[Signal]]:
     for sig in open_sells:
         if sig.symbol in triggered:
             elapsed = n.calendar.count_between(sig.signal_day, day)
-            if elapsed >= valid_days and sig.reminded_day is None:
+            # 只在通知的晚上提醒（补跑的日子不消耗这唯一一次提醒）
+            if elapsed >= valid_days and sig.reminded_day is None and n.notify:
                 sig.reminded_day = day
                 reminders.append(sig)
         elif sig.symbol not in suspended:
@@ -840,8 +854,9 @@ def _sell_side(n: _Night) -> tuple[list[Signal], list[Signal]]:
 def _abandon_expired(n: _Night) -> list[Signal]:
     """有效期已过仍未录入成交的买入信号 → 已放弃。"""
     abandoned: list[Signal] = []
+    valid_days = n.b.cfg.service.signal_valid_days
     for sig in repo.list_signals(n.s, n.b.book.user_id, n.b.book.id, Side.BUY.value, _OPEN):
-        if sig.valid_until is not None and sig.valid_until < n.day:
+        if not _buy_valid_on(sig, n.day, n.calendar, valid_days):
             mark_signal(n.s, sig, SignalStatus.ABANDONED, n.day)
             abandoned.append(sig)
     return abandoned
@@ -935,7 +950,7 @@ def advance_manual_book(
     已处理过（processed_through >= day）时不写任何东西，返回空结果（state 为重放到 day 的状态）。
     首晚不早于订阅起始日，之后必须按交易日逐日推进。notify 为假（补跑）时新信号记为未通知。
     """
-    b = _open_book(s, sub, cfg)
+    b = _open_book(s, sub, cfg, lock=True)
     ledger = _load_ledger(s, b, market)
     processed = b.book.processed_through
     if processed is not None and processed >= day:
