@@ -16,6 +16,7 @@ from qt.service.accounts import (
     create_user,
     pause_subscription,
     resume_subscription,
+    set_weekly_mail,
     subscription_config,
     update_params,
 )
@@ -51,6 +52,50 @@ def test_duplicate_email_rejected(db: Session) -> None:
 def test_invalid_email_rejected(db: Session) -> None:
     with pytest.raises(ValidationError, match="邮箱"):
         create_user(db, "not-an-email")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "a@b@example.com",
+        "@example.com",
+        "a@",
+        "a@localhost",
+        "a@example.",
+        "a@.com",
+        "a@example..com",
+        "a b@example.com",
+        "a@exa mple.com",
+        "a\x00@example.com",
+        "a\x07b@example.com",
+        "a@exam\x1bple.com",
+        "a@example.com\nb",
+        "a\u200b@example.com",
+        "a" * 250 + "@example.com",
+    ],
+)
+def test_malformed_email_rejected_with_chinese_message(db: Session, bad: str) -> None:
+    with pytest.raises(ValidationError, match="邮箱格式"):
+        create_user(db, bad)
+
+
+def test_email_of_maximum_length_is_accepted(db: Session) -> None:
+    address = "a" * (254 - len("@example.com")) + "@example.com"
+    assert len(address) == 254
+    assert create_user(db, address).email == address
+    with pytest.raises(ValidationError, match="邮箱格式"):
+        create_user(db, "a" + address)
+
+
+def test_set_weekly_mail_switches_flag_and_audits(db: Session) -> None:
+    user = create_user(db, "w@example.com")
+    assert user.weekly_mail is True
+    set_weekly_mail(db, user.id, False)
+    assert repo.get_user(db, user.id).weekly_mail is False
+    set_weekly_mail(db, user.id, True)
+    assert repo.get_user(db, user.id).weekly_mail is True
+    actions = list(db.scalars(select(AuditLog.action).where(AuditLog.actor_user_id == user.id)))
+    assert actions.count("user.weekly_mail") == 2
 
 
 def test_only_one_active_subscription_per_user(db: Session) -> None:

@@ -5,7 +5,7 @@ from datetime import date
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from qt.db.models import Followup, Subscription, User
+from qt.db.models import DailyRun, Followup, Subscription, User
 
 
 def find_user_by_email(s: Session, email: str) -> User | None:
@@ -35,4 +35,10 @@ def list_unfilled_followups(s: Session, since: date, before: date) -> list[Follo
         )
         .order_by(Followup.id)
     )
+    return list(s.scalars(stmt))
+
+
+def list_recent_runs(s: Session, limit: int) -> list[DailyRun]:
+    """最近 limit 个交易日的每日运行记录，日期从新到旧。"""
+    stmt = select(DailyRun).order_by(DailyRun.trade_day.desc()).limit(limit)
     return list(s.scalars(stmt))

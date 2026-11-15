@@ -15,6 +15,7 @@ from qt.db.models import (
     AuditLog,
     Book,
     BookDay,
+    Followup,
     LedgerEntry,
     ParamChange,
     Rejection,
@@ -22,6 +23,7 @@ from qt.db.models import (
     Signal,
     Subscription,
     SystemState,
+    Trade,
     User,
 )
 from qt.service.errors import NotFoundError
@@ -49,6 +51,12 @@ def get_open_subscription(s: Session, user_id: int) -> Subscription | None:
         Subscription.user_id == user_id, Subscription.status != "closed"
     )
     return s.scalars(stmt).first()
+
+
+def get_latest_subscription(s: Session, user_id: int) -> Subscription | None:
+    """该使用者最近创建的订阅（含已关闭的）；一个都没有则返回 None。"""
+    stmt = select(Subscription).where(Subscription.user_id == user_id)
+    return s.scalars(stmt.order_by(Subscription.id.desc())).first()
 
 
 def get_book(s: Session, user_id: int, book_id: int) -> Book:
@@ -156,6 +164,20 @@ def list_book_days(s: Session, user_id: int, book_id: int) -> list[BookDay]:
     get_book(s, user_id, book_id)
     stmt = select(BookDay).where(BookDay.user_id == user_id, BookDay.book_id == book_id)
     return list(s.scalars(stmt.order_by(BookDay.day)))
+
+
+def list_trades(s: Session, user_id: int, book_id: int) -> list[Trade]:
+    """账本里已完成的交易，按卖出日、编号升序。"""
+    get_book(s, user_id, book_id)
+    stmt = select(Trade).where(Trade.user_id == user_id, Trade.book_id == book_id)
+    return list(s.scalars(stmt.order_by(Trade.exit_day, Trade.id)))
+
+
+def list_followups(s: Session, user_id: int, book_id: int) -> list[Followup]:
+    """账本的跟踪记录，按事件日、编号升序。"""
+    get_book(s, user_id, book_id)
+    stmt = select(Followup).where(Followup.user_id == user_id, Followup.book_id == book_id)
+    return list(s.scalars(stmt.order_by(Followup.event_day, Followup.id)))
 
 
 def list_param_changes(s: Session, user_id: int, subscription_id: int) -> list[ParamChange]:

@@ -5,7 +5,7 @@
 """
 
 import math
-import re
+import unicodedata
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from typing import Any, cast
@@ -24,7 +24,7 @@ STRATEGY_NAME = "high_dividend_low_position"
 # 使用者可调整的区段；其余区段与 strategy.lookback_days 全站统一
 _USER_SECTIONS = ("strategy", "risk")
 _SITE_WIDE_FIELDS = frozenset({"strategy.lookback_days"})
-_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_MAX_EMAIL_LENGTH = 254  # RFC 5321 的地址上限
 
 
 def _now() -> datetime:
@@ -65,10 +65,26 @@ def subscription_config(cfg: AppConfig, sub: Subscription) -> AppConfig:
     return cfg.model_copy(update={"strategy": strategy, "risk": risk})
 
 
+def _valid_email(address: str) -> bool:
+    """只有一个 @、本地部分非空、域名含点且各段非空；不含空白与控制字符（含不可见格式字符）。"""
+    if len(address) > _MAX_EMAIL_LENGTH:
+        return False
+    if any(unicodedata.category(ch).startswith(("C", "Z")) for ch in address):
+        return False  # 控制字符、不可见格式字符与各类空白
+    local, at, domain = address.partition("@")
+    if not at or not local or "@" in domain:
+        return False
+    labels = domain.split(".")
+    return len(labels) >= 2 and all(labels)
+
+
 def create_user(s: Session, email: str, is_admin: bool = False) -> User:
-    """注册使用者；邮箱转小写，重复或格式不对时抛 ValidationError。"""
+    """注册使用者；邮箱转小写，重复或格式不对时抛 ValidationError。
+
+    邮箱之后会作为收件人，也会被打印进给使用者的命令里，所以格式在这里严格检查。
+    """
     normalized = email.strip().lower()
-    if not _EMAIL_PATTERN.match(normalized):
+    if not _valid_email(normalized):
         raise ValidationError("邮箱格式不正确")
     if admin_repo.find_user_by_email(s, normalized) is not None:
         raise ValidationError("该邮箱已注册")
@@ -79,6 +95,15 @@ def create_user(s: Session, email: str, is_admin: bool = False) -> User:
     except IntegrityError as exc:
         raise ValidationError("该邮箱已注册") from exc
     repo.add_audit(s, user.id, "user.create", f"user:{user.id}", {"is_admin": is_admin})
+    return user
+
+
+def set_weekly_mail(s: Session, user_id: int, enabled: bool) -> User:
+    """开关使用者的周报邮件，并写审计日志。"""
+    user = repo.get_user(s, user_id)
+    user.weekly_mail = enabled
+    s.flush()
+    repo.add_audit(s, user_id, "user.weekly_mail", f"user:{user_id}", {"enabled": enabled})
     return user
 
 

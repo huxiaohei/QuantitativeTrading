@@ -1,4 +1,4 @@
-"""命令行入口：qt data、qt backtest、qt run-day（手动跑一天）、qt worker（定时进程）。"""
+"""命令行入口：data、backtest、admin（管理）、run-day（手动跑一天）、worker（定时进程）。"""
 
 import json
 import logging
@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import typer
 import yaml
 
+from qt.admin_cli import admin_app
 from qt.backtest.commands import backtest_app
 from qt.config import AppConfig, load_config
 from qt.data.akshare_source import AkshareSource
@@ -41,6 +42,7 @@ app = typer.Typer(help="A 股量化回测工具", no_args_is_help=True)
 data_app = typer.Typer(help="数据下载与检查", no_args_is_help=True)
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
+app.add_typer(admin_app, name="admin")
 
 # 完整性问题最多逐条打印的数量
 _MAX_PRINTED_PROBLEMS = 50
