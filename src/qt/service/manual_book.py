@@ -124,7 +124,7 @@ class ManualTrade:
 
 @dataclass(frozen=True)
 class ManualState:
-    """重放结果。days、equity、unit_nav 逐日一一对应。"""
+    """重放结果。days、equity、cash_history、unit_nav 逐日一一对应。"""
 
     positions: dict[str, Position]
     origins: dict[str, str]  # 股票 -> "signal" | "self"
@@ -137,6 +137,7 @@ class ManualState:
     actions: list[CorporateAction]
     risk_events: list[RiskEvent]
     risk: RiskState
+    cash_history: list[float]  # 每日日终现金
 
 
 class _LedgerProblem(Exception):
@@ -169,6 +170,7 @@ class _Replayer:
         self.days: list[date] = []
         self.equity: list[float] = []
         self.unit_nav: list[float] = []
+        self.cash_history: list[float] = []
         self.trades: list[ManualTrade] = []
         self.actions: list[CorporateAction] = []
         self.risk_events: list[RiskEvent] = []
@@ -200,6 +202,7 @@ class _Replayer:
         self.days.append(day)
         self.equity.append(equity)
         self.unit_nav.append(self.nav)
+        self.cash_history.append(self.cash)
         self.risk_events.extend(self.risk.on_day_close(day, self.nav))
 
     def _apply_dividends(self, day: date, prev_day: date | None) -> None:
@@ -394,6 +397,7 @@ def _replay(
         actions=book.actions,
         risk_events=book.risk_events,
         risk=risk.dump_state(),
+        cash_history=book.cash_history,
     )
 
 

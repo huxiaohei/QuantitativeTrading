@@ -4,7 +4,7 @@
 跨使用者的查询只放在 admin_repo。
 """
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import date
 from typing import Any
 
@@ -14,8 +14,11 @@ from sqlalchemy.orm import Session
 from qt.db.models import (
     AuditLog,
     Book,
+    BookDay,
+    LedgerEntry,
     ParamChange,
     Rejection,
+    RiskEvent,
     Signal,
     Subscription,
     SystemState,
@@ -107,6 +110,49 @@ def latest_rejection(
         Rejection.rule == rule,
     )
     return s.scalars(stmt.order_by(Rejection.last_day.desc(), Rejection.id.desc())).first()
+
+
+def list_ledger_entries(s: Session, user_id: int, book_id: int) -> list[LedgerEntry]:
+    """账本的全部流水（含作废记录），按编号升序（即录入顺序）。"""
+    get_book(s, user_id, book_id)
+    stmt = select(LedgerEntry).where(LedgerEntry.user_id == user_id, LedgerEntry.book_id == book_id)
+    return list(s.scalars(stmt.order_by(LedgerEntry.id)))
+
+
+def get_ledger_entry(s: Session, user_id: int, book_id: int, entry_id: int) -> LedgerEntry:
+    """取该使用者某本账里的一条流水。"""
+    entry = s.get(LedgerEntry, entry_id)
+    if entry is None or entry.user_id != user_id or entry.book_id != book_id:
+        raise NotFoundError("流水不存在")
+    return entry
+
+
+def list_signals(
+    s: Session,
+    user_id: int,
+    book_id: int,
+    side: str | None = None,
+    statuses: Collection[str] | None = None,
+) -> list[Signal]:
+    """账本的信号，可按方向与状态过滤，按编号升序。"""
+    stmt = select(Signal).where(Signal.user_id == user_id, Signal.book_id == book_id)
+    if side is not None:
+        stmt = stmt.where(Signal.side == side)
+    if statuses is not None:
+        stmt = stmt.where(Signal.status.in_(list(statuses)))
+    return list(s.scalars(stmt.order_by(Signal.id)))
+
+
+def list_risk_events(s: Session, user_id: int, book_id: int) -> list[RiskEvent]:
+    """账本的风控事件，按日期、编号升序。"""
+    stmt = select(RiskEvent).where(RiskEvent.user_id == user_id, RiskEvent.book_id == book_id)
+    return list(s.scalars(stmt.order_by(RiskEvent.day, RiskEvent.id)))
+
+
+def list_book_days(s: Session, user_id: int, book_id: int) -> list[BookDay]:
+    """账本的每日净值，按日期升序。"""
+    stmt = select(BookDay).where(BookDay.user_id == user_id, BookDay.book_id == book_id)
+    return list(s.scalars(stmt.order_by(BookDay.day)))
 
 
 def list_param_changes(s: Session, user_id: int, subscription_id: int) -> list[ParamChange]:

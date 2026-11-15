@@ -1,0 +1,98 @@
+"""手动账用的行情：用指标面板（FeaturePanel）与本地行情存储（ParquetStore）实现 manual_book.Market。
+
+价格一律为不复权价；分红送转按除权日取自分红表（分红记录晚于除权日才取到时，重放仍按除权日补记）。
+同一个对象只在一次运行（一个晚上或一次录入）内使用，分红、行业、证券列表读一次后缓存。
+"""
+
+import math
+from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
+from datetime import date
+
+import pandas as pd
+
+from qt.config import AppConfig
+from qt.data.schema import Table
+from qt.data.store import ParquetStore
+from qt.features import FeaturePanel
+
+
+def _as_date(value: object) -> date | None:
+    """表中的日期单元格转为 date；空值（NaT）返回 None。"""
+    return value.date() if isinstance(value, pd.Timestamp) else None  # NaT 不是 Timestamp
+
+
+def _as_float(value: object) -> float:
+    """表中的数值单元格转为 float；空值记为 0。"""
+    number = float(str(value))
+    return 0.0 if math.isnan(number) else number
+
+
+class StoreMarket:
+    """行情：收盘价来自指标面板，分红、退市、行业、当日最高最低价来自行情存储。
+
+    只覆盖站点股票池所在板块（与指标面板一致）的股票。
+    """
+
+    def __init__(self, store: ParquetStore, panel: FeaturePanel, cfg: AppConfig) -> None:
+        self._store = store
+        self.panel = panel
+        securities = store.read(Table.SECURITIES)
+        securities = securities[securities["board"].isin(cfg.universe.boards)]
+        symbols = [str(s) for s in securities["symbol"]]
+        self._symbols = frozenset(symbols)
+        self._delisted: dict[str, date] = {}
+        for symbol, when in zip(symbols, securities["delist_date"].tolist(), strict=True):
+            day = _as_date(when)
+            if day is not None:
+                self._delisted[symbol] = day
+        industries = store.read(Table.INDUSTRIES)
+        self._industry = {
+            str(s): str(i)
+            for s, i in zip(industries["symbol"], industries["industry"], strict=True)
+        }
+        self._dividends: dict[str, list[tuple[date, float, float]]] = {}
+
+    def known_symbols(self) -> AbstractSet[str]:
+        """可以录入的股票代码（站点股票池所在板块的全部证券，含已退市）。"""
+        return self._symbols
+
+    def last_close(self, day: date, symbol: str) -> float:
+        """截至 day（含）最后一个收盘价：停牌日、或还没有当日数据的日子都取最近一次已知收盘价。"""
+        return self.panel.last_close(day, symbol)
+
+    def dividends(self, symbol: str) -> Sequence[tuple[date, float, float]]:
+        """(除权日, 每股现金, 每股送转)，按除权日升序；除权日缺失的记录不用。"""
+        cached = self._dividends.get(symbol)
+        if cached is not None:
+            return cached
+        df = self._store.read(Table.DIVIDENDS, symbols=[symbol])
+        rows: list[tuple[date, float, float]] = []
+        for ex, cash, bonus in zip(
+            df["ex_date"].tolist(),
+            df["cash_per_share"].tolist(),
+            df["bonus_per_share"].tolist(),
+            strict=True,
+        ):
+            day = _as_date(ex)
+            if day is not None:
+                rows.append((day, _as_float(cash), _as_float(bonus)))
+        rows.sort(key=lambda r: r[0])
+        self._dividends[symbol] = rows
+        return rows
+
+    def delisted_before(self, day: date, symbol: str) -> bool:
+        """day 时是否已经退市：退市日当天即视为已退市（与回测引擎在退市日清算一致）。"""
+        delisted = self._delisted.get(symbol)
+        return delisted is not None and delisted <= day
+
+    def industry(self, symbol: str) -> str:
+        """所属行业；没有分类时为空字符串（与指标面板一致）。"""
+        return self._industry.get(symbol, "")
+
+    def price_range(self, day: date, symbol: str) -> tuple[float, float] | None:
+        """当日 (最低价, 最高价)；当日没有日线（停牌或数据未到）返回 None。"""
+        bars = self._store.read(Table.BARS, symbols=[symbol], start=day, end=day)
+        if bars.empty:
+            return None
+        return float(bars["low"].min()), float(bars["high"].max())
