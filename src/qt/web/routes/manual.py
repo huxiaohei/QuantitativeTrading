@@ -255,21 +255,25 @@ def trade_form(
     request: Request, found: CurrentUser, deps: Deps, s: DbSession, signal: int | None = None
 ) -> Response:
     sub = _open_sub(s, found)
-    if sub is None:
-        return _to_strategy()
-    values: _Values = {"side": "buy", "day": _latest_day(deps)}
     row: views.SignalRow | None = None
     if signal is not None:
+        # 别人的、不存在的编号由服务层抛 NotFoundError（404）；本人已处理过的回信号页说明
         row = views.recordable_signal(
             s,
             found.user.id,
-            sub.id,
+            None if sub is None else sub.id,
             signal,
             deps.calendar(),
             deps.cfg,
             deps.now().date(),
             names=stock_names(deps),
         )
+        if row is None:
+            return RedirectResponse("/signals?msg=signal_handled", 303)
+    if sub is None:
+        return _to_strategy()
+    values: _Values = {"side": "buy", "day": _latest_day(deps)}
+    if row is not None:
         values.update(side=row.side, symbol=row.symbol, shares=f"{row.shares:.0f}")
     return _trade_page(request, found, deps, values=values, signal=row)
 

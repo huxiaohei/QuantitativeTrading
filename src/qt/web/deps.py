@@ -95,6 +95,7 @@ FLASH_MESSAGES: dict[str, str] = {
     "retry_requested": "已提交立即重试，worker 会在一分钟内开始处理",
     "outbox_requeued": "失败的邮件已重新排队",
     "void_na": "这条流水不能作废（已经作废，或本身是作废记录）",
+    "signal_handled": "这条信号已经处理过或已过期，可以在下面查看它的状态",
 }
 
 

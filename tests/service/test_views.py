@@ -307,3 +307,29 @@ def test_closed_subscription_is_read_only(env: Env, db: Session, ran: Subscripti
     assert manual.subscription.read_only and not any(e.can_void for e in manual.entries)
     listed = views.subscriptions(db, ran.user_id)
     assert [s.id for s in listed] == [ran.id] and listed[0].read_only
+
+
+def test_recordable_signal_tells_owner_handled_from_foreign(
+    env: Env, db: Session, ran: Subscription
+) -> None:
+    """可录入返回该行；本人的但已不能录入返回 None；别人的、不存在的抛 NotFoundError。"""
+    today = env.days[DAY + 1]
+    manual = _signals(db, ran, "manual")
+    open_buy = next(s for s in manual if s.status in ("created", "notified") and s.side == "buy")
+    executed = next(s for s in manual if s.status == "executed")
+    system_sig = _signals(db, ran, "system")[0]
+    uid = ran.user_id
+    row = views.recordable_signal(db, uid, ran.id, open_buy.id, env.calendar, CFG, today)
+    assert row is not None and row.id == open_buy.id
+    for sig_id in (executed.id, system_sig.id):
+        assert views.recordable_signal(db, uid, ran.id, sig_id, env.calendar, CFG, today) is None
+    late = env.days[DAY + 1 + CFG.service.signal_valid_days + 1]
+    assert views.recordable_signal(db, uid, ran.id, open_buy.id, env.calendar, CFG, late) is None
+    # 订阅关闭后没有开着的订阅：本人的信号一律算"已处理"
+    assert views.recordable_signal(db, uid, None, open_buy.id, env.calendar, CFG, today) is None
+    other = _user(db, "b@example.com")
+    for sig_id in (open_buy.id, executed.id, 999999):
+        with pytest.raises(NotFoundError):
+            views.recordable_signal(db, other, None, sig_id, env.calendar, CFG, today)
+    with pytest.raises(NotFoundError):
+        views.recordable_signal(db, uid, ran.id, 999999, env.calendar, CFG, today)

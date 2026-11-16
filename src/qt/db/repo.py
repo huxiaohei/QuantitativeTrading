@@ -108,6 +108,14 @@ def get_system_state(s: Session, user_id: int, book_id: int) -> SystemState | No
     return state
 
 
+def get_signal(s: Session, user_id: int, signal_id: int) -> Signal:
+    """取该使用者名下的一条信号；不存在或属于别人一律 NotFoundError。"""
+    sig = s.get(Signal, signal_id)
+    if sig is None or sig.user_id != user_id:
+        raise NotFoundError("信号不存在")
+    return sig
+
+
 def find_signal(
     s: Session, user_id: int, book_id: int, side: str, symbol: str, signal_day: date
 ) -> Signal | None:

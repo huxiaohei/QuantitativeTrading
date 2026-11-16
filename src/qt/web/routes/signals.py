@@ -5,7 +5,7 @@ from fastapi.responses import Response
 
 from qt.service import views
 from qt.web.app import route
-from qt.web.deps import CurrentUser, DbSession, Deps, render
+from qt.web.deps import FLASH_MESSAGES, CurrentUser, DbSession, Deps, render
 from qt.web.routes.common import SubParam, page_context, stock_names
 
 router = APIRouter()
@@ -13,7 +13,12 @@ router = APIRouter()
 
 @route(router, "GET", "/signals", "user")
 def signals(
-    request: Request, found: CurrentUser, deps: Deps, s: DbSession, sub: SubParam = None
+    request: Request,
+    found: CurrentUser,
+    deps: Deps,
+    s: DbSession,
+    sub: SubParam = None,
+    msg: str | None = None,
 ) -> Response:
     shown, context = page_context(s, found, sub, "signals", "/signals")
     view = None
@@ -38,5 +43,10 @@ def signals(
             deps.cfg,
             today,
         )
-    context = {**context, "view": view, "manual_error": manual_error}
+    context = {
+        **context,
+        "view": view,
+        "manual_error": manual_error,
+        "flash": FLASH_MESSAGES.get(msg or ""),
+    }
     return render(request, "signals.html", context, found=found)

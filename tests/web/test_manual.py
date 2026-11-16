@@ -509,16 +509,25 @@ def test_signal_prefill_and_isolation(
     assert re.search(r'<option value="buy" selected>', page)
     assert f"信号 #{sig.id}" in page
 
-    # 已执行的信号不能预填
+    # 本人已处理过的信号（如已执行）不能预填：回到信号页并说明，而不是 404
     done = db.scalars(select(Signal).where(Signal.user_id == user_id, Signal.status == "executed"))
     executed = next(iter(done))
-    assert client.get(f"/manual/trade?signal={executed.id}").status_code == 404
+    resp = client.get(f"/manual/trade?signal={executed.id}", follow_redirects=False)
+    assert (resp.status_code, resp.headers["location"]) == (303, "/signals?msg=signal_handled")
+    assert "这条信号已经处理过或已过期，可以在下面查看它的状态" in _page(
+        client, resp.headers["location"]
+    )
+    # 不存在的编号仍是 404
     assert client.get("/manual/trade?signal=999999").status_code == 404
 
     other, other_id = _other_client(deps, make_user)
     with other:
+        # 别人的信号，无论能不能录入、自己有没有订阅，都是 404（不暴露别人的信号是否存在）
+        assert other.get(f"/manual/trade?signal={sig.id}").status_code == 404
+        assert other.get(f"/manual/trade?signal={executed.id}").status_code == 404
         subscribe(db, world, other_id)
         assert other.get(f"/manual/trade?signal={sig.id}").status_code == 404
+        assert other.get(f"/manual/trade?signal={executed.id}").status_code == 404
 
 
 def test_cannot_void_someone_elses_entry(
