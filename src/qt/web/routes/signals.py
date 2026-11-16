@@ -17,14 +17,26 @@ def signals(
 ) -> Response:
     shown, context = page_context(s, found, sub, "signals", "/signals")
     view = None
+    manual_error = None
     if shown is not None:
+        today = deps.now().date()
         view = views.signals_page(
             s,
             found.user.id,
             shown.id,
             deps.calendar(),
             deps.cfg,
-            deps.now().date(),
+            today,
             names=stock_names(deps),
         )
-    return render(request, "signals.html", {**context, "view": view}, found=found)
+        manual_error = views.manual_notice(
+            s,
+            found.user.id,
+            shown.id,
+            deps.market(today, views.book_symbols(s, found.user.id, shown.id)),
+            deps.calendar(),
+            deps.cfg,
+            today,
+        )
+    context = {**context, "view": view, "manual_error": manual_error}
+    return render(request, "signals.html", context, found=found)

@@ -14,7 +14,7 @@ from qt.db.models import LedgerEntry
 from qt.models import Position
 from qt.service import manual_ops
 from qt.service.accounts import subscription_config
-from qt.service.errors import ValidationError
+from qt.service.errors import LedgerInconsistentError, ValidationError
 from qt.service.manual_book import CorporateAction, Market
 from qt.service.signals import SignalStatus
 from qt.service.views.base import (
@@ -125,6 +125,19 @@ class ManualBookView:
     summary: BookSummary
     holdings: list[HoldingRow]
     entries: list[EntryRow]
+
+
+@dataclass(frozen=True)
+class ManualBookPage:
+    """手动账页面用的结果：流水本身不一致（LedgerInconsistentError）时不抛异常，
+    summary 为 None、holdings 为空、error 是服务给出的原因，entries 仍列出全部原始流水（可作废）。
+    """
+
+    subscription: SubscriptionView
+    summary: BookSummary | None
+    holdings: list[HoldingRow]
+    entries: list[EntryRow]
+    error: str | None
 
 
 def _holding(
@@ -289,6 +302,42 @@ def manual_book(
         holdings=holdings,
         entries=_manual_entries(rows, state.actions, names, writable),
     )
+
+
+def manual_page(
+    s: Session,
+    user_id: int,
+    subscription_id: int,
+    market: Market,
+    calendar: TradingCalendar,
+    cfg: AppConfig,
+    today: date,
+    *,
+    names: Names | None = None,
+) -> ManualBookPage:
+    """手动账页面：同 manual_book；流水不一致时改为带原因的结果，并照常列出原始流水。"""
+    try:
+        view = manual_book(s, user_id, subscription_id, market, calendar, cfg, today, names=names)
+    except LedgerInconsistentError as exc:
+        sub = repo.get_subscription(s, user_id, subscription_id)
+        book = repo.get_book_of_kind(s, user_id, sub.id, "manual")
+        rows = repo.list_ledger_entries(s, user_id, book.id)
+        entries = _manual_entries(rows, [], names, sub.status != "closed")
+        return ManualBookPage(subscription_view(sub), None, [], entries, str(exc))
+    return ManualBookPage(view.subscription, view.summary, view.holdings, view.entries, None)
+
+
+def manual_notice(
+    s: Session,
+    user_id: int,
+    subscription_id: int,
+    market: Market,
+    calendar: TradingCalendar,
+    cfg: AppConfig,
+    today: date,
+) -> str | None:
+    """手动账流水不一致时的原因；一致则为 None。"""
+    return manual_page(s, user_id, subscription_id, market, calendar, cfg, today).error
 
 
 def system_book(

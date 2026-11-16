@@ -79,6 +79,12 @@ FLASH_MESSAGES: dict[str, str] = {
     "sub_paused": "订阅已暂停",
     "sub_resumed": "订阅已恢复",
     "sub_closed": "订阅已关闭",
+    "manual_trade": "已录入成交",
+    "manual_holding": "已录入已有持仓",
+    "manual_deposit": "已录入入金",
+    "manual_withdraw": "已录入出金",
+    "manual_void": "已作废流水",
+    "void_na": "这条流水不能作废（已经作废，或本身是作废记录）",
 }
 
 

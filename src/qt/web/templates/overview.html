@@ -15,7 +15,7 @@
 <section class="card">
   <h2>两本账</h2>
   <p class="muted">手动账是你实际账户的记录，信号以它为准；系统账按信号自动执行，仅供对照。</p>
-  {{ summary_table(view.manual, view.system) }}
+  {{ summary_table(view.manual, view.system, view.manual_error) }}
 </section>
 <section class="card">
   <h2>最近一次运行出的信号</h2>

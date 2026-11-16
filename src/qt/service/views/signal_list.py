@@ -10,6 +10,7 @@ from qt.calendar import TradingCalendar
 from qt.config import AppConfig
 from qt.db import repo
 from qt.db.models import Rejection, Signal, Subscription
+from qt.service.errors import NotFoundError
 from qt.service.manual_ops import buy_valid_on
 from qt.service.signals import SignalStatus
 from qt.service.views.base import (
@@ -188,3 +189,23 @@ def signals_page(
         history=history[:HISTORY_LIMIT],
         rejections=rejections[:REJECTION_LIMIT],
     )
+
+
+def recordable_signal(
+    s: Session,
+    user_id: int,
+    subscription_id: int,
+    signal_id: int,
+    calendar: TradingCalendar,
+    cfg: AppConfig,
+    today: date,
+    *,
+    names: Names | None = None,
+) -> SignalRow:
+    """本人手动账里可以"按此信号录入"的信号；别人的、不存在的、已结的、过期的都抛 NotFoundError。"""
+    for row in signal_rows(
+        s, user_id, subscription_id, "manual", calendar, cfg, today, names=names
+    ):
+        if row.id == signal_id and row.can_record:
+            return row
+    raise NotFoundError("信号不存在")

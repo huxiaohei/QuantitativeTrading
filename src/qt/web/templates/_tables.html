@@ -28,7 +28,7 @@
 </div>
 {% endmacro %}
 
-{% macro summary_table(manual, system) %}
+{% macro summary_table(manual, system, manual_error=none) %}
 <div class="table-wrap">
 <table>
   <thead><tr>
@@ -47,6 +47,8 @@
     <td class="num {{ (b.unit_nav - 1) | trend }}">{{ (b.unit_nav - 1) | pct }}</td>
     <td>{{ b.as_of }}</td>
   </tr>
+  {% elif label == "手动账" and manual_error %}
+  <tr><td>{{ label }}</td><td colspan="6" class="error">手动账的流水现在互相对不上，暂时算不出净值：{{ manual_error }}。请到“手动账”页处理。</td></tr>
   {% else %}
   <tr><td>{{ label }}</td><td colspan="6" class="muted">尚未推进过（每日运行之后才有数据）</td></tr>
   {% endif %}
@@ -87,13 +89,13 @@
 {% endif %}
 {% endmacro %}
 
-{% macro entries_table(rows) %}
+{% macro entries_table(rows, voidable=false) %}
 {% if rows %}
 <div class="table-wrap">
 <table>
   <thead><tr>
     <th>编号</th><th>日期</th><th>类型</th><th>股票</th><th class="num">股数</th>
-    <th class="num">价格</th><th class="num">金额</th><th class="num">费用</th><th>备注</th>
+    <th class="num">价格</th><th class="num">金额</th><th class="num">费用</th><th>备注</th>{% if voidable %}<th></th>{% endif %}
   </tr></thead>
   <tbody>
   {% for e in rows | reverse %}
@@ -107,6 +109,7 @@
     <td class="num">{{ e.amount | money if e.amount else "" }}</td>
     <td class="num">{{ e.fees | money if e.fees else "" }}{% if e.fees_estimated %}（估算）{% endif %}</td>
     <td>{% if e.kind == "void" %}作废 #{{ e.voids_entry_id }}{% endif %}{% if e.kind == "transfer_in" %}从 {{ e.effective_day }} 起进入净值{% endif %}{% if e.signal_id is not none %}信号 #{{ e.signal_id }}{% endif %}{% if e.note %} {{ e.note }}{% endif %}</td>
+    {% if voidable %}<td>{% if e.can_void %}<a href="/manual/entries/{{ e.id }}/void">作废</a>{% endif %}</td>{% endif %}
   </tr>
   {% endfor %}
   </tbody>

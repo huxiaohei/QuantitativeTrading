@@ -5,6 +5,7 @@
 <h1>信号</h1>
 {% include "_page_head.html" %}
 {% if view is not none %}
+{% if manual_error %}<p class="error" role="alert">手动账的流水现在互相对不上，暂时算不出净值和持仓：{{ manual_error }}。请到“<a href="/manual">手动账</a>”页处理。</p>{% endif %}
 <p class="muted">信号是按你设定的规则计算出的提示，系统不会替你下单。</p>
 <section class="card">
   <h2>待处理的信号</h2>

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% from "_tables.html" import holdings_table, entries_table %}
+{% block title %}手动账 · 量化信号{% endblock %}
+{% block content %}
+<h1>手动账</h1>
+{% if flash %}<p class="notice">{{ flash }}</p>{% endif %}
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<p class="muted">手动账是你实际账户的记录：系统不会替你下单，成交后请在这里录入。目前只支持沪深主板股票。</p>
+<div class="actions">
+  <a href="/manual/trade"><button type="button" class="primary">录入买入或卖出</button></a>
+  <a href="/manual/holding"><button type="button">录入已有持仓</button></a>
+  <a href="/manual/cash"><button type="button">入金或出金</button></a>
+</div>
+{% if page.error %}
+<section class="card">
+  <p class="error" role="alert">手动账的流水现在互相对不上，暂时算不出净值和持仓：{{ page.error }}</p>
+  <p>请在下面的流水里作废有问题的记录，或补录缺少的入金；仍然处理不了时请联系管理员。</p>
+</section>
+{% else %}
+<section class="card">
+  <h2>截至 {{ page.summary.as_of }}</h2>
+  <div class="table-wrap">
+  <table>
+    <tbody>
+      <tr><th>净值</th><td class="num">{{ page.summary.nav | money }}</td></tr>
+      <tr><th>现金</th><td class="num">{{ page.summary.cash | money }}</td></tr>
+      <tr><th>持仓市值</th><td class="num">{{ page.summary.holdings_value | money }}</td></tr>
+      <tr><th>收益</th><td class="num {{ (page.summary.unit_nav - 1) | trend }}">{{ (page.summary.unit_nav - 1) | pct }}</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+<section class="card">
+  <h2>持仓</h2>
+  {{ holdings_table(page.holdings, levels=true) }}
+</section>
+{% endif %}
+<section class="card">
+  <h2>流水</h2>
+  {{ entries_table(page.entries, voidable=true) }}
+</section>
+{% endblock %}

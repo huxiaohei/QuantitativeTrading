@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}入金或出金 · 量化信号{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>入金或出金</h1>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="/manual/cash" class="form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>类型
+      <select name="kind">
+        <option value="deposit"{% if values.get("kind") == "deposit" %} selected{% endif %}>入金</option>
+        <option value="withdraw"{% if values.get("kind") == "withdraw" %} selected{% endif %}>出金</option>
+      </select>
+      {% if errors.get("kind") %}<span class="field-error" role="alert">{{ errors.get("kind") }}</span>{% endif %}
+    </label>
+    <label>日期
+      <input type="text" name="day" value="{{ values.get('day', '') }}" placeholder="YYYY-MM-DD" inputmode="numeric" required>
+      {% if errors.get("day") %}<span class="field-error" role="alert">{{ errors.get("day") }}</span>{% endif %}
+    </label>
+    <label>金额（元）
+      <input type="text" name="amount" value="{{ values.get('amount', '') }}" inputmode="decimal" required>
+      {% if errors.get("amount") %}<span class="field-error" role="alert">{{ errors.get("amount") }}</span>{% endif %}
+    </label>
+    <button type="submit" class="primary">录入</button>
+  </form>
+  <p class="links"><a href="/manual">返回手动账</a></p>
+</section>
+{% endblock %}

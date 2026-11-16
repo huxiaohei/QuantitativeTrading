@@ -15,7 +15,7 @@ from qt.service.views.base import (
     resolve_subscription,
     subscription_view,
 )
-from qt.service.views.books import BookSummary, manual_book, system_book
+from qt.service.views.books import BookSummary, manual_page, system_book
 from qt.service.views.runs import RunView, latest_run
 from qt.service.views.signal_list import SignalRow, signal_rows
 
@@ -25,6 +25,7 @@ class OverviewView:
     """总览。没有订阅时 subscription、manual、system 为 None；系统账还没推进过时 system 为 None。
 
     todays_signals：最近一次运行（数据正常时）当天出的信号，手动账在前，各自编号从新到旧。
+    manual_error：手动账流水不一致时的原因（此时 manual 为 None）。
     """
 
     run: RunView | None
@@ -32,6 +33,7 @@ class OverviewView:
     manual: BookSummary | None
     system: BookSummary | None
     todays_signals: list[SignalRow]
+    manual_error: str | None = None
 
 
 def overview(
@@ -55,7 +57,7 @@ def overview(
         return OverviewView(run, None, None, None, [])
     if market is None:
         raise ValueError("有订阅时总览需要行情")
-    manual = manual_book(s, user_id, sub.id, market, calendar, cfg, today, names=names)
+    manual = manual_page(s, user_id, sub.id, market, calendar, cfg, today, names=names)
     system = system_book(s, user_id, sub.id, names=names)
     todays: list[SignalRow] = []
     if run is not None and run.data_ok:
@@ -64,4 +66,6 @@ def overview(
                 s, user_id, sub.id, book, calendar, cfg, today, since=run.day, names=names
             )
             todays += [r for r in rows if r.signal_day == run.day]
-    return OverviewView(run, subscription_view(sub), manual.summary, system.summary, todays)
+    return OverviewView(
+        run, subscription_view(sub), manual.summary, system.summary, todays, manual.error
+    )
