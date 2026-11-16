@@ -2,13 +2,14 @@
 
 from datetime import date, timedelta
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from qt.calendar import TradingCalendar
-from qt.config import AppConfig, load_config
+from qt.config import AppConfig, StrategyConfig, load_config
 from qt.data.store import ParquetStore
 from qt.db import repo
 from qt.db.models import AuditLog
@@ -64,6 +65,19 @@ def test_params_cover_every_original_key_with_clean_descriptions() -> None:
     for p in rules.PARAMS:
         assert p.label and p.description, p.key
         assert "建议" not in p.description and "推荐" not in p.description, p.key
+
+
+def test_param_kinds_and_choices_are_truthful() -> None:
+    by_key = {p.key: p for p in rules.PARAMS}
+    assert by_key["strategy.exclude_dividend_cut"].kind == "bool"
+    assert by_key["strategy.take_profit_mode"].kind == "choice"
+    allowed = get_args(StrategyConfig.model_fields["take_profit_mode"].annotation)
+    for p in rules.PARAMS:
+        if p.kind == "choice":
+            assert p.choices and all(label for _, label in p.choices), p.key
+            assert {value for value, _ in p.choices} == set(allowed), p.key
+        else:
+            assert p.choices == (), p.key
 
 
 def test_next_effective_day_follows_the_earlier_book(db: Session, days: list[date]) -> None:

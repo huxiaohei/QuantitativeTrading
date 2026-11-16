@@ -20,16 +20,18 @@ from qt.service.errors import ValidationError
 class ParamInfo:
     """一个使用者可调参数的展示信息。
 
-    minimum / maximum 用配置里的单位（比例类为 0 到 1 的小数）；
-    没有数值范围的项（开关、二选一）为 None。
+    minimum / maximum 用配置里的单位（percent 为 0 到 1 的小数）；没有数值范围的项为 None。
+    kind 为 "bool" 是是否开关，为 "choice" 是多选一，可选值与中文名在 choices 里（值，中文名）；
+    其他 kind 的 choices 为空元组。
     """
 
     key: str
     label: str
     description: str
-    kind: Literal["int", "float", "percent"]
+    kind: Literal["int", "float", "percent", "bool", "choice"]
     minimum: float | None
     maximum: float | None
+    choices: tuple[tuple[str, str], ...] = ()
 
 
 PARAMS: tuple[ParamInfo, ...] = (
@@ -71,7 +73,7 @@ PARAMS: tuple[ParamInfo, ...] = (
         "strategy.exclude_dividend_cut",
         "排除削减分红的股票",
         "取值为是或否。选是时，最近一次分红比上一次减少的股票不会进入候选；选否时不做这项排除。",
-        "int",
+        "bool",
         None,
         None,
     ),
@@ -112,9 +114,10 @@ PARAMS: tuple[ParamInfo, ...] = (
         "止盈方式",
         "二选一：固定止盈（涨到固定比例就提示卖出）或移动止盈（涨到启动涨幅后，从最高点回撤到设定比例再提示卖出）。"
         "固定止盈规则更简单，移动止盈在上涨行情里能多持有一段。",
-        "int",
+        "choice",
         None,
         None,
+        (("fixed", "固定止盈"), ("trailing", "移动止盈")),
     ),
     ParamInfo(
         "strategy.take_profit_fixed",
