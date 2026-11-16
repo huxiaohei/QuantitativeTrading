@@ -324,9 +324,12 @@ def web_command(
     """网页服务（单进程）。对外地址取环境变量 QT_BASE_URL，未设置时不启动。"""
     # 网页依赖较重，只在这个命令里导入，不拖慢其他命令
     import uvicorn
+    from sqlalchemy.orm import Session
 
+    from qt.db import admin_repo
     from qt.web.app import create_app
     from qt.web.deps import WebDeps
+    from qt.web.market import MarketCache
 
     _setup_logging()
     try:
@@ -334,14 +337,22 @@ def web_command(
         if url is None:
             raise SetupError("未设置环境变量 QT_BASE_URL（网页的对外地址），网页服务无法启动")
         runtime = Runtime(config, data_dir)
+        engine = runtime.engine()
+
+        def latest_done_day() -> date | None:
+            with Session(engine) as s:
+                return admin_repo.latest_done_day(s)
+
+        market = MarketCache(runtime.store(), runtime.cfg(), runtime.calendar, latest_done_day)
         deps = WebDeps(
-            engine=runtime.engine(),
+            engine=engine,
             cfg=runtime.cfg(),
             base_url=url,
             sender=make_sender(),
             now=now,
             store=runtime.store(),
             calendar=runtime.calendar,
+            market=market.get,
         )
     except RuntimeError as exc:  # SetupError 与缺少邮件环境变量都是 RuntimeError
         typer.echo(f"无法启动：{exc}")

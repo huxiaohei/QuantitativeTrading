@@ -66,3 +66,9 @@ def count_outbox_by_status(s: Session) -> dict[str, int]:
 def list_invites(s: Session) -> list[Invite]:
     """全部邀请码，编号从新到旧。"""
     return list(s.scalars(select(Invite).order_by(Invite.id.desc())))
+
+
+def latest_done_day(s: Session) -> date | None:
+    """最近一次状态为 done 的每日运行的交易日；还没有则为 None。"""
+    stmt = select(func.max(DailyRun.trade_day)).where(DailyRun.status == "done")
+    return s.scalar(stmt)

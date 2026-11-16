@@ -6,16 +6,18 @@
 
 import math
 from bisect import bisect_right
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import date
 
 import pandas as pd
 
+from qt.calendar import TradingCalendar
 from qt.config import AppConfig
 from qt.data.schema import Table
 from qt.data.store import ParquetStore
-from qt.features import FeaturePanel
+from qt.features import FeaturePanel, build_panel
+from qt.service.errors import ValidationError
 
 
 def _as_date(value: object) -> date | None:
@@ -135,3 +137,25 @@ class StoreMarket:
         if bars.empty:
             return None
         return float(bars["low"].min()), float(bars["high"].max())
+
+
+_EARLIEST = date(1990, 1, 1)
+
+
+def build_store_market(
+    store: ParquetStore,
+    cfg: AppConfig,
+    calendar: TradingCalendar,
+    today: date,
+    symbols: Collection[str] | None = None,
+) -> StoreMarket:
+    """行情：以不晚于今天的最近一个交易日为指标面板的日期。
+
+    symbols 为 None 时面板覆盖站点股票池的全部股票；否则只覆盖这些股票（内存小得多），
+    它们的收盘价等结果与全量面板逐项相同。
+    """
+    days = calendar.between(_EARLIEST, today)
+    if not days:
+        raise ValidationError(f"交易日历里没有 {today} 及以前的交易日")
+    panel = build_panel(store, calendar, cfg, days[-1], days[-1], symbols)
+    return StoreMarket(store, panel, cfg)

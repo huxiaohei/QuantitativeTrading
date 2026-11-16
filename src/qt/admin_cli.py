@@ -25,7 +25,6 @@ from qt.data.update import DataIntegrityError, format_bulk
 from qt.db import admin_repo, repo
 from qt.db.engine import session_scope
 from qt.db.models import Book, LedgerEntry, Signal, Subscription, User
-from qt.features import build_panel
 from qt.mail.outbox import requeue_failed
 from qt.models import Position, Side
 from qt.runtime import (
@@ -41,7 +40,7 @@ from qt.service import accounts, manual_ops, rules
 from qt.service.actor import CLI
 from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
 from qt.service.manual_book import CorporateAction
-from qt.service.market import StoreMarket
+from qt.service.market import StoreMarket, build_store_market
 from qt.service.signals import SignalStatus
 
 admin_app = typer.Typer(help="管理命令：使用者、订阅、手动账与运行记录", no_args_is_help=True)
@@ -141,11 +140,7 @@ def pct(value: float) -> str:
 
 def _market(rt: Runtime, calendar: TradingCalendar, today: date) -> StoreMarket:
     """行情：以不晚于今天的最近一个交易日为指标面板的日期。"""
-    days = calendar.between(_EARLIEST, today)
-    if not days:
-        raise ValidationError(f"交易日历里没有 {today} 及以前的交易日")
-    panel = build_panel(rt.store(), calendar, rt.cfg(), days[-1], days[-1])
-    return StoreMarket(rt.store(), panel, rt.cfg())
+    return build_store_market(rt.store(), rt.cfg(), calendar, today)
 
 
 # 命令的输出先攒在这里，事务提交成功之后才打印（出错回滚时丢弃）

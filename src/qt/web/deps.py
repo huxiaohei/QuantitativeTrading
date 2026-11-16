@@ -6,9 +6,9 @@
 import hmac
 import http.cookies
 import ipaddress
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote, urlsplit
@@ -27,6 +27,7 @@ from qt.db.models import User, WebSession
 from qt.mail.send import Sender
 from qt.runtime import cookie_secure
 from qt.service import auth
+from qt.service.market import StoreMarket
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -57,6 +58,8 @@ class WebDeps:
     now: Callable[[], datetime]
     store: ParquetStore
     calendar: Callable[[], TradingCalendar]
+    # (今天, 账本涉及的股票集合) -> 行情；面板只覆盖这些股票，由 MarketCache.get 提供
+    market: Callable[[date, Collection[str]], StoreMarket]
     background: bool = True  # 是否启动补发账号邮件、每日清理的后台线程（测试里关掉）
     secure: bool = field(init=False)
 

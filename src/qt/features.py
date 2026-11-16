@@ -29,6 +29,7 @@ snapshot 与 bar 只是对预先算好的数据做切片与查表。
 """
 
 import itertools
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal, cast
@@ -408,7 +409,9 @@ def _compute_panel(
     p = full[in_range].sort_values(["day", "symbol"], kind="stable").reset_index(drop=True)
 
     list_date = securities.set_index("symbol")["list_date"]
-    p["listed_years"] = _floats((p["day"] - p["symbol"].map(list_date)).dt.days / 365.25)
+    # 用 reindex 而不是 map：股票集合为空（面板没有任何行）时 map 会在空映射上报类型错误
+    listed = pd.Series(list_date.reindex(p["symbol"]).to_numpy(), index=p.index)
+    p["listed_years"] = _floats((p["day"] - listed).dt.days / 365.25)
     industry = industries.set_index("symbol")
     p["industry"] = p["symbol"].map(industry["industry"]).astype("object").fillna("").astype("str")
     p["is_financial"] = p["symbol"].map(industry["is_financial"]).eq(True).to_numpy(dtype="bool")
@@ -548,16 +551,27 @@ def _usable(bars: pd.DataFrame) -> npt.NDArray[np.bool_]:
 
 
 def build_panel(
-    store: ParquetStore, calendar: TradingCalendar, cfg: AppConfig, start: date, end: date
+    store: ParquetStore,
+    calendar: TradingCalendar,
+    cfg: AppConfig,
+    start: date,
+    end: date,
+    symbols: Collection[str] | None = None,
 ) -> FeaturePanel:
     """读取全部所需历史并构建 [start, end] 的 FeaturePanel。
+
+    symbols 不为 None 时只构建这些股票（且须在股票池板块内）的面板，其余股票的指标不算；
+    每只股票的指标只取决于它自己的行情、分红、财务，所以结果与全量面板里对应的行完全一致。
 
     日线读到 end 为止的全部历史（保证 start 当天回看窗口有效），分红与财务读全量。
     开高低收或复权因子缺失、非有限或不为正的日线当作当天没有日线（与停牌相同，挂单顺延）。
     calendar 参数目前未使用，仅为保持调用方（命令行、测试）的签名不变而保留。
     """
     securities = store.read(Table.SECURITIES)
-    securities = securities[securities["board"].isin(cfg.universe.boards)].reset_index(drop=True)
+    securities = securities[securities["board"].isin(cfg.universe.boards)]
+    if symbols is not None:
+        securities = securities[securities["symbol"].isin(set(symbols))]
+    securities = securities.reset_index(drop=True)
     symbols = [str(s) for s in securities["symbol"]]
     bars = store.read(Table.BARS, symbols=symbols, end=end)
     bars = bars[_usable(bars)].reset_index(drop=True)

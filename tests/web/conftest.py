@@ -3,7 +3,7 @@
 import email
 import email.policy
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
@@ -25,6 +25,7 @@ from qt.mail.send import FileSender
 from qt.service import auth
 from qt.service.accounts import create_user
 from qt.service.actor import CLI
+from qt.service.market import StoreMarket, build_store_market
 from qt.web.app import create_app
 from qt.web.deps import WebDeps
 
@@ -65,18 +66,29 @@ def _calendar() -> TradingCalendar:
     return TradingCalendar([date(2026, 11, 16)])
 
 
+def small_market(store: ParquetStore) -> Callable[[date, Collection[str]], StoreMarket]:
+    """用小夹具数据现建行情的函数（测试里不缓存）。"""
+
+    def _market(today: date, symbols: Collection[str]) -> StoreMarket:
+        return build_store_market(store, CFG, _calendar(), today, symbols)
+
+    return _market
+
+
 def make_deps(
     engine: Engine, tmp_path: Path, clock: Clock, mail_dir: Path, base_url: str = BASE
 ) -> WebDeps:
     """按测试需要构造 WebDeps；后台线程关闭。"""
+    store = ParquetStore(tmp_path / "data")
     return WebDeps(
         engine=engine,
         cfg=CFG,
         base_url=base_url,
         sender=FileSender(mail_dir),
         now=clock,
-        store=ParquetStore(tmp_path / "data"),
+        store=store,
         calendar=_calendar,
+        market=small_market(store),
         background=False,
     )
 
