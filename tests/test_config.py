@@ -142,3 +142,22 @@ def test_stamp_tax_schedule_must_be_sorted(tmp_path: Path) -> None:
         path = _write_modified(tmp_path, "costs", "stamp_tax_schedule", schedule)
         with pytest.raises(ValidationError):
             load_config(path)
+
+
+def test_web_defaults() -> None:
+    web = load_config(DEFAULT).web
+    assert web.signup_mode == "invite"
+    assert web.terms_version == "2026-11"
+    assert web.session_days == 30
+    assert web.invite_valid_days == 14
+    assert web.verify_token_hours == 48
+    assert web.reset_token_hours == 1
+    assert web.password_min_length == 10
+    assert web.report_file is None
+    assert web.panel_memory_limit_mb == 800
+
+
+def test_web_signup_mode_rejects_unknown_value(tmp_path: Path) -> None:
+    path = _write_modified(tmp_path, "web", "signup_mode", "closed")
+    with pytest.raises(ValidationError):
+        load_config(path)

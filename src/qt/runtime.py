@@ -5,6 +5,8 @@ QT_CONFIG、QT_DATA_DIR、DATABASE_URL），保证管理命令与每晚的任务
 每日任务独有的部分（ADMIN_EMAIL、数据源、发信器）在 qt.cli.make_context 里叠加在其上。
 """
 
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -29,6 +31,28 @@ DataDirOption = Annotated[Path, typer.Option("--data-dir", help="数据目录", 
 
 class SetupError(RuntimeError):
     """运行环境无法建立（配置文件、DATABASE_URL 等）；消息为中文。"""
+
+
+_LOCAL_HTTP = re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
+
+
+def base_url() -> str | None:
+    """网页的对外地址，读环境变量 QT_BASE_URL（去掉末尾斜杠）；未设置返回 None。
+
+    只接受 https 地址，本机开发可用 http://localhost 或 http://127.0.0.1（可带端口）。
+    """
+    raw = os.environ.get("QT_BASE_URL", "").strip()
+    if not raw:
+        return None
+    url = raw.rstrip("/")
+    if not (url.startswith("https://") or _LOCAL_HTTP.match(url)):
+        raise SetupError("QT_BASE_URL 必须是 https 地址（本机开发可用 http://localhost）")
+    return url
+
+
+def cookie_secure(url: str) -> bool:
+    """会话 cookie 是否加 Secure 标记：https 地址为真。"""
+    return url.startswith("https://")
 
 
 def now() -> datetime:

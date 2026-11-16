@@ -142,6 +142,20 @@ class ServiceConfig(_Frozen):
     followup_days: Annotated[list[PositiveInt], Field(min_length=1)]  # 离场/放弃后的跟踪天数
 
 
+class WebConfig(_Frozen):
+    """网页与登录参数：注册方式、协议版本、会话与令牌有效期、口令长度、面板内存上限。"""
+
+    signup_mode: Literal["invite", "open"] = "invite"  # invite 凭邀请码注册，open 公开注册
+    terms_version: str = "2026-11"  # 当前使用协议与风险提示的版本号
+    session_days: PositiveInt = 30  # 登录会话有效天数
+    invite_valid_days: PositiveInt = 14  # 邀请码有效天数
+    verify_token_hours: PositiveInt = 48  # 邮箱验证链接有效小时数
+    reset_token_hours: PositiveInt = 1  # 重置密码链接有效小时数
+    password_min_length: PositiveInt = 10  # 密码最短长度
+    report_file: str | None = None  # 回测报告文件路径；未配置则不展示
+    panel_memory_limit_mb: PositiveInt = 800  # 管理面板显示的内存上限（MB）
+
+
 class AppConfig(_Frozen):
     """应用总配置。"""
 
@@ -152,6 +166,7 @@ class AppConfig(_Frozen):
     backtest: BacktestConfig
     data: DataConfig
     service: ServiceConfig
+    web: WebConfig = WebConfig()
 
 
 def load_config(path: Path) -> AppConfig:

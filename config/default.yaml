@@ -61,3 +61,13 @@ service:
   rejection_episode_gap_days: 20   # 同一只股票的拒绝记录相隔超过此天数算一次新事件
   backdate_limit_days: 10          # 补记成交最多可回溯的天数
   followup_days: [20, 60]          # 离场、放弃、被拒后跟踪收益的天数
+web:
+  signup_mode: invite              # invite 凭邀请码注册 | open 公开注册
+  terms_version: "2026-11"         # 当前使用协议与风险提示的版本号；改版本会让使用者重新确认
+  session_days: 30                 # 登录会话有效天数
+  invite_valid_days: 14            # 邀请码有效天数
+  verify_token_hours: 48           # 邮箱验证链接有效小时数
+  reset_token_hours: 1             # 重置密码链接有效小时数
+  password_min_length: 10          # 密码最短长度
+  report_file: null                # 回测报告文件路径；null 表示不展示
+  panel_memory_limit_mb: 800       # 管理面板显示的内存上限（MB）

@@ -523,7 +523,7 @@ def render_report(
             expired=len(result.expired_buys),
             trades=trades,
             held=held,
-            params=_flatten(cfg.model_dump(mode="json")),
+            params=_flatten(cfg.model_dump(mode="json", exclude={"web"})),  # 网页参数与回测无关
             gaps=data_gaps.read_text(encoding="utf-8"),
             limitations=limitation_statements(cfg),
             checks=data_checks,

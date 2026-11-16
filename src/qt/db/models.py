@@ -57,6 +57,7 @@ class User(Base):
     status: Mapped[str] = mapped_column(String(16), server_default="active")
     plan: Mapped[str] = mapped_column(String(32), server_default="free")
     weekly_mail: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    abandon_mail: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     terms_version: Mapped[str | None] = mapped_column(String(32))
     terms_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -337,10 +338,82 @@ class AuditLog(Base):
     """审计日志：改动使用者数据的操作都记一条。"""
 
     __tablename__ = "audit_log"
+    __table_args__ = (_one_of("channel", ("web", "cli", "job"), "ck_audit_log_channel"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
     action: Mapped[str] = mapped_column(String(64))
     target: Mapped[str] = mapped_column(String(128))
     detail: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    channel: Mapped[str] = mapped_column(String(8), server_default="cli")
     created_at: Mapped[datetime] = _created_at()
+
+
+class Invite(Base):
+    """邀请码：由管理员创建，注册时核销一次。"""
+
+    __tablename__ = "invites"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    code: Mapped[str] = mapped_column(String(24), unique=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    note: Mapped[str] = mapped_column(String(200), server_default="")
+    created_at: Mapped[datetime] = _created_at()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    used_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WebSession(Base):
+    """网页登录会话。只存令牌的哈希，原文只在使用者的 cookie 里。"""
+
+    __tablename__ = "web_sessions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    csrf_token: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = _created_at()
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ip: Mapped[str | None] = mapped_column(String(64))
+    user_agent: Mapped[str | None] = mapped_column(String(300))
+
+
+class EmailToken(Base):
+    """邮件里的一次性链接令牌（验证邮箱、重置密码）。只存哈希。"""
+
+    __tablename__ = "email_tokens"
+    __table_args__ = (_one_of("kind", ("verify", "reset"), "ck_email_tokens_kind"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = _created_at()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RateEvent(Base):
+    """限流事件：同一个 key 在时间窗内的次数用来判断是否超限。"""
+
+    __tablename__ = "rate_events"
+    __table_args__ = (Index("ix_rate_events_key_at", "key", "at"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    key: Mapped[str] = mapped_column(String(200))
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class RerunRequest(Base):
+    """管理员在网页上提出的重跑请求，由 worker 取走处理。"""
+
+    __tablename__ = "rerun_requests"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    requested_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    requested_at: Mapped[datetime] = _created_at()
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result: Mapped[str | None] = mapped_column(Text)
