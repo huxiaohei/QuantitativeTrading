@@ -8,6 +8,7 @@ from datetime import date
 
 _NUMBER = re.compile(r"^[+-]?\d+(\.\d+)?$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_INTEGER = re.compile(r"^[+-]?\d+$")
 _TRUE = frozenset({"on", "true", "1", "yes"})
 PASSWORD_MAX_LENGTH = 1024
 
@@ -51,6 +52,22 @@ def parse_shares(text: str, field: str) -> float:
     if value is None:
         raise FormError(field, "数量应为数字，例如 100")
     return value
+
+
+def parse_decimal(text: str, field: str) -> float:
+    """普通的十进制小数（参数值用）。"""
+    value = _parse_number(text)
+    if value is None:
+        raise FormError(field, "应为数字，例如 12.5")
+    return value
+
+
+def parse_integer(text: str, field: str) -> int:
+    """整数（参数值用）。"""
+    value = text.strip()
+    if not _INTEGER.match(value):
+        raise FormError(field, "应为整数，例如 5")
+    return int(value)
 
 
 def parse_bool(text: str | None) -> bool:

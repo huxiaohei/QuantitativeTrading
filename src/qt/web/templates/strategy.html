@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}策略 · 量化信号{% endblock %}
+{% block content %}
+<h1>策略</h1>
+{% if flash %}<p class="notice">{{ flash }}</p>{% endif %}
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+{% if current is none %}
+<section class="card">
+  <p>你现在没有生效的订阅。创建订阅后，系统每个交易日按你设定的规则计算信号。</p>
+  <p><a href="/strategy/new"><button type="button" class="primary">创建订阅</button></a></p>
+</section>
+{% else %}
+<section class="card">
+  <h2>当前订阅 #{{ current.id }}</h2>
+  <div class="table-wrap">
+  <table>
+    <tbody>
+      <tr><th>状态</th><td>{{ current.status_label }}</td></tr>
+      <tr><th>起始资金</th><td class="num">{{ current.initial_cash | money }}</td></tr>
+      <tr><th>起始日</th><td>{{ current.start_day }}</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="actions">
+    {% if current.status == "active" %}
+    <form method="post" action="/strategy/pause" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit">暂停</button>
+    </form>
+    {% elif current.status == "paused" %}
+    <form method="post" action="/strategy/resume" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit">恢复</button>
+    </form>
+    {% endif %}
+    <a href="/strategy/params">修改参数</a>
+    <a href="/strategy/close">关闭订阅</a>
+  </div>
+</section>
+<section class="card">
+  <h2>参数</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>参数</th><th class="num">当前值</th><th class="num">默认值</th></tr></thead>
+    <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.info.label }}</td>
+      <td class="num">{{ row.current }}</td>
+      <td class="num">{{ row.default }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="muted">每个参数的含义见"修改参数"页。</p>
+</section>
+{% endif %}
+{% if history %}
+<section class="card">
+  <h2>历史订阅</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>编号</th><th>状态</th><th class="num">起始资金</th><th>起始日</th><th>关闭于</th><th></th></tr></thead>
+    <tbody>
+    {% for item in history %}
+    <tr>
+      <td>#{{ item.id }}</td>
+      <td>{{ item.status_label }}</td>
+      <td class="num">{{ item.initial_cash | money }}</td>
+      <td>{{ item.start_day }}</td>
+      <td>{% if item.closed_at %}{{ item.closed_at.date() }}{% else %}-{% endif %}</td>
+      <td><a href="/overview?sub={{ item.id }}">只读查看</a></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+<section class="card">
+  <h2>说明</h2>
+  <ul>
+    <li><a href="/concepts">概念说明</a>：报告和参数里出现的每个概念</li>
+    {% if has_report %}<li><a href="/report">回测报告</a>：默认参数下的历史回测结果</li>{% endif %}
+  </ul>
+</section>
+{% endblock %}

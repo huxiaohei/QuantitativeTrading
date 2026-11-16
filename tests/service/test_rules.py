@@ -19,6 +19,7 @@ from qt.service.accounts import (
     create_subscription,
     create_user,
     set_abandon_mail,
+    update_params,
 )
 from qt.service.actor import CLI, web_actor
 from qt.service.errors import ValidationError
@@ -144,3 +145,24 @@ def test_set_abandon_mail_switches_flag_and_audits(db: Session) -> None:
     assert row.action == "user.abandon_mail"
     assert row.channel == "web" and row.actor_user_id == user.id
     assert row.detail == {"enabled": False, "user_id": user.id}
+
+
+def test_default_start_day_is_next_trading_day_and_needs_calendar_coverage() -> None:
+    calendar = TradingCalendar([date(2026, 11, 13), date(2026, 11, 16)])
+    assert rules.default_start_day(calendar, date(2026, 11, 13)) == date(2026, 11, 16)
+    assert rules.default_start_day(calendar, date(2026, 11, 14)) == date(2026, 11, 16)
+    with pytest.raises(ValidationError, match="交易日历还没有覆盖"):
+        rules.default_start_day(calendar, date(2026, 11, 16))
+
+
+def test_site_wide_params_are_exactly_those_the_service_refuses_to_override(db: Session) -> None:
+    user = create_user(db, "w@example.com", actor=CLI)
+    sub = create_subscription(db, user.id, CFG, 10000.0, date(2026, 11, 17), None, actor=CLI)
+    refused: set[str] = set()
+    for info in rules.PARAMS:
+        try:
+            update_params(db, user.id, sub.id, CFG, {info.key: 7}, date(2026, 11, 17), actor=CLI)
+        except ValidationError as exc:
+            if "全站统一" in str(exc):
+                refused.add(info.key)
+    assert refused == {p.key for p in rules.PARAMS if p.site_wide}

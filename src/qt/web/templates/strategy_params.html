@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}修改参数 · 量化信号{% endblock %}
+{% block content %}
+<h1>修改参数</h1>
+<p class="muted">改动提交后先给你确认，确认后从下一次运行处理的交易日起生效。</p>
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<form method="post" action="/strategy/params" class="form">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <section class="card">
+  {% for row in rows %}
+    {% set info = row.info %}
+    <label>{{ info.label }}{% if info.kind == "percent" %}（%）{% endif %}
+      {% if info.site_wide %}
+      <input type="text" value="{{ row.current }}" disabled>
+      {% elif info.kind == "bool" %}
+      <select name="{{ info.key }}">
+        <option value="true"{% if row.text == "true" %} selected{% endif %}>是</option>
+        <option value="false"{% if row.text == "false" %} selected{% endif %}>否</option>
+      </select>
+      {% elif info.kind == "choice" %}
+      <select name="{{ info.key }}">
+        {% for value, name in info.choices %}
+        <option value="{{ value }}"{% if row.text == value %} selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+      {% else %}
+      <input type="text" name="{{ info.key }}" value="{{ row.text }}" inputmode="decimal">
+      {% endif %}
+      <span class="hint">{{ info.description }}</span>
+      <span class="hint">默认值 {{ row.default }}{% if row.range_hint and not info.site_wide %}；{{ row.range_hint }}{% endif %}</span>
+      {% if row.error %}<span class="field-error" role="alert">{{ row.error }}</span>{% endif %}
+    </label>
+  {% endfor %}
+  </section>
+  <button type="submit" class="primary">提交修改</button>
+</form>
+<p class="links"><a href="/strategy">返回策略页</a></p>
+{% endblock %}

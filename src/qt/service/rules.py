@@ -4,7 +4,7 @@
 """
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal
 
 from sqlalchemy.orm import Session
@@ -22,7 +22,7 @@ class ParamInfo:
 
     minimum / maximum 用配置里的单位（percent 为 0 到 1 的小数）；没有数值范围的项为 None。
     kind 为 "bool" 是是否开关，为 "choice" 是多选一，可选值与中文名在 choices 里（值，中文名）；
-    其他 kind 的 choices 为空元组。
+    其他 kind 的 choices 为空元组。site_wide 为真的项全站统一，使用者只能看、不能改。
     """
 
     key: str
@@ -32,6 +32,7 @@ class ParamInfo:
     minimum: float | None
     maximum: float | None
     choices: tuple[tuple[str, str], ...] = ()
+    site_wide: bool = False
 
 
 PARAMS: tuple[ParamInfo, ...] = (
@@ -60,6 +61,7 @@ PARAMS: tuple[ParamInfo, ...] = (
         "int",
         1,
         None,
+        site_wide=True,
     ),
     ParamInfo(
         "strategy.min_dividend_years",
@@ -245,6 +247,14 @@ def next_effective_day(s: Session, sub: Subscription, calendar: TradingCalendar)
                 "交易日历还没有覆盖到下一次运行的日期，请先运行 qt data update"
             ) from exc
     return min(starts)
+
+
+def default_start_day(calendar: TradingCalendar, today: date) -> date:
+    """订阅起始日的缺省值：今天之后第一个交易日；日历没有覆盖到时抛 ValidationError。"""
+    upcoming = calendar.between(today + timedelta(days=1), date.max)
+    if not upcoming:
+        raise ValidationError("交易日历还没有覆盖到下一个交易日，请先运行 qt data update")
+    return upcoming[0]
 
 
 def resolve_start_day(

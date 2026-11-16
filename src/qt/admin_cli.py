@@ -66,7 +66,6 @@ _DAY_DEFAULT_HELP = (
 )
 _EARLIEST = date(1990, 1, 1)
 _RECENT_ENTRIES = 20  # book show 显示的最近流水条数
-_FAR_FUTURE = date.max
 
 Email = Annotated[str, typer.Option("--email", help="使用者邮箱")]
 Symbol = Annotated[str, typer.Argument(help="股票代码，如 600001")]
@@ -355,14 +354,12 @@ def sub_create(
         overrides = _parse_overrides(set_)
         user = _user(s, email)
         calendar = cli.calendar()
-        upcoming = calendar.between(_today() + timedelta(days=1), _FAR_FUTURE)
-        if not upcoming:
-            raise ValidationError("交易日历还没有覆盖到下一个交易日，请先运行 qt data update")
+        upcoming = rules.default_start_day(calendar, _today())
         first = rules.resolve_start_day(
-            start, calendar, upcoming[0], cli.cfg().service.backdate_limit_days, today=_today()
+            start, calendar, upcoming, cli.cfg().service.backdate_limit_days, today=_today()
         )
         sub = accounts.create_subscription(s, user.id, cli.cfg(), cash, first, overrides, actor=CLI)
-        label = "下一个交易日" if first == upcoming[0] else "自选起始日，运行时会补算"
+        label = "下一个交易日" if first == upcoming else "自选起始日，运行时会补算"
         _emit(f"已为 {user.email} 创建订阅 {sub.id}：本金 {money(cash)}，起始日 {first}（{label}）")
         if overrides:
             _emit("参数覆盖：" + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items()))

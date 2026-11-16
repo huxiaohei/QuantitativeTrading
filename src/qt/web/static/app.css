@@ -172,3 +172,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   font-size: .85rem;
 }
 .site-footer p { margin: .3rem 0; }
+
+/* ---- 策略页 ---- */
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: .8rem; margin-top: .6rem; }
+.concepts h1 { margin-top: 0; }
+.concepts pre, .concepts code { font-size: .9rem; }
+.concepts pre { overflow-x: auto; }

@@ -38,6 +38,7 @@ COPY config ./config
 COPY migrations ./migrations
 COPY alembic.ini ./
 COPY scripts ./scripts
+COPY docs/concepts.md ./docs/concepts.md
 RUN uv sync --frozen
 
 # 默认运行 qt；不设 ENTRYPOINT，便于 `docker compose run worker uv run ...` 执行其他命令

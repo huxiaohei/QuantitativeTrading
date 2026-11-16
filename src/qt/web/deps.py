@@ -74,6 +74,11 @@ FLASH_MESSAGES: dict[str, str] = {
     "verified": "邮箱已验证，请登录",
     "expired": "登录已过期，请重新登录",
     "reset": "密码已重设，请用新密码登录",
+    "sub_created": "订阅已创建",
+    "params_saved": "参数已修改，从生效日起按新参数计算",
+    "sub_paused": "订阅已暂停",
+    "sub_resumed": "订阅已恢复",
+    "sub_closed": "订阅已关闭",
 }
 
 
