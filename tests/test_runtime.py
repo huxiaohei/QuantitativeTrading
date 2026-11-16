@@ -40,3 +40,28 @@ def test_base_url_rejects_plain_http(monkeypatch: pytest.MonkeyPatch, url: str) 
 def test_cookie_secure_only_for_https() -> None:
     assert cookie_secure("https://quant.example.com") is True
     assert cookie_secure("http://localhost:8000") is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://a.example/x",
+        "https://a.example/x/",
+        "https://a.example?x=1",
+        "https://a.example#top",
+        "https://a.example:8443/app",
+        "http://localhost:8000/x",
+        "https://user@a.example",
+    ],
+)
+def test_base_url_rejects_path_query_fragment(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    monkeypatch.setenv("QT_BASE_URL", url)
+    with pytest.raises(SetupError, match="QT_BASE_URL"):
+        base_url()
+
+
+def test_base_url_accepts_port_and_treats_empty_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QT_BASE_URL", "https://a.example:8443")
+    assert base_url() == "https://a.example:8443"
+    monkeypatch.setenv("QT_BASE_URL", "")
+    assert base_url() is None

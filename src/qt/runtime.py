@@ -34,19 +34,25 @@ class SetupError(RuntimeError):
 
 
 _LOCAL_HTTP = re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
+# 只有协议、域名和可选端口：不带路径、查询、# 片段或用户名
+_HTTPS_ORIGIN = re.compile(r"^https://[A-Za-z0-9.-]+(:\d+)?$")
 
 
 def base_url() -> str | None:
-    """网页的对外地址，读环境变量 QT_BASE_URL（去掉末尾斜杠）；未设置返回 None。
+    """网页的对外地址，读环境变量 QT_BASE_URL（去掉末尾斜杠）；未设置或为空返回 None。
 
-    只接受 https 地址，本机开发可用 http://localhost 或 http://127.0.0.1（可带端口）。
+    只接受 https 地址，本机开发可用 http://localhost 或 http://127.0.0.1（可带端口）；
+    只能写到域名和端口，带路径、查询或 # 片段一律报错（邮件里的链接都是在它后面直接拼路径）。
     """
     raw = os.environ.get("QT_BASE_URL", "").strip()
     if not raw:
         return None
     url = raw.rstrip("/")
-    if not (url.startswith("https://") or _LOCAL_HTTP.match(url)):
-        raise SetupError("QT_BASE_URL 必须是 https 地址（本机开发可用 http://localhost）")
+    if not (_HTTPS_ORIGIN.match(url) or _LOCAL_HTTP.match(url)):
+        raise SetupError(
+            "QT_BASE_URL 必须是 https 地址，只写协议、域名和端口，不带路径、查询或 #"
+            "（本机开发可用 http://localhost）"
+        )
     return url
 
 
