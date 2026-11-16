@@ -8,6 +8,8 @@
 
 import hashlib
 import secrets
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
@@ -33,6 +35,9 @@ from qt.service.errors import (
 EmailTokenKind = Literal["verify", "reset"]
 
 _HASHER = PasswordHasher()
+# 每次 argon2 计算要占 64 MiB 内存：整个进程同时最多算 2 个，其余排队，
+# 防止一阵并发登录把网页容器的内存撑爆（频率限制只数已提交的失败，挡不住同时到达的请求）
+_HASH_SLOTS = threading.BoundedSemaphore(2)
 # 用户不存在时对它做一次真实校验，让"邮箱不存在"与"密码错"耗时同量级
 _DUMMY_HASH = _HASHER.hash("dummy-password-for-timing")
 _ANONYMOUS_WEB = Actor(None, "web")
@@ -85,15 +90,22 @@ def _rate_key(prefix: str, value: str) -> str:
     return key if len(key) <= _RATE_KEY_MAX else f"{prefix}:{_sha256(value)}"
 
 
+def _in_hash_slot[T](work: Callable[[], T]) -> T:
+    """占一个哈希名额再做 argon2 计算（哈希与校验都走这里）。"""
+    with _HASH_SLOTS:
+        return work()
+
+
 def hash_password(plain: str) -> str:
     """argon2id 哈希（库的默认参数）。"""
-    return _HASHER.hash(plain)
+    return _in_hash_slot(lambda: _HASHER.hash(plain))
 
 
 def verify_password(hashed: str | None, plain: str) -> bool:
     """校验密码；hashed 为 None 时也做一次真实校验再返回假，防止从耗时探测账号。"""
+    target = _DUMMY_HASH if hashed is None else hashed
     try:
-        _HASHER.verify(_DUMMY_HASH if hashed is None else hashed, plain)
+        _in_hash_slot(lambda: _HASHER.verify(target, plain))
     except (VerificationError, InvalidHashError):
         return False
     return hashed is not None
@@ -273,6 +285,8 @@ def register(
         raise AuthError("请先阅读并同意使用条款与风险提示")
     invite = _lock_valid_invite(s, invite_code, now) if cfg.signup_mode == "invite" else None
     check_password_rules(normalized, password, cfg.password_min_length)
+    # 先算哈希再查邮箱：已注册与新注册两条路都只算一次，耗时上看不出邮箱是否存在
+    password_hash = hash_password(password)
 
     existing = admin_repo.find_user_by_email(s, normalized)
     if existing is not None:
@@ -290,7 +304,7 @@ def register(
         user = accounts.create_user(s, normalized, actor=_ANONYMOUS_WEB)
     except ValidationError as exc:  # 格式不对（或并发下被抢注）
         raise AuthError(str(exc)) from exc
-    user.password_hash = hash_password(password)
+    user.password_hash = password_hash
     user.terms_version = cfg.terms_version
     user.terms_accepted_at = now
     if invite is not None:
@@ -377,6 +391,8 @@ def reset_password(
     if user.email_verified_at is None:
         user.email_verified_at = now
     revoked = _delete_sessions(s, user.id)
+    # 已经用邮件证明了身份：解除按邮箱的登录锁定，新密码马上能登录
+    s.execute(delete(RateEvent).where(RateEvent.key == _login_key(user.email)))
     s.flush()
     repo.add_audit(
         s,
@@ -391,12 +407,20 @@ def reset_password(
 
 # ---- 登录与会话 ----
 
+_LOGIN_LIMIT = 5
+_LOGIN_WINDOW = timedelta(minutes=15)
+
+
+def _login_key(normalized: str) -> str:
+    """按邮箱计登录失败次数的频率键（改密码时猜错当前密码也记在这里）。"""
+    return _rate_key("login", normalized)
+
 
 def _login_failed(
     s: Session, normalized: str, ip: str, user: User | None, reason: str, now: datetime
 ) -> AuthError:
     """记失败次数与审计，返回统一的 AuthError 供调用方抛出。"""
-    rate_hit(s, _rate_key("login", normalized), now)
+    rate_hit(s, _login_key(normalized), now)
     rate_hit(s, _rate_key("login-ip", ip), now)
     repo.add_audit(
         s,
@@ -420,9 +444,8 @@ def login(
 ) -> LoginResult:
     """登录。失败（含停用、不存在）一律同一句话，且只在失败时计数。"""
     normalized = normalize_email(email)
-    window = timedelta(minutes=15)
-    rate_check(s, _rate_key("login", normalized), 5, window, now)
-    rate_check(s, _rate_key("login-ip", ip), 20, window, now)
+    rate_check(s, _login_key(normalized), _LOGIN_LIMIT, _LOGIN_WINDOW, now)
+    rate_check(s, _rate_key("login-ip", ip), 20, _LOGIN_WINDOW, now)
     user = admin_repo.find_user_by_email(s, normalized)
     password_ok = verify_password(None if user is None else user.password_hash, password)
     if user is None or not password_ok:
@@ -498,13 +521,26 @@ def change_password(
     keep_session_id: int,
     now: datetime,
 ) -> None:
-    """已登录改密码：校验当前密码，删除除当前会话外的全部会话。"""
+    """已登录改密码：校验当前密码，删除除当前会话外的全部会话和未用的重置令牌。
+
+    猜错当前密码与登录失败共用按邮箱的频率键，同样 15 分钟内 5 次封顶。
+    """
     user = repo.get_user(s, user_id)
+    key = _login_key(user.email)
+    rate_check(s, key, _LOGIN_LIMIT, _LOGIN_WINDOW, now)
     if not verify_password(user.password_hash, current):
+        rate_hit(s, key, now)
         raise AuthError("当前密码不正确")
     check_password_rules(user.email, new, cfg.password_min_length)
     user.password_hash = hash_password(new)
     removed = _delete_sessions(s, user_id, keep_session_id)
+    s.execute(
+        delete(EmailToken).where(
+            EmailToken.user_id == user_id,
+            EmailToken.kind == "reset",
+            EmailToken.used_at.is_(None),
+        )
+    )
     s.flush()
     repo.add_audit(
         s,

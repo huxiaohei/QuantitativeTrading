@@ -1,8 +1,11 @@
 """账号服务：密码、注册、令牌、登录、会话、找回密码、改密码、停用、邀请码、清理、审计。"""
 
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from argon2.exceptions import VerificationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -555,3 +558,107 @@ def test_audit_rows(db: Session) -> None:
 def test_audit_without_subject_user_omits_key(db: Session) -> None:
     entry = repo.add_audit(db, None, "x", "t", {"a": 1}, Actor(None, "web"))
     assert entry.detail == {"a": 1}
+
+
+# ---- 终审修复：哈希并发上限、重置解锁、注册耗时、改密码 ----
+
+
+class _SlowHasher:
+    """假哈希器：每次调用睡一小会儿，记录同时在算的最大数量与调用次数。"""
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self._delay = delay
+        self._lock = threading.Lock()
+        self._running = 0
+        self.peak = 0
+        self.hash_calls = 0
+        self.verify_calls = 0
+
+    def _enter(self) -> None:
+        with self._lock:
+            self._running += 1
+            self.peak = max(self.peak, self._running)
+        time.sleep(self._delay)
+        with self._lock:
+            self._running -= 1
+
+    def hash(self, plain: str) -> str:
+        self.hash_calls += 1
+        self._enter()
+        return f"fake:{plain}"
+
+    def verify(self, hashed: str, plain: str) -> bool:
+        self.verify_calls += 1
+        self._enter()
+        if hashed != f"fake:{plain}":
+            raise VerificationError
+        return True
+
+
+def test_hashing_concurrency_capped_at_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _SlowHasher(delay=0.05)
+    monkeypatch.setattr(auth, "_HASHER", fake)
+    threads = [
+        threading.Thread(target=auth.verify_password, args=(None if i % 2 else "fake:x", "x"))
+        for i in range(12)
+    ] + [threading.Thread(target=auth.hash_password, args=("y",)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert fake.verify_calls == 12
+    assert fake.hash_calls == 4
+    assert fake.peak == 2
+
+
+def test_reset_password_lifts_login_lockout(db: Session) -> None:
+    _verified_user(db)
+    for _ in range(5):
+        with pytest.raises(AuthError, match=LOGIN_FAIL):
+            _login(db, pw="wrong-password!")
+    with pytest.raises(RateLimitedError):
+        _login(db)
+    got = auth.request_password_reset(db, "foo@example.com", CFG, NOW)
+    assert got is not None
+    auth.reset_password(db, got[1], "brand-new-password", CFG, NOW)
+    assert _login(db, pw="brand-new-password").token
+
+
+def test_register_hashes_once_on_both_paths(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    admin = _admin(db)
+    fake = _SlowHasher()
+    monkeypatch.setattr(auth, "_HASHER", fake)
+    created = auth.register(db, "foo@example.com", PW, _invite(db, admin), True, CFG, IP, NOW)
+    assert created.kind == "created"
+    assert fake.hash_calls == 1
+    exists = auth.register(db, "foo@example.com", PW, _invite(db, admin), True, CFG, IP, NOW)
+    assert exists.kind == "exists"
+    assert fake.hash_calls == 2
+    assert repo.get_user(db, created.user_id).password_hash == f"fake:{PW}"
+
+
+def test_change_password_removes_unused_reset_tokens(db: Session) -> None:
+    user = _verified_user(db)
+    keep = _login(db)
+    got = auth.request_password_reset(db, "foo@example.com", CFG, NOW)
+    assert got is not None
+    auth.change_password(db, user.id, PW, "brand-new-password", CFG, keep.session.id, NOW)
+    with pytest.raises(AuthError):
+        auth.reset_password(db, got[1], "another-new-password", CFG, NOW)
+    assert db.scalars(select(EmailToken).where(EmailToken.kind == "reset")).all() == []
+
+
+def test_change_password_wrong_current_is_rate_limited(db: Session) -> None:
+    user = _verified_user(db)
+    keep = _login(db)
+    for _ in range(5):
+        with pytest.raises(AuthError, match="当前密码不正确"):
+            auth.change_password(
+                db, user.id, "wrong-password!", "brand-new-password", CFG, keep.session.id, NOW
+            )
+    with pytest.raises(RateLimitedError):  # 即使当前密码正确
+        auth.change_password(db, user.id, PW, "brand-new-password", CFG, keep.session.id, NOW)
+    with pytest.raises(RateLimitedError):  # 与登录共用同一个键
+        _login(db)
+    later = NOW + timedelta(minutes=15, seconds=1)
+    auth.change_password(db, user.id, PW, "brand-new-password", CFG, keep.session.id, later)
