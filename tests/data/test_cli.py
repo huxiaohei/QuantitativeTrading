@@ -280,7 +280,11 @@ def _varied_bars(symbol: str, base: float) -> pd.DataFrame:
 
 
 def _snapshot_world(
-    tmp_path: Path, n: int = 5, adj_on_last_day: float | None = None
+    tmp_path: Path,
+    n: int = 5,
+    adj_on_last_day: float | None = None,
+    suspended: str | None = None,
+    source_has_suspended_bar: bool = False,
 ) -> tuple[FakeSource, pd.DataFrame]:
     """库里日线到 1-11，数据源有到 1-12 的逐只日线与 1-12 的批量行情。"""
     syms = [f"60000{i}" for i in range(n)]
@@ -288,6 +292,13 @@ def _snapshot_world(
     if adj_on_last_day is not None:  # 逐只接口在 1-12 给出不同的复权因子
         last = (market["symbol"] == "600001") & (market["day"] == pd.Timestamp(DAYS[-1]))
         market.loc[last, "adj_factor"] = adj_on_last_day
+    snapshot = snapshot_from_bars(market, DAYS[-1], DAYS[-2])
+    if suspended is not None:  # 批量行情显示停牌：当天这一行全是 0
+        for col in ("open", "high", "low", "close", "volume", "amount"):
+            snapshot.loc[snapshot["symbol"] == suspended, col] = 0.0
+        if not source_has_suspended_bar:
+            today = (market["symbol"] == suspended) & (market["day"] == pd.Timestamp(DAYS[-1]))
+            market = market[~today].reset_index(drop=True)
     trade_days = make_trade_days([*DAYS, NEXT_DAY])
     secs = make_securities([(s, "sh_main", LISTED, None) for s in syms])
     store = ParquetStore(tmp_path)
@@ -301,7 +312,6 @@ def _snapshot_world(
         bars=market,
         industries=make_industries([(s, "制造业", False) for s in syms]),
     )
-    snapshot = snapshot_from_bars(market, DAYS[-1], DAYS[-2])
     source.snapshot = snapshot
     return source, snapshot
 
@@ -331,7 +341,7 @@ def test_cli_update_reports_bulk_usage(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setattr(qt.cli, "_now", lambda: SNAP_NOW)
     result = CliRunner().invoke(qt.cli.app, ["data", "update", "--data-dir", str(tmp_path)])
     assert result.exit_code == 0, result.output
-    assert "日线批量行情：已启用，批量写入 5 只，逐只请求 0 只" in result.output
+    assert "日线批量行情：已启用，批量写入 5 只，判为停牌 0 只，逐只请求 0 只" in result.output
     assert [c for c in source.calls if c[0] == "bars"] == []
 
 
@@ -407,3 +417,39 @@ def test_check_snapshot_failure_is_a_chinese_message(
     code, output = _check(monkeypatch, source, tmp_path)
     assert code == 1
     assert "批量行情获取失败" in output
+
+
+def test_check_snapshot_samples_suspended_symbols_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, _ = _snapshot_world(tmp_path, n=6, suspended="600005")
+    code, output = _check(monkeypatch, source, tmp_path)
+    assert code == 0, output
+    assert "核对 6 只（有成交 5 只、停牌 1 只）：一致 6 只，不一致 0 只" in output
+    assert "600005" in [str(a[0]) for n, a in source.calls if n == "bars"]
+
+
+def test_check_snapshot_suspended_but_per_symbol_has_bar_is_a_difference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, _ = _snapshot_world(tmp_path, n=6, suspended="600005", source_has_suspended_bar=True)
+    before = _files(tmp_path)
+    code, output = _check(monkeypatch, source, tmp_path)
+    assert code == 1
+    assert "600005：不一致：批量行情显示停牌" in output
+    assert _files(tmp_path) == before
+
+
+def test_check_snapshot_counts_each_symbol_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, snapshot = _snapshot_world(tmp_path)
+    snapshot.loc[snapshot["symbol"] == "600003", "prev_close"] = 1.0  # 当天除权
+    snapshot.loc[snapshot["symbol"] == "600003", "high"] = 99.0  # 同时价格不一致
+    source.fail_symbols = {"600004"}  # 逐只请求失败
+    code, output = _check(monkeypatch, source, tmp_path)
+    assert code == 1
+    assert (
+        "核对 5 只（有成交 5 只、停牌 0 只）：一致 3 只，不一致 1 只，"
+        "当天除权（昨收对不上，批量路径会改走逐只请求）0 只，无法核对 1 只"
+    ) in output

@@ -12,17 +12,22 @@ from qt.config import AppConfig
 from qt.data.schema import SNAPSHOT_SCHEMA, Table
 from qt.data.store import ParquetStore
 from qt.data.update import (
+    SNAPSHOT_MAX_NO_TRADE,
+    SNAPSHOT_MIN_COVERAGE,
     SNAPSHOT_MIN_MATCH,
     SNAPSHOT_TOLERANCE,
+    NetworkOutageError,
     UpdateReport,
     format_bulk,
     snapshot_window_problem,
     update_all,
 )
-from tests.data.helpers import bar_days, make_trade_days
+from tests.data.helpers import bar_days, make_trade_days, set_file_age
 from tests.fakes import (
     FakeSource,
     default_app_config,
+    make_dividends,
+    make_financials,
     make_industries,
     make_securities,
     populate_store,
@@ -198,7 +203,7 @@ def test_prev_close_tolerance_boundary(tmp_path: Path) -> None:
     [{"open": 0.0}, {"close": 0.0}, {"volume": float("nan")}, {"close": float("nan")}],
 )
 def test_untrusted_quote_goes_per_symbol(tmp_path: Path, values: dict[str, float]) -> None:
-    market = _market(3)
+    market = _market(10)
     store = _store(tmp_path, market)
     snapshot = _snapshot(market)
     _set(snapshot, "600002", **values)
@@ -240,7 +245,7 @@ def test_lagging_or_never_downloaded_symbols_go_per_symbol(tmp_path: Path) -> No
 
 
 def test_suspended_symbol_gets_no_bar_and_no_request(tmp_path: Path) -> None:
-    market = _market(3)
+    market = _market(10)  # 1/10 无成交，不超过整晚闸门的 10%
     store = _store(tmp_path, market)
     snapshot = _snapshot(market)
     _set(snapshot, "600001", open=0.0, high=0.0, low=0.0, close=0.0, volume=0.0, amount=0.0)
@@ -248,8 +253,8 @@ def test_suspended_symbol_gets_no_bar_and_no_request(tmp_path: Path) -> None:
     report = _run(source, store)
     assert report.bulk_used
     assert _bars_symbols(source) == []
-    assert (report.bulk_bars, report.per_symbol_bars) == (2, 0)
-    assert (report.updated, report.skipped, dict(report.failed)) == (2, 1, {})
+    assert (report.bulk_bars, report.bulk_suspended, report.per_symbol_bars) == (9, 1, 0)
+    assert (report.updated, report.skipped, dict(report.failed)) == (9, 1, {})
     assert bar_days(store, "600001") == DAYS[:-1]
 
 
@@ -428,10 +433,10 @@ def test_window_problem_rules() -> None:
 
 
 def test_format_bulk_lines() -> None:
-    assert (
-        format_bulk(True, 3000, 12, "") == "日线批量行情：已启用，批量写入 3000 只，逐只请求 12 只"
+    assert format_bulk(True, 3000, 40, 12, "") == (
+        "日线批量行情：已启用，批量写入 3000 只，判为停牌 40 只，逐只请求 12 只"
     )
-    assert format_bulk(False, 0, 3487, "批量行情获取失败：超时") == (
+    assert format_bulk(False, 0, 0, 3487, "批量行情获取失败：超时") == (
         "日线批量行情：未启用（批量行情获取失败：超时），逐只请求 3487 只"
     )
 
@@ -447,3 +452,155 @@ def test_snapshot_schema_columns() -> None:
         "volume",
         "amount",
     ]
+
+
+# ---------------------------------------------------------------- 复审修订：停牌的认定与整晚闸门
+
+
+def _zero(snapshot: pd.DataFrame, symbol: str) -> None:
+    _set(snapshot, symbol, open=0.0, high=0.0, low=0.0, close=0.0, volume=0.0, amount=0.0)
+
+
+def test_partly_zeroed_snapshot_falls_back_for_whole_night(tmp_path: Path) -> None:
+    market = _market(10)
+    store = _store(tmp_path, market)
+    snapshot = _snapshot(market)
+    _zero(snapshot, "600001")
+    _zero(snapshot, "600002")  # 2/10 = 20% 无成交
+    source = _source(market, snapshot)
+    report = _run(source, store)
+    assert SNAPSHOT_MAX_NO_TRADE == 0.1
+    assert not report.bulk_used
+    assert "无成交" in report.bulk_reason and "2 只" in report.bulk_reason
+    assert sorted(_bars_symbols(source)) == _symbols(10)
+    assert (report.bulk_bars, report.bulk_suspended) == (0, 0)
+
+
+def test_zero_volume_with_nonzero_price_goes_per_symbol(tmp_path: Path) -> None:
+    market = _market(10)
+    store = _store(tmp_path, market)
+    snapshot = _snapshot(market)
+    _set(snapshot, "600003", volume=0.0)  # 价格不是 0：不像停牌，也不能用
+    source = _source(market, snapshot)
+    report = _run(source, store)
+    assert report.bulk_used
+    assert _bars_symbols(source) == ["600003"]
+    assert report.bulk_suspended == 0
+    assert bar_days(store, "600003") == DAYS
+
+
+def test_zeroed_row_with_disagreeing_prev_close_goes_per_symbol(tmp_path: Path) -> None:
+    market = _market(10)
+    store = _store(tmp_path, market)
+    snapshot = _snapshot(market)
+    _zero(snapshot, "600004")
+    _set(snapshot, "600004", prev_close=1.0)
+    source = _source(market, snapshot)
+    report = _run(source, store)
+    assert report.bulk_used
+    assert _bars_symbols(source) == ["600004"]
+    assert report.bulk_suspended == 0
+
+
+def test_small_comparable_sample_falls_back(tmp_path: Path) -> None:
+    market = _market(10)
+    store = _store(tmp_path, market)
+    for symbol in _symbols(10)[4:]:  # 6 只落后两天：可比对、有成交的只剩 4/10 < 50%
+        own = market[market["symbol"] == symbol]
+        store.write(
+            Table.BARS, own[own["day"] <= pd.Timestamp(DAYS[-3])].reset_index(drop=True), symbol
+        )
+    source = _source(market, _snapshot(market))
+    report = _run(source, store)
+    assert SNAPSHOT_MIN_COVERAGE == 0.5
+    assert not report.bulk_used and "样本太小" in report.bulk_reason
+    assert sorted(_bars_symbols(source)) == _symbols(10)
+
+
+def test_all_zero_pre_open_snapshot_falls_back(tmp_path: Path) -> None:
+    market = _market(5)
+    store = _store(tmp_path, market)
+    snapshot = _snapshot(market)
+    for symbol in _symbols(5):
+        _zero(snapshot, symbol)
+    source = _source(market, snapshot)
+    report = _run(source, store)
+    assert not report.bulk_used and report.bulk_reason != ""
+    assert sorted(_bars_symbols(source)) == _symbols(5)
+    assert report.bulk_suspended == 0
+
+
+def test_dividend_on_as_of_goes_per_symbol(tmp_path: Path) -> None:
+    market = _market(10)
+    store = _store(tmp_path, market)
+    div = make_dividends("600005", [(2023, date(2023, 12, 20), AS_OF, 0.001)])
+    store.write(Table.DIVIDENDS, div, symbol="600005")
+    source = _source(market, _snapshot(market))  # 昨收没变（分红太少，参考价不变）
+    report = _run(source, store)
+    assert report.bulk_used
+    assert _bars_symbols(source) == ["600005"]
+
+
+@pytest.mark.parametrize("factor", [float("nan"), 0.0, -1.0, float("inf")])
+def test_bad_stored_adj_factor_goes_per_symbol(tmp_path: Path, factor: float) -> None:
+    market = _market(10)
+    store = _store(tmp_path, market)
+    own = store.read(Table.BARS, symbols=["600006"])
+    own.loc[own["day"] == pd.Timestamp(PREV), "adj_factor"] = factor
+    store.write(Table.BARS, own, symbol="600006")
+    source = _source(market, _snapshot(market))
+    report = _run(source, store)
+    assert report.bulk_used
+    assert _bars_symbols(source) == ["600006"]
+
+
+class _FlakySource(FakeSource):
+    """down 里的股票：日线、分红请求都抛网络错误。"""
+
+    down: frozenset[str] = frozenset()
+
+    def bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
+        if symbol in self.down:
+            self.calls.append(("bars", (symbol, start, end)))
+            raise ConnectionError(f"模拟断网：{symbol}")
+        return super().bars(symbol, start, end)
+
+    def dividends(self, symbol: str) -> pd.DataFrame:
+        if symbol in self.down:
+            self.calls.append(("dividends", (symbol,)))
+            raise ConnectionError(f"模拟断网：{symbol}")
+        return super().dividends(symbol)
+
+
+def test_breaker_still_trips_on_bulk_nights(tmp_path: Path) -> None:
+    market = _market(10)
+    store = _store(tmp_path, market)
+    symbols = _symbols(10)
+    for symbol in symbols[1::2]:  # 奇数位：批量写入，分红财务当天刚下载过 → 完全不联网
+        store.write(Table.DIVIDENDS, make_dividends(symbol, []), symbol=symbol)
+        store.write(Table.FINANCIALS, make_financials(symbol, []), symbol=symbol)
+        set_file_age(tmp_path, Table.DIVIDENDS, symbol, AS_OF, 0)
+        set_file_age(tmp_path, Table.FINANCIALS, symbol, AS_OF, 0)
+    lagging = market[market["symbol"] == "600004"]  # 偶数位里有一只要逐只请求日线
+    store.write(
+        Table.BARS,
+        lagging[lagging["day"] <= pd.Timestamp(DAYS[-3])].reset_index(drop=True),
+        "600004",
+    )
+    source = _FlakySource(
+        trade_days=make_trade_days(CAL_DAYS),
+        securities=make_securities([(s, "sh_main", LISTED, None) for s in symbols]),
+        bars=market,
+        industries=make_industries([(s, "制造业", False) for s in symbols]),
+    )
+    source.snapshot = _snapshot(market)
+    source.down = frozenset(symbols[0::2])
+    cfg = CFG.model_copy(
+        update={"data": CFG.data.model_copy(update={"max_consecutive_failures": 3})}
+    )
+    with pytest.raises(NetworkOutageError, match="连续 3 只"):
+        update_all(source, store, cfg, AS_OF, now=NOW)
+    # 600000、600002（分红）、600004（日线）三次网络失败之间夹着不联网的批量写入股票
+    failed_at = [str(a[0]) for n, a in source.calls if n in ("bars", "dividends")]
+    assert failed_at == ["600000", "600002", "600004"]
+    assert bar_days(store, "600001") == DAYS  # 批量写入照常

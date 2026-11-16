@@ -701,7 +701,16 @@ def test_runs_command_prints_bulk_bars_on_one_line(
 ) -> None:
     started = datetime(2026, 11, 13, 18, 0, tzinfo=SH)
     for day, bulk in (
-        (date(2026, 11, 13), {"used": True, "bars": 3000, "per_symbol": 12, "reason": ""}),
+        (
+            date(2026, 11, 13),
+            {
+                "used": True,
+                "bars": 3000,
+                "suspended": 40,
+                "per_symbol": 12,
+                "reason": "",
+            },
+        ),
         (
             date(2026, 11, 16),
             {"used": False, "bars": 0, "per_symbol": 3487, "reason": "批量行情获取失败：超时"},
@@ -720,7 +729,7 @@ def test_runs_command_prints_bulk_bars_on_one_line(
     db.commit()
     r = invoke("admin", "runs")
     assert r.exit_code == 0, r.stdout
-    assert "日线批量行情：已启用，批量写入 3000 只，逐只请求 12 只" in r.stdout
+    assert "日线批量行情：已启用，批量写入 3000 只，判为停牌 40 只，逐只请求 12 只" in r.stdout
     assert "日线批量行情：未启用（批量行情获取失败：超时），逐只请求 3487 只" in r.stdout
 
 

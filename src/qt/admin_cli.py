@@ -1070,6 +1070,7 @@ def _reason_lines(detail: dict[str, Any]) -> list[str]:
             format_bulk(
                 bool(info.get("used")),
                 int(info.get("bars") or 0),
+                int(info.get("suspended") or 0),
                 int(info.get("per_symbol") or 0),
                 str(info.get("reason") or ""),
             )

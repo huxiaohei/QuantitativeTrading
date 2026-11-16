@@ -779,7 +779,13 @@ def test_nightly_update_uses_bulk_snapshot_and_records_it(env: Env, db: Session)
     pd.testing.assert_frame_equal(stored, expected, check_exact=True)
     run = daily_run(db, day)
     assert run is not None
-    assert run.detail["bulk"] == {"used": True, "bars": 4, "per_symbol": 0, "reason": ""}
+    assert run.detail["bulk"] == {
+        "used": True,
+        "bars": 4,
+        "suspended": 0,
+        "per_symbol": 0,
+        "reason": "",
+    }
 
 
 def test_nightly_update_records_why_bulk_was_not_used(env: Env, db: Session) -> None:
@@ -796,40 +802,66 @@ def test_nightly_update_records_why_bulk_was_not_used(env: Env, db: Session) -> 
     assert "批量行情获取失败" in bulk["reason"]
 
 
+_EXTRA = [f"6000{i:02d}" for i in range(6, 12)]  # 再加 6 只旁观股票：共 11 只
+
+
+def _holding_suspended_in_snapshot(
+    env: Env, db: Session, source_has_bar: bool
+) -> tuple[Subscription, FakeSource]:
+    """手动账持有 600001；批量行情显示它停牌（全 0，昨收对得上），其余 10 只正常成交。
+
+    库里每只股票的日线都只到前一个交易日；source_has_bar 决定逐只接口有没有 600001 当天的日线。
+    1/11 无成交，不超过整晚闸门的 10%。
+    """
+    days = env.days
+    day = days[DAY]
+    sub, _ = _holding_whose_bar_is_missing(env, db, failures=0)
+    template = env.store.read(Table.BARS, symbols=["600005"])  # 600001 的完整日线副本
+    for symbol in _EXTRA:
+        copy = template.copy()
+        copy["symbol"] = symbol
+        env.store.write(Table.BARS, copy, symbol=symbol)
+    symbols = [*TRADING_SYMBOLS, "600005", *_EXTRA]
+    env.store.write(
+        Table.SECURITIES, make_securities([(s, "sh_main", date(2010, 1, 1), None) for s in symbols])
+    )
+    env.store.write(Table.INDUSTRIES, make_industries([(s, "银行", False) for s in symbols]))
+    own = template.copy()
+    own["symbol"] = "600001"
+    others = env.store.read(Table.BARS, symbols=[s for s in symbols if s != "600001"])
+    market = pd.concat([others, own], ignore_index=True)
+    is_held_today = (market["symbol"] == "600001") & (market["day"] == pd.Timestamp(day))
+    source = FakeSource(
+        trade_days=env.store.read(Table.TRADE_DAYS),
+        securities=env.store.read(Table.SECURITIES),
+        bars=(market if source_has_bar else market[~is_held_today]).reset_index(drop=True),
+        dividends=env.store.read(Table.DIVIDENDS),
+        financials=env.store.read(Table.FINANCIALS),
+        industries=env.store.read(Table.INDUSTRIES),
+    )
+    snapshot = snapshot_from_bars(market, day, days[DAY - 1])
+    held = snapshot["symbol"] == "600001"
+    for col in ("open", "high", "low", "close", "volume", "amount"):
+        snapshot.loc[held, col] = 0.0
+    source.snapshot = snapshot
+    _truncate_bars(env.store, day)
+    env.source = source
+    return sub, source
+
+
 def test_holding_suspended_in_snapshot_is_rechecked_and_treated_as_suspended(
     env: Env, db: Session
 ) -> None:
-    days = env.days
-    day = days[DAY]
-    sub, source = _holding_whose_bar_is_missing(env, db, failures=0, source_has_bar=False)
-    everything = pd.concat(
-        [source.bars(s, days[0], day) for s in [*TRADING_SYMBOLS, "600005"]], ignore_index=True
-    )
-    source.calls.clear()
-    snapshot = snapshot_from_bars(everything, day, days[DAY - 1])
-    prev_close = float(
-        everything[
-            (everything["symbol"] == "600001") & (everything["day"] == pd.Timestamp(days[DAY - 1]))
-        ]["close"].iloc[0]
-    )
-    suspended = pd.DataFrame(
-        {
-            "symbol": pd.Series(["600001"], dtype="str"),
-            **{c: pd.Series([0.0], dtype="float64") for c in ("open", "high", "low", "close")},
-            "prev_close": pd.Series([prev_close], dtype="float64"),
-            "volume": pd.Series([0.0], dtype="float64"),
-            "amount": pd.Series([0.0], dtype="float64"),
-        }
-    )
-    source.snapshot = pd.concat([snapshot, suspended], ignore_index=True)
-    _truncate_bars(env.store, day)
+    day = env.days[DAY]
+    sub, source = _holding_suspended_in_snapshot(env, db, source_has_bar=False)
     assert run_day(env.ctx, day, True, True) == "done"
     assert processed_through(db, sub, "manual") == day
     # 更新阶段没有逐只请求；持仓缺当日日线，由行情检查再请求一次，数据源回答没有 → 停牌
     assert [args[0] for name, args in source.calls if name == "bars"] == ["600001"]
     run = daily_run(db, day)
     assert run is not None
-    assert run.detail["bulk"]["used"] is True and run.detail["bulk"]["bars"] == 4
+    bulk = run.detail["bulk"]
+    assert (bulk["used"], bulk["bars"], bulk["suspended"], bulk["per_symbol"]) == (True, 10, 1, 0)
     assert run.detail["download_failed"] == {}
     assert run.detail["bars_retried"] == {
         "symbols": ["600001"],
@@ -837,3 +869,18 @@ def test_holding_suspended_in_snapshot_is_rechecked_and_treated_as_suspended(
         "failed": {},
     }
     assert not [m for m in env.sender.sent if m.to_addr == ADMIN]
+
+
+def test_holding_wrongly_suspended_in_snapshot_gets_its_bar_from_the_recheck(
+    env: Env, db: Session
+) -> None:
+    day = env.days[DAY]
+    sub, source = _holding_suspended_in_snapshot(env, db, source_has_bar=True)
+    assert run_day(env.ctx, day, True, True) == "done"
+    assert processed_through(db, sub, "manual") == day
+    assert [args[0] for name, args in source.calls if name == "bars"] == ["600001"]
+    stored = env.store.read(Table.BARS, symbols=["600001"])
+    assert stored["day"].max() == pd.Timestamp(day)
+    run = daily_run(db, day)
+    assert run is not None
+    assert run.detail["bars_retried"] == {"symbols": ["600001"], "still_missing": [], "failed": {}}

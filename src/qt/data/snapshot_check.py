@@ -19,10 +19,14 @@ from qt.data.update import (
     prev_close_matches,
     snapshot_quotes,
     snapshot_window_problem,
+    traded,
+    zeroed,
 )
 
 # 逐项比较的列：批量行情与逐只日线都有
 _FIELDS = ("open", "high", "low", "close", "volume", "amount")
+# 另外抽查的“批量行情显示停牌”的股票数上限
+SUSPENDED_SAMPLE = 5
 
 
 @dataclass(frozen=True)
@@ -68,9 +72,11 @@ def check_snapshot(
     """取一次批量行情，对抽样股票逐只请求同一天的日线，逐项比较；不写任何数据。
 
     as_of 按已存储的交易日历取 now 时最近一个已收盘的交易日。抽样范围：库里在市的证券中批量行情
-    显示当天有成交的。每只股票比较开高低收、成交量、成交额是否完全相同；库里有前一交易日日线且
-    昨收对得上的，再看逐只接口给出的复权因子是否等于沿用值。昨收对不上的（当天除权）单独计数，
-    不算不一致。
+    显示当天有成交的 sample 只，另加批量行情显示停牌（成交量、开盘价、最新价都是 0）的至多
+    SUSPENDED_SAMPLE 只。有成交的：比较开高低收、成交量、成交额是否完全相同；库里有前一交易日日线
+    且昨收对得上的，再看逐只接口给出的复权因子是否等于沿用值；昨收对不上的（当天除权）且价格一致的
+    单独计数，不算不一致。停牌的：逐只接口不应有 as_of 的日线，有则不一致。
+    每只股票恰好计入一类（一致、不一致、当天除权、无法核对），各类之和等于核对的只数。
     """
     calendar = load_calendar(store)
     as_of = latest_closed_day(now, calendar)
@@ -96,32 +102,43 @@ def check_snapshot(
         f"批量行情 {len(quotes)} 只；昨收与库里 {prev} 的收盘价相符 {matched}/{total}（{share}），"
         f"整晚使用批量行情要求不低于 {SNAPSHOT_MIN_MATCH:.0%}"
     )
-    population = sorted(s for s in listed if s in quotes and quotes[s].volume > 0)
+    population = sorted(s for s in listed if s in quotes and traded(quotes[s]))
     chosen = sorted(rng.sample(population, min(sample, len(population))))
+    idle = sorted(s for s in listed if s in quotes and zeroed(quotes[s]))
+    idle_chosen = sorted(rng.sample(idle, min(SUSPENDED_SAMPLE, len(idle))))
     same = differ = ex_rights = unable = 0
-    for symbol in chosen:
+    for symbol in [*chosen, *idle_chosen]:
         try:
             bars = source.bars(symbol, as_of, as_of)
         except Exception as exc:  # 单只失败不影响其他股票
             unable += 1
-            lines.append(f"  {symbol}：逐只请求失败：{type(exc).__name__}: {exc}")
+            lines.append(f"  {symbol}：无法核对：逐只请求失败：{type(exc).__name__}: {exc}")
             continue
         today = bars[bars["day"] == pd.Timestamp(as_of)]
+        if symbol in idle_chosen:
+            if len(today) == 0:
+                same += 1
+            else:
+                differ += 1
+                lines.append(f"  {symbol}：不一致：批量行情显示停牌，逐只接口却有 {as_of} 的日线")
+            continue
         if len(today) == 0:
             differ += 1
             lines.append(f"  {symbol}：不一致：逐只接口没有 {as_of} 的日线，批量行情却有成交")
             continue
         diffs, shifted = _compare(quotes[symbol], today.iloc[0], stored.get(symbol))
-        if shifted:
-            ex_rights += 1
-            lines.append(f"  {symbol}：当天除权（昨收对不上），批量路径会改走逐只请求")
         if diffs:
             differ += 1
             lines.append(f"  {symbol}：不一致：{'；'.join(diffs)}")
+        elif shifted:
+            ex_rights += 1
+            lines.append(f"  {symbol}：当天除权（昨收对不上），批量路径会改走逐只请求")
         else:
             same += 1
+    total_checked = len(chosen) + len(idle_chosen)
     lines.append(
-        f"核对 {len(chosen)} 只：一致 {same} 只，不一致 {differ} 只，"
+        f"核对 {total_checked} 只（有成交 {len(chosen)} 只、停牌 {len(idle_chosen)} 只）："
+        f"一致 {same} 只，不一致 {differ} 只，"
         f"当天除权（昨收对不上，批量路径会改走逐只请求）{ex_rights} 只，无法核对 {unable} 只"
     )
     return SnapshotCheck(as_of, lines, ok=differ == 0 and unable == 0)

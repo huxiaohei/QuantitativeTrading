@@ -27,11 +27,11 @@ from qt.data.update import (
     DataIntegrityError,
     SharedTableError,
     check_integrity,
-    format_bulk,
     latest_closed_day,
     load_calendar,
     refresh_bars,
     refresh_fundamentals,
+    report_bulk_line,
     update_all,
 )
 from qt.db import admin_repo, repo
@@ -241,7 +241,7 @@ class Downloaded:
     """本次数据更新的目标日、逐只下载失败（symbol -> 错误信息）与批量行情的使用情况。
 
     bulk 记入 daily_runs.detail["bulk"]：used（是否用了批量行情）、bars（批量写入只数）、
-    per_symbol（逐只请求日线的只数）、reason（没用的原因）。
+    suspended（判为停牌的只数）、per_symbol（逐只请求日线的只数）、reason（没用的原因）。
     """
 
     as_of: date
@@ -269,11 +269,12 @@ def _update_data(ctx: RunContext, as_of: date) -> tuple[list[str], Downloaded]:
         report.skipped,
         len(report.failed),
         len(report.download_failed),
-        format_bulk(report.bulk_used, report.bulk_bars, report.per_symbol_bars, report.bulk_reason),
+        report_bulk_line(report),
     )
     bulk = {
         "used": report.bulk_used,
         "bars": report.bulk_bars,
+        "suspended": report.bulk_suspended,
         "per_symbol": report.per_symbol_bars,
         "reason": report.bulk_reason,
     }

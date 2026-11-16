@@ -30,9 +30,9 @@ from qt.data.update import (
     check_integrity,
     count_delist_missing,
     count_no_bars,
-    format_bulk,
     latest_closed_day,
     load_calendar,
+    report_bulk_line,
     update_all,
 )
 from qt.jobs.backup import backup_from_env
@@ -131,9 +131,7 @@ def run_update(
         f"失败 {len(report.failed)} 只（其中已退市且无日线 {count_no_bars(report.failed)} 只，"
         f"退市日期缺失被丢弃 {count_delist_missing(report.failed)} 只）；失败明细见 {failures}"
     )
-    typer.echo(
-        format_bulk(report.bulk_used, report.bulk_bars, report.per_symbol_bars, report.bulk_reason)
-    )
+    typer.echo(report_bulk_line(report))
 
     problems = [*report.problems, *check_integrity(store, load_calendar(store), as_of, symbols)]
     if problems:

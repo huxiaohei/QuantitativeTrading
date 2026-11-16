@@ -49,6 +49,11 @@ _NEXT_DAY_CUTOFF = time(9, 0)
 SNAPSHOT_TOLERANCE = 0.005
 # 可比对的股票里昨收对得上的最低比例；低于此值说明批量行情不是 as_of 那天的，整晚改走逐只请求
 SNAPSHOT_MIN_MATCH = 0.9
+# 可比对的股票（库里最后一根是前一交易日、批量行情里有它）中没有成交的比例上限；超过说明批量行情
+# 被部分清零或不可信，整晚改走逐只请求
+SNAPSHOT_MAX_NO_TRADE = 0.1
+# 有成交的可比对股票至少占本次要更新的在市股票的这个比例，否则比例闸门的样本太小，整晚改走逐只请求
+SNAPSHOT_MIN_COVERAGE = 0.5
 
 ProgressFn = Callable[[str, int, int], None]
 # 进度回调的默认间隔（只）
@@ -133,15 +138,30 @@ class UpdateReport:
     download_failed: Mapping[str, str] = field(default_factory=dict[str, str])
     bulk_used: bool = False  # 本次是否用了批量行情
     bulk_bars: int = 0  # 由批量行情写入的日线只数
+    bulk_suspended: int = 0  # 按批量行情判为停牌（不写日线、不请求）的只数
     per_symbol_bars: int = 0  # 逐只请求日线的股票数
     bulk_reason: str = ""  # 没有用批量行情的原因（用了则为空）
 
 
-def format_bulk(used: bool, bars: int, per_symbol: int, reason: str) -> str:
+def format_bulk(used: bool, bars: int, suspended: int, per_symbol: int, reason: str) -> str:
     """批量行情使用情况的一行中文说明（命令行与 qt admin runs 共用）。"""
     if used:
-        return f"日线批量行情：已启用，批量写入 {bars} 只，逐只请求 {per_symbol} 只"
+        return (
+            f"日线批量行情：已启用，批量写入 {bars} 只，判为停牌 {suspended} 只，"
+            f"逐只请求 {per_symbol} 只"
+        )
     return f"日线批量行情：未启用（{reason}），逐只请求 {per_symbol} 只"
+
+
+def report_bulk_line(report: UpdateReport) -> str:
+    """一次更新的批量行情使用情况（format_bulk 的一行）。"""
+    return format_bulk(
+        report.bulk_used,
+        report.bulk_bars,
+        report.bulk_suspended,
+        report.per_symbol_bars,
+        report.bulk_reason,
+    )
 
 
 def count_no_bars(failed: Mapping[str, str]) -> int:
@@ -253,36 +273,55 @@ def prev_close_matches(
     return sum(compared), len(compared)
 
 
+def traded(quote: Quote) -> bool:
+    """批量行情里这只股票当天有成交（成交量 > 0）。"""
+    return quote.volume > 0
+
+
+def zeroed(quote: Quote) -> bool:
+    """批量行情里这一行是停牌的样子：成交量、开盘价、最新价都是 0。"""
+    return quote.volume == 0 and quote.open == 0 and quote.close == 0
+
+
 def _usable(quote: Quote) -> bool:
     """有成交、价格为正（另要求最高、最低、成交额都是有限数，否则不可信）。"""
     finite = all(math.isfinite(v) for v in (quote.high, quote.low, quote.amount))
-    return quote.open > 0 and quote.close > 0 and quote.volume > 0 and finite
+    return quote.open > 0 and quote.close > 0 and traded(quote) and finite
 
 
 @dataclass(frozen=True)
 class _Bulk:
     """本次运行可用的批量行情：as_of 当天的行情与库里前一交易日的 (收盘价, 复权因子)。
 
-    prev_bars 只含库里最后一根日线正好是 prev 的股票。
+    prev_bars 只含库里最后一根日线正好是 prev 的股票；ex_today 是库里分红表在 as_of 除权除息的股票。
     """
 
     as_of: date
     prev: date
     quotes: Mapping[str, Quote]
     prev_bars: Mapping[str, tuple[float, float]]
+    ex_today: frozenset[str]
 
     def suspended(self, symbol: str) -> bool:
-        """批量行情里有它但没有成交（成交量为 0）。"""
-        quote = self.quotes.get(symbol)
-        return quote is not None and quote.volume == 0
-
-    def bar(self, symbol: str) -> pd.DataFrame | None:
-        """可信时返回 as_of 当天的日线（复权因子沿用前一根），否则 None（改走逐只请求）。"""
+        """停牌：这一行的成交量、开盘价、最新价都是 0，且昨收与库里前一日收盘价对得上。"""
         quote = self.quotes.get(symbol)
         stored = self.prev_bars.get(symbol)
-        if quote is None or stored is None or not _usable(quote):
+        if quote is None or stored is None or not zeroed(quote):
+            return False
+        return prev_close_agrees(quote, stored[0])
+
+    def bar(self, symbol: str) -> pd.DataFrame | None:
+        """可信时返回 as_of 当天的日线（复权因子沿用前一根），否则 None（改走逐只请求）。
+
+        当天有除权除息记录、或前一根的复权因子不是正的有限数时不用批量行情。
+        """
+        quote = self.quotes.get(symbol)
+        stored = self.prev_bars.get(symbol)
+        if quote is None or stored is None or not _usable(quote) or symbol in self.ex_today:
             return None
         close, adj_factor = stored
+        if not (math.isfinite(adj_factor) and adj_factor > 0):
+            return None
         if not prev_close_agrees(quote, close):
             return None  # 当天除权（昨收参考价被调整）或数据不对
         return pd.DataFrame(
@@ -302,10 +341,12 @@ class _Bulk:
 
 @dataclass
 class _BarStats:
-    """日线来源计数：批量写入的只数与逐只请求的只数。"""
+    """本次运行的计数：批量写入、判为停牌、逐只请求日线的只数，以及成功返回的网络请求次数。"""
 
     bulk: int = 0
+    suspended: int = 0
     per_symbol: int = 0
+    requests_ok: int = 0
 
 
 def _prepare_bulk(
@@ -316,12 +357,14 @@ def _prepare_bulk(
     now: datetime | None,
     universe: Sequence[str],
     wanted: Sequence[str],
+    listed_wanted: Sequence[str],
 ) -> tuple[_Bulk | None, str]:
     """决定本次是否用批量行情；返回 (_Bulk, "") 或 (None, 不用的原因)。
 
     批量行情最多请求一次、失败不重试。整体闸门：配置开启、调用方给了当前时间且在有效时段内、
-    请求成功、可比对的股票里昨收对得上的比例不低于 SNAPSHOT_MIN_MATCH。
-    没有任何要处理的股票停在前一交易日时不请求。
+    请求成功；可比对的股票（库里最后一根是前一交易日、批量行情里有它）中没有成交的不超过
+    SNAPSHOT_MAX_NO_TRADE；有成交的可比对股票不少于本次要更新的在市股票的 SNAPSHOT_MIN_COVERAGE；
+    其中昨收对得上的比例不低于 SNAPSHOT_MIN_MATCH。没有任何要处理的股票停在前一交易日时不请求。
     """
     if not cfg.data.bulk_bars:
         return None, "配置 data.bulk_bars 为假"
@@ -347,15 +390,33 @@ def _prepare_bulk(
         quotes = snapshot_quotes(source.daily_snapshot())
     except Exception as exc:  # 只请求一次：限流、超时、格式变化都退回逐只请求
         return None, f"批量行情获取失败：{type(exc).__name__}: {exc}"
+    comparable = [quotes[s] for s in prev_bars if s in quotes]
+    if not comparable:
+        return None, f"批量行情里没有可比对的股票（库里日线停在 {prev} 的股票都不在批量行情里）"
+    idle = sum(1 for q in comparable if not traded(q))
+    if idle / len(comparable) > SNAPSHOT_MAX_NO_TRADE:
+        return None, (
+            f"可比对的 {len(comparable)} 只股票中批量行情显示无成交的有 {idle} 只"
+            f"（{idle / len(comparable):.1%}），超过 {SNAPSHOT_MAX_NO_TRADE:.0%}，"
+            "批量行情可能被清零或不完整"
+        )
     matched, total = prev_close_matches(quotes, {s: c for s, (c, _) in prev_bars.items()})
-    if total == 0:
-        return None, f"批量行情里没有可比对昨收的股票（库里 {prev} 有日线且当天有成交的为 0 只）"
+    needed = SNAPSHOT_MIN_COVERAGE * len(listed_wanted)
+    if total == 0 or total < needed:
+        return None, (
+            f"有成交的可比对股票只有 {total} 只，不到本次要更新的在市股票"
+            f" {len(listed_wanted)} 只的 {SNAPSHOT_MIN_COVERAGE:.0%}，样本太小"
+        )
     if matched / total < SNAPSHOT_MIN_MATCH:
         return None, (
             f"批量行情的昨收与库里 {prev} 收盘价相符的只有 {matched}/{total}"
             f"（{matched / total:.1%}），低于 {SNAPSHOT_MIN_MATCH:.0%}，可能不是 {as_of} 的数据"
         )
-    return _Bulk(as_of, prev, quotes, prev_bars), ""
+    dividends = store.read(Table.DIVIDENDS)
+    ex_today = frozenset(
+        str(s) for s in dividends.loc[dividends["ex_date"] == pd.Timestamp(as_of), "symbol"]
+    )
+    return _Bulk(as_of, prev, quotes, prev_bars, ex_today), ""
 
 
 def _shared[T](name: str, fn: Callable[[], T]) -> T:
@@ -590,8 +651,8 @@ def _update_bars(
 ) -> bool:
     """更新一只股票的日线（不存 as_of 之后的行）；有新行写入返回 True。
 
-    bulk 不为空且库里最后一根日线正好是前一交易日时先看批量行情：停牌（有它但没有成交）则不写、
-    不请求；可信则写入 as_of 的日线；其余情形照旧逐只请求。stats 记录日线的来源。
+    bulk 不为空且库里最后一根日线正好是前一交易日时先看批量行情：停牌（见 _Bulk.suspended）则不写、
+    不请求；可信则写入 as_of 的日线；其余情形照旧逐只请求。stats 记录日线的来源与成功的请求次数。
     """
     first_start = _years_before(cfg.backtest.in_sample_start, _LOOKBACK_YEARS)
     last = store.last_day(Table.BARS, symbol)
@@ -601,6 +662,8 @@ def _update_bars(
         return False
     if bulk is not None and last == bulk.prev:
         if bulk.suspended(symbol):
+            if stats is not None:
+                stats.suspended += 1
             return False  # 停牌：不写日线，也不逐只请求
         bar = bulk.bar(symbol)
         if bar is not None:
@@ -612,6 +675,8 @@ def _update_bars(
         stats.per_symbol += 1
     start = first_start if last is None else last + timedelta(days=1)
     df = source.bars(symbol, start, as_of)
+    if stats is not None:
+        stats.requests_ok += 1
     df = df[df["day"] <= pd.Timestamp(as_of)]
     if len(df) == 0:
         if delisted and last is None:
@@ -628,17 +693,25 @@ def _update_fundamentals(
     symbol: str,
     today: date,
     force: bool = False,
+    stats: _BarStats | None = None,
 ) -> None:
-    """分红与财务：按文件年龄滚动刷新（force 为真则不看年龄），只保留 data_start 之后的行。"""
+    """分红与财务：按文件年龄滚动刷新（force 为真则不看年龄），只保留 data_start 之后的行。
+
+    stats 不为空时记录成功返回的请求次数。
+    """
     days = cfg.data.fundamentals_refresh_days
     start = pd.Timestamp(cfg.backtest.data_start)
     age = _file_age_days(store, Table.DIVIDENDS, symbol, today)
     if force or fundamentals_due(symbol, age, today, days):
         div = source.dividends(symbol)
+        if stats is not None:
+            stats.requests_ok += 1
         store.write(Table.DIVIDENDS, div[div["ex_date"] >= start], symbol)
     age = _file_age_days(store, Table.FINANCIALS, symbol, today)
     if force or fundamentals_due(symbol, age, today, days):
         fin = source.financials(symbol)
+        if stats is not None:
+            stats.requests_ok += 1
         store.write(Table.FINANCIALS, fin[fin["report_period"] >= start], symbol)
 
 
@@ -710,7 +783,7 @@ def update_all(
     try:
         try:
             bulk, bulk_reason = _prepare_bulk(
-                source, store, cfg, as_of, now, list(in_universe.index), wanted
+                source, store, cfg, as_of, now, list(in_universe.index), wanted, listed_wanted
             )
         except Exception as exc:  # 本地数据读不出等：退回逐只请求，不影响本次更新
             _log.exception("准备批量行情出错，改走逐只请求")
@@ -727,6 +800,9 @@ def update_all(
             symbols is None,
         )
         for i, symbol in enumerate(wanted, start=1):
+            # 熔断只看网络：成功返回过请求才清零连续失败数，没有联网的股票（批量写入、停牌、
+            # 已是最新且基本面未到期等）不改变它
+            requests_before = stats.requests_ok
             try:
                 if symbol not in in_universe.index:
                     raise ValueError("不在配置板块的证券列表中")
@@ -738,15 +814,18 @@ def update_all(
                     changed = _update_bars(
                         source, store, cfg, symbol, delisted, as_of, latest, bulk, stats
                     )
-                    _update_fundamentals(source, store, cfg, symbol, as_of)
+                    _update_fundamentals(source, store, cfg, symbol, as_of, stats=stats)
                     updated, skipped = (updated + 1, skipped) if changed else (updated, skipped + 1)
-                guard.ok()
-            except _NoBarsError:
+                if stats.requests_ok > requests_before:
+                    guard.ok()
+            except _NoBarsError:  # 数据源正常回答了（没有日线）
                 _record(failed, symbol, f"{NO_BARS_PREFIX}：已退市股票取不到日线")
                 guard.ok()
             except Exception as exc:  # 单只股票失败不影响其他股票
                 _record(failed, symbol, f"{type(exc).__name__}: {exc}")
                 download_failed[symbol] = f"{type(exc).__name__}: {exc}"
+                if stats.requests_ok > requests_before:
+                    guard.ok()  # 本只先有请求成功，网络当时是通的
                 guard.failed(exc)
             if progress is not None and i % progress_every == 0:
                 progress("日线", i, len(wanted))
@@ -772,6 +851,7 @@ def update_all(
         download_failed=download_failed,
         bulk_used=bulk is not None,
         bulk_bars=stats.bulk,
+        bulk_suspended=stats.suspended,
         per_symbol_bars=stats.per_symbol,
         bulk_reason=bulk_reason,
     )
