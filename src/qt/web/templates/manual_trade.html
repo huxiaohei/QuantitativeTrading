@@ -10,6 +10,7 @@
   {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   <form method="post" action="/manual/trade" class="form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="form_key" value="{{ form_key }}">
     <label>方向
       <select name="side">
         <option value="buy"{% if values.get("side") == "buy" %} selected{% endif %}>买入</option>

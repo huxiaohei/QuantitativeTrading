@@ -464,6 +464,12 @@ def _check_void(entries: Sequence[Entry], new: Entry) -> None:
         raise ValidationError(f"流水 {target.id} 已作废，不能重复作废")
 
 
+def check_symbol(known_symbols: AbstractSet[str], symbol: str | None) -> None:
+    """股票代码必须是可以录入的（站点股票池所在板块的证券）；不需要行情，网页可以先做这一步。"""
+    if symbol not in known_symbols:
+        raise ValidationError(f"股票代码不存在：{symbol}")
+
+
 def _check_fields(
     new: Entry,
     market: Market,
@@ -476,8 +482,8 @@ def _check_fields(
     """不依赖重放的逐项检查。"""
     kind = new.kind
     with_symbol = kind in (EntryKind.BUY, EntryKind.SELL, EntryKind.TRANSFER_IN)
-    if with_symbol and new.symbol not in known_symbols:
-        raise ValidationError(f"股票代码不存在：{new.symbol}")
+    if with_symbol:
+        check_symbol(known_symbols, new.symbol)
     day = new.trade_day
     if day > today:
         raise ValidationError(f"日期 {day} 不能晚于今天（{today}）")
@@ -569,8 +575,9 @@ def validate_entry(
         except _LedgerProblem as p:
             raise LedgerInconsistentError(
                 f"账本现有流水已不一致（与本次录入无关）：{old.message}；加上本次录入后仍不一致："
-                f"{p.message}。录入一笔足够的入金（qt admin cash deposit），或作废出错的流水"
-                "（qt admin entry void），把账本修好之后再录入其他流水"
+                f"{p.message}",
+                "。录入一笔足够的入金（qt admin cash deposit），或作废出错的流水"
+                "（qt admin entry void），把账本修好之后再录入其他流水",
             ) from p
         return  # 本次录入把账本修好了
     try:

@@ -6,6 +6,7 @@
   {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   <form method="post" action="/manual/cash" class="form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="form_key" value="{{ form_key }}">
     <label>类型
       <select name="kind">
         <option value="deposit"{% if values.get("kind") == "deposit" %} selected{% endif %}>入金</option>

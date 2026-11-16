@@ -29,4 +29,13 @@ class EmailNotVerifiedError(AuthError):
 
 
 class LedgerInconsistentError(Exception):
-    """账本现有流水本身已不一致（系统问题，不是本次输入的错），需要管理员处理。"""
+    """账本现有流水本身已不一致（系统问题，不是本次输入的错）。
+
+    reason 是原因；hint 是接在原因后面的修复办法（可能写着命令行命令，网页不显示它）。
+    str(异常) 是两者相连，命令行显示的文字不变。
+    """
+
+    def __init__(self, reason: str, hint: str = "") -> None:
+        super().__init__(reason + hint)
+        self.reason = reason
+        self.hint = hint

@@ -41,8 +41,7 @@ class StoreMarket:
     def __init__(self, store: ParquetStore, panel: FeaturePanel, cfg: AppConfig) -> None:
         self._store = store
         self.panel = panel
-        securities = store.read(Table.SECURITIES)
-        securities = securities[securities["board"].isin(cfg.universe.boards)]
+        securities = _universe_securities(store, cfg)
         symbols = [str(s) for s in securities["symbol"]]
         self._symbols = frozenset(symbols)
         self._delisted: dict[str, date] = {}
@@ -137,6 +136,16 @@ class StoreMarket:
         if bars.empty:
             return None
         return float(bars["low"].min()), float(bars["high"].max())
+
+
+def _universe_securities(store: ParquetStore, cfg: AppConfig) -> pd.DataFrame:
+    securities = store.read(Table.SECURITIES)
+    return securities[securities["board"].isin(cfg.universe.boards)]
+
+
+def known_symbols(store: ParquetStore, cfg: AppConfig) -> frozenset[str]:
+    """可以录入的股票代码（站点股票池所在板块的全部证券，含已退市）；只读证券表，不建行情。"""
+    return frozenset(str(s) for s in _universe_securities(store, cfg)["symbol"])
 
 
 def security_names(store: ParquetStore) -> dict[str, str]:

@@ -1,7 +1,9 @@
 """手动账页面：查看、录入买入卖出、已有持仓、入金出金、作废；失败原因、归属隔离、账本不一致。"""
 
+import dataclasses
 import re
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
+from datetime import date
 from pathlib import Path
 
 import httpx2 as httpx
@@ -17,6 +19,7 @@ from qt.db import repo
 from qt.db.models import LedgerEntry, Signal, Subscription
 from qt.service import accounts, views
 from qt.service.actor import CLI
+from qt.service.form_keys import new_form_value
 from qt.service.market import StoreMarket, build_store_market
 from qt.web.app import create_app
 from qt.web.deps import WebDeps
@@ -60,8 +63,16 @@ def _subscribe(db: Session, world: World, user_id: int) -> Subscription:
 
 
 def _post(client: TestClient, path: str, data: dict[str, str]) -> httpx.Response:
+    """带防伪造令牌提交表单；没给 form_key 的（录入表单）每次用一个新的一次性值。"""
     token = csrf_of(client.get("/manual/cash"))
-    return client.post(path, data={**data, "csrf": token}, follow_redirects=False)
+    extra = {} if "/void" in path or "form_key" in data else {"form_key": new_form_value()}
+    return client.post(path, data={**data, **extra, "csrf": token}, follow_redirects=False)
+
+
+def _form_key(page: str) -> str:
+    found = re.search(r'name="form_key" value="([^"]+)"', page)
+    assert found is not None, "页面里没有 form_key"
+    return found.group(1)
 
 
 def _ledger(db: Session, sub: Subscription) -> list[LedgerEntry]:
@@ -301,18 +312,148 @@ def test_pages_say_main_board_only(
     assert "目前只支持沪深主板股票" in _page(client, "/manual")
 
 
-def test_duplicate_post_of_the_same_buy_form(
+def test_same_form_submitted_twice_writes_one_entry(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    """实际行为：服务层没有幂等判断，同一个表单连续提交两次得到两条一样的买入流水，都是 303。"""
+    """同一个表单（同一个一次性值）连点两次：只有一条流水，第二次 303 到 /manual 并提示已录入过。"""
     sub = _subscribe(db, world, _login(client, make_user))
-    form = _buy_form(world)
+    form = {**_buy_form(world), "form_key": _form_key(_page(client, "/manual/trade"))}
     first = _post(client, "/manual/trade", form)
     second = _post(client, "/manual/trade", form)
-    assert (first.status_code, second.status_code) == (303, 303)
-    assert first.headers["location"] != second.headers["location"]
-    rows = _ledger(db, sub)
-    assert [(r.kind, r.symbol, r.shares) for r in rows] == [("buy", "600001", 1000)] * 2
+    assert first.headers["location"].startswith("/manual?msg=manual_trade")
+    assert (second.status_code, second.headers["location"]) == (303, "/manual?msg=manual_duplicate")
+    assert "这笔已经录入过，没有重复记录" in _page(client, second.headers["location"])
+    assert [(r.kind, r.shares) for r in _ledger(db, sub)] == [("buy", 1000)]
+
+
+def test_holding_and_cash_forms_are_also_deduplicated(
+    client: TestClient, make_user: MakeUser, world: World, db: Session
+) -> None:
+    sub = _subscribe(db, world, _login(client, make_user))
+    holding = {
+        "symbol": "600003",
+        "buy_day": str(world.days[DAY - 30]),
+        "cost_price": "9",
+        "shares": "100",
+        "form_key": new_form_value(),
+    }
+    cash = {
+        "kind": "deposit",
+        "day": str(world.days[DAY]),
+        "amount": "100",
+        "form_key": new_form_value(),
+    }
+    for path, data in (("/manual/holding", holding), ("/manual/cash", cash)):
+        assert _post(client, path, data).headers["location"].startswith("/manual?msg=manual_")
+        again = _post(client, path, data)
+        assert again.headers["location"] == "/manual?msg=manual_duplicate"
+    assert [r.kind for r in _ledger(db, sub)] == ["transfer_in", "deposit"]
+
+
+def test_two_renders_with_same_content_are_two_trades(
+    client: TestClient, make_user: MakeUser, world: World, db: Session
+) -> None:
+    sub = _subscribe(db, world, _login(client, make_user))
+    first_key = _form_key(_page(client, "/manual/trade"))
+    second_key = _form_key(_page(client, "/manual/trade"))
+    assert first_key != second_key
+    for key in (first_key, second_key):
+        assert (
+            _post(client, "/manual/trade", {**_buy_form(world), "form_key": key}).status_code == 303
+        )
+    assert len(_ledger(db, sub)) == 2
+
+
+def test_failed_write_does_not_burn_the_form_value(
+    client: TestClient, make_user: MakeUser, world: World, db: Session
+) -> None:
+    sub = _subscribe(db, world, _login(client, make_user))
+    key = new_form_value()
+    bad = _post(client, "/manual/trade", {**_buy_form(world, shares="150"), "form_key": key})
+    assert bad.status_code == 422 and _ledger(db, sub) == []
+    fresh = _form_key(bad.text)
+    assert fresh != key  # 重新显示的表单带新的值
+    # 用重新显示的表单改正后提交成功；原来的值也没有被占用
+    assert (
+        _post(client, "/manual/trade", {**_buy_form(world), "form_key": fresh}).status_code == 303
+    )
+    assert _post(client, "/manual/trade", {**_buy_form(world), "form_key": key}).status_code == 303
+    assert len(_ledger(db, sub)) == 2
+
+
+@pytest.mark.parametrize("value", ["", "short", "has space and ?? characters!!", "x" * 65])
+def test_missing_or_malformed_form_value_is_rejected(
+    client: TestClient, make_user: MakeUser, world: World, db: Session, value: str
+) -> None:
+    sub = _subscribe(db, world, _login(client, make_user))
+    token = csrf_of(client.get("/manual/cash"))
+    paths = {
+        "/manual/trade": _buy_form(world),
+        "/manual/cash": {"kind": "deposit", "day": str(world.days[DAY]), "amount": "1"},
+    }
+    for path, data in paths.items():
+        resp = client.post(
+            path, data={**data, "form_key": value, "csrf": token}, follow_redirects=False
+        )
+        assert resp.status_code == 422 and "表单已失效" in resp.text
+    missing = client.post(
+        "/manual/trade", data={**_buy_form(world), "csrf": token}, follow_redirects=False
+    )
+    assert missing.status_code == 422
+    assert _ledger(db, sub) == []
+
+
+def test_forms_carry_a_form_value(
+    client: TestClient, make_user: MakeUser, world: World, db: Session
+) -> None:
+    _subscribe(db, world, _login(client, make_user))
+    for path in ("/manual/trade", "/manual/holding", "/manual/cash"):
+        assert len(_form_key(_page(client, path))) >= 16
+
+
+def test_void_twice_is_a_clear_422_with_one_void(
+    client: TestClient, make_user: MakeUser, world: World, db: Session
+) -> None:
+    sub = _subscribe(db, world, _login(client, make_user))
+    _post(client, "/manual/trade", _buy_form(world))
+    (buy,) = _ledger(db, sub)
+    assert _post(client, f"/manual/entries/{buy.id}/void", {}).status_code == 303
+    again = _post(client, f"/manual/entries/{buy.id}/void", {})
+    assert again.status_code == 422 and "已作废，不能重复作废" in again.text
+    assert [r.kind for r in _ledger(db, sub)] == ["buy", "void"]
+
+
+def test_unsupported_symbol_does_not_build_a_market(
+    deps: WebDeps, make_user: MakeUser, world: World, db: Session
+) -> None:
+    builds: list[str] = []
+
+    def counting(today: date, symbols: Collection[str]) -> StoreMarket:
+        builds.append(",".join(sorted(symbols)))
+        return deps.market(today, symbols)
+
+    with TestClient(create_app(dataclasses.replace(deps, market=counting)), base_url=BASE) as c:
+        sub = _subscribe(db, world, _login(c, make_user))
+        before = len(builds)
+        for symbol in ("abc", "300001", "9" * 500):
+            resp = _post(c, "/manual/trade", _buy_form(world, symbol=symbol))
+            assert resp.status_code == 422 and "股票代码不存在" in resp.text
+            held = _post(
+                c,
+                "/manual/holding",
+                {
+                    "symbol": symbol,
+                    "buy_day": str(world.days[DAY - 30]),
+                    "cost_price": "9",
+                    "shares": "100",
+                },
+            )
+            assert held.status_code == 422 and "股票代码不存在" in held.text
+        # 每次提交页面都会 GET 一下 /manual/cash 取令牌，那不建行情；提交本身一次也没建
+        assert len(builds) == before
+        assert _ledger(db, sub) == []
+        assert _post(c, "/manual/trade", _buy_form(world)).status_code == 303
+        assert len(builds) > before  # 合法代码照常建行情
 
 
 # ---- 没有订阅 ----
@@ -404,7 +545,11 @@ def test_cannot_void_someone_elses_entry(
         # 对方录入的流水不带到我的账里，我的账页面也看不到对方的
         _post_other = other.post(
             "/manual/trade",
-            data={**_buy_form(world, symbol="600002"), "csrf": token},
+            data={
+                **_buy_form(world, symbol="600002"),
+                "form_key": new_form_value(),
+                "csrf": token,
+            },
             follow_redirects=False,
         )
         assert _post_other.status_code == 303
@@ -470,6 +615,7 @@ def test_unrelated_write_on_inconsistent_ledger_is_422_not_500(
     _break_ledger(db, sub, world)
     resp = _post(client, "/manual/trade", _buy_form(world))
     assert resp.status_code == 422 and "现有流水" in resp.text
+    assert "qt admin" not in resp.text and "作废有问题的记录" in resp.text
     assert len(_ledger(db, sub)) == 1
 
 

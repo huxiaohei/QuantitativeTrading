@@ -323,7 +323,7 @@ def manual_page(
         book = repo.get_book_of_kind(s, user_id, sub.id, "manual")
         rows = repo.list_ledger_entries(s, user_id, book.id)
         entries = _manual_entries(rows, [], names, sub.status != "closed")
-        return ManualBookPage(subscription_view(sub), None, [], entries, str(exc))
+        return ManualBookPage(subscription_view(sub), None, [], entries, exc.reason)
     return ManualBookPage(view.subscription, view.summary, view.holdings, view.entries, None)
 
 

@@ -16,10 +16,11 @@ from sqlalchemy.orm import Session
 from qt.db import repo
 from qt.db.models import LedgerEntry, Subscription
 from qt.models import Side
-from qt.service import manual_ops, views
+from qt.service import form_keys, manual_ops, views
 from qt.service.actor import web_actor
 from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
-from qt.service.market import StoreMarket
+from qt.service.manual_book import check_symbol
+from qt.service.market import StoreMarket, known_symbols
 from qt.web.app import route
 from qt.web.deps import FLASH_MESSAGES, Current, CurrentUser, DbSession, Deps, WebDeps, render
 from qt.web.forms import FormError, parse_date, parse_money, parse_shares
@@ -31,11 +32,24 @@ FormText = Annotated[str, Form()]
 _Values = dict[str, str]
 _ONLY_MAIN_BOARD = "目前只支持沪深主板股票"
 _FAILED = (ValidationError, LedgerInconsistentError)
+_STALE_FORM = "表单已失效，请重新填写后提交"
+_REPAIR_HINT = "可以到手动账页的流水里作废有问题的记录，或补录入金"
 _SIDES = {"buy": Side.BUY, "sell": Side.SELL}
 _CASH_KINDS: dict[str, Literal["deposit", "withdraw"]] = {
     "deposit": "deposit",
     "withdraw": "withdraw",
 }
+
+
+class _Duplicate(Exception):
+    """这个表单（同一个一次性值）已经提交成功过。"""
+
+
+def _reason(exc: ValidationError | LedgerInconsistentError) -> str:
+    """显示给使用者的原因：账本不一致时不带命令行的修复办法，改成网页上能做的。"""
+    if isinstance(exc, LedgerInconsistentError):
+        return f"{exc.reason}。{_REPAIR_HINT}"
+    return str(exc)
 
 
 # ---- 共用 ----
@@ -95,11 +109,32 @@ def _write(
     sub: Subscription,
     extra: str | None,
     action: Callable[[StoreMarket, date], LedgerEntry],
+    form_key: str | None = None,
 ) -> LedgerEntry:
-    """在保存点里调用服务层：失败时回滚这一次写入，不留半截数据。"""
-    market = _market(deps, s, found, sub, extra)
+    """在保存点里调用服务层：失败时回滚这一次写入（含对表单值的认领），不留半截数据。
+
+    form_key 不为空时先认领表单的一次性值，已经认领过抛 _Duplicate，什么也不写。
+    """
+    rows = _market(deps, s, found, sub, extra)
     with s.begin_nested():
-        return action(market, deps.now().date())
+        if form_key is not None and not form_keys.claim_form(
+            s, found.user.id, form_key, deps.now()
+        ):
+            raise _Duplicate
+        return action(rows, deps.now().date())
+
+
+def _unknown_symbol(deps: WebDeps, code: str) -> str | None:
+    """代码不是可录入的股票时服务给出的原因；只读证券表，不建行情（乱填的代码不能拖慢别人）。"""
+    try:
+        check_symbol(known_symbols(deps.store, deps.cfg), code)
+    except ValidationError as exc:
+        return str(exc)
+    return None
+
+
+def _duplicate() -> Response:
+    return RedirectResponse("/manual?msg=manual_duplicate", 303)
 
 
 def _yuan(value: float) -> str:
@@ -206,6 +241,7 @@ def _trade_page(
         "errors": errors or {},
         "error": error,
         "signal": signal,
+        "form_key": form_keys.new_form_value(),
         "board_note": _ONLY_MAIN_BOARD,
     }
     return render(request, "manual_trade.html", context, found=found, status_code=status_code)
@@ -247,6 +283,7 @@ def trade_submit(
     price: FormText = "",
     shares: FormText = "",
     fees: FormText = "",
+    form_key: FormText = "",
 ) -> Response:
     sub = _open_sub(s, found)
     if sub is None:
@@ -259,8 +296,12 @@ def trade_submit(
         "shares": shares,
         "fees": fees,
     }
+    if not form_keys.is_valid_form_value(form_key):
+        return _trade_page(request, found, deps, values=values, error=_STALE_FORM, status_code=422)
     errors: dict[str, str] = {}
     code = _code(errors, symbol)
+    if code and (reason := _unknown_symbol(deps, code)) is not None:
+        errors["symbol"] = reason
     trade_side = _SIDES.get(side)
     if trade_side is None:
         errors["side"] = "请选择买入或卖出"
@@ -298,9 +339,11 @@ def trade_submit(
         )
 
     try:
-        entry = _write(deps, s, found, sub, code, action)
+        entry = _write(deps, s, found, sub, code, action, form_key)
+    except _Duplicate:
+        return _duplicate()
     except _FAILED as exc:
-        return _trade_page(request, found, deps, values=values, error=str(exc), status_code=422)
+        return _trade_page(request, found, deps, values=values, error=_reason(exc), status_code=422)
     return _done("manual_trade", entry)
 
 
@@ -321,6 +364,7 @@ def _holding_page(
         "values": values,
         "errors": errors or {},
         "error": error,
+        "form_key": form_keys.new_form_value(),
         "board_note": _ONLY_MAIN_BOARD,
     }
     return render(request, "manual_holding.html", context, found=found, status_code=status_code)
@@ -343,13 +387,18 @@ def holding_submit(
     buy_day: FormText = "",
     cost_price: FormText = "",
     shares: FormText = "",
+    form_key: FormText = "",
 ) -> Response:
     sub = _open_sub(s, found)
     if sub is None:
         return _to_strategy()
     values = {"symbol": symbol, "buy_day": buy_day, "cost_price": cost_price, "shares": shares}
+    if not form_keys.is_valid_form_value(form_key):
+        return _holding_page(request, found, values=values, error=_STALE_FORM, status_code=422)
     errors: dict[str, str] = {}
     code = _code(errors, symbol)
+    if code and (reason := _unknown_symbol(deps, code)) is not None:
+        errors["symbol"] = reason
     day = _field(errors, parse_date, buy_day, "buy_day")
     cost = _field(errors, parse_money, cost_price, "cost_price")
     count = _field(errors, parse_shares, shares, "shares")
@@ -375,9 +424,11 @@ def holding_submit(
         )
 
     try:
-        entry = _write(deps, s, found, sub, code, action)
+        entry = _write(deps, s, found, sub, code, action, form_key)
+    except _Duplicate:
+        return _duplicate()
     except _FAILED as exc:
-        return _holding_page(request, found, values=values, error=str(exc), status_code=422)
+        return _holding_page(request, found, values=values, error=_reason(exc), status_code=422)
     return _done("manual_holding", entry)
 
 
@@ -398,6 +449,7 @@ def _cash_page(
         "values": values,
         "errors": errors or {},
         "error": error,
+        "form_key": form_keys.new_form_value(),
     }
     return render(request, "manual_cash.html", context, found=found, status_code=status_code)
 
@@ -418,11 +470,14 @@ def cash_submit(
     kind: FormText = "",
     day: FormText = "",
     amount: FormText = "",
+    form_key: FormText = "",
 ) -> Response:
     sub = _open_sub(s, found)
     if sub is None:
         return _to_strategy()
     values = {"kind": kind, "day": day, "amount": amount}
+    if not form_keys.is_valid_form_value(form_key):
+        return _cash_page(request, found, values=values, error=_STALE_FORM, status_code=422)
     errors: dict[str, str] = {}
     cash_kind = _CASH_KINDS.get(kind)
     if cash_kind is None:
@@ -450,9 +505,11 @@ def cash_submit(
         )
 
     try:
-        entry = _write(deps, s, found, sub, None, action)
+        entry = _write(deps, s, found, sub, None, action, form_key)
+    except _Duplicate:
+        return _duplicate()
     except _FAILED as exc:
-        return _cash_page(request, found, values=values, error=str(exc), status_code=422)
+        return _cash_page(request, found, values=values, error=_reason(exc), status_code=422)
     return _done(f"manual_{cash_kind}", entry)
 
 
@@ -533,5 +590,5 @@ def void_submit(
     try:
         entry = _write(deps, s, found, sub, None, action)
     except _FAILED as exc:
-        return _manual_page(request, found, deps, s, sub, error=str(exc), status_code=422)
+        return _manual_page(request, found, deps, s, sub, error=_reason(exc), status_code=422)
     return _done("manual_void", entry)

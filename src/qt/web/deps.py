@@ -84,6 +84,7 @@ FLASH_MESSAGES: dict[str, str] = {
     "manual_deposit": "已录入入金",
     "manual_withdraw": "已录入出金",
     "manual_void": "已作废流水",
+    "manual_duplicate": "这笔已经录入过，没有重复记录",
     "void_na": "这条流水不能作废（已经作废，或本身是作废记录）",
 }
 

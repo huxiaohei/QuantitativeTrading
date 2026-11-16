@@ -7,6 +7,7 @@
   {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   <form method="post" action="/manual/holding" class="form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="form_key" value="{{ form_key }}">
     <label>股票代码
       <input type="text" name="symbol" value="{{ values.get('symbol', '') }}" inputmode="numeric" required>
       {% if errors.get("symbol") %}<span class="field-error" role="alert">{{ errors.get("symbol") }}</span>{% endif %}
