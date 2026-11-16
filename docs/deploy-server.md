@@ -42,9 +42,11 @@ chmod 600 .env
 
 ## 3. 内存与交换空间
 
-每晚 `worker` 会构建全市场行情面板，峰值内存可达约 3 GB；网页进程不会构建全市场面板，并且 `compose.yaml` 给它设了 `mem_limit: 1500m` 作为兜底。
+每晚 `worker` 会构建全市场行情面板，峰值内存可达约 3 GB；网页进程不会构建全市场面板，并且 `compose.yaml` 给它设了 `mem_limit: 800m` 作为兜底。
+数据库设了 `oom_score_adj: -500`：内存真的不够时，内核优先杀别的进程，而不是先杀数据库。
 
-如果服务器内存小于 4 GB，建议增加交换空间，避免夜间运行被系统杀掉。下面只是示例，**这是对系统的修改，由你自己决定是否执行、怎样执行**，项目的脚本不会替你改：
+**服务器内存小于 4 GB 时，必须先加交换空间再启动**，否则夜间运行（再加上网页）可能把内存用完，进程被系统杀掉。
+下面是 2 GB 交换文件的示例，**这是对系统的修改，由你本人在服务器上执行**，项目的脚本不会替你改：
 
 ```bash
 # 示例：创建 2 GB 交换文件（需要 root）
@@ -56,7 +58,9 @@ sudo swapon /swapfile
 # /swapfile none swap sw 0 0
 ```
 
-第一次夜间运行期间，用 `docker stats` 观察 `worker` 和 `web` 的内存占用。
+执行后用 `free -m` 确认 `Swap` 一行的总量不是 0。
+
+第一次夜间运行期间（网页保持运行），用 `docker stats` 观察 `worker`、`web`、`db` 的内存占用，把峰值记到文末的"首次上线记录"里。
 
 ## 4. 启动
 
@@ -72,6 +76,13 @@ docker compose ps        # db healthy，migrate Exited (0)，worker、web、prox
 `curl -s -o /dev/null -w '%{http_code}' https://<你的域名>/login`，或请求 `/healthz`。
 
 注意：必须带 `--profile public`，否则不会启动 `proxy`。`docker compose up -d`（不带档位）不会启动 `proxy`。
+
+如果 `data/` 是完全空的（新服务器上还没有下载过行情），登录后的页面会出错，要等行情下载完才能正常使用。
+首次完整下载约 3 到 6 小时：
+
+```bash
+docker compose run --rm worker qt data update
+```
 
 ## 5. 第一个管理员与邀请码
 
@@ -91,6 +102,8 @@ docker compose logs -f web
 docker compose logs -f proxy
 docker compose logs -f worker
 ```
+
+每个服务的容器日志都限制为单个文件 10 MB、最多 3 个（`compose.yaml` 里的 `logging`），不会把磁盘写满。
 
 网页（uvicorn）和 Caddy **故意都不写访问日志**：邮箱验证和重置密码的令牌放在网址的查询串里，写访问日志会把令牌落到磁盘。
 `deploy/Caddyfile` 里不要加 `log` 指令。`proxy` 的日志只有启动、证书申请等运行信息。
@@ -131,6 +144,14 @@ docker compose ps
 - **邮件送达：** 新域名发出的邮件可能被判为垃圾邮件。上线前用 QQ、163、Gmail 各注册一次，确认验证邮件能收到（看一下垃圾箱）。
 - **条款文字：** 注册页展示的条款在 `src/qt/web/templates/_terms_text.html`，上线前你必须亲自过目并按需修改。
 - **来源校验：** 若登录或提交表单被拒绝，先检查 `QT_BASE_URL` 与你浏览器里访问的地址是否完全一致（含 `https`）。
+- **交换空间（内存小于 4 GB 的主机）：** `free -m` 里 `Swap` 的总量不是 0。
+- **夜间运行的内存：** 第一次夜间运行时网页保持运行，用 `docker stats` 看 `worker`、`web`、`db` 的内存，确认没有被杀掉的容器（`docker compose ps` 里没有反复重启的）。
+- **来访 IP：** 第一次登录之后，用下面的只读命令看最近的登录记录，`ip` 应是你的公网 IP，而不是 `172.` 开头的容器网络地址
+  （如果是 `172.x`，说明网页没拿到反向代理转来的真实地址，登录频率限制会把所有人算成同一个 IP）：
+
+  ```bash
+  docker compose exec db psql -U qt -d qt -c "SELECT created_at, action, detail->>'ip' AS ip FROM audit_log WHERE action IN ('login_ok', 'login_failed') ORDER BY id DESC LIMIT 5;"
+  ```
 
 ## 首次上线记录
 
@@ -139,8 +160,10 @@ docker compose ps
 - 上线日期：
 - 域名：
 - 服务器配置（核数 / 内存 / 是否加了交换空间）：
+- 交换空间已生效（`free -m` 的 Swap 总量）：
 - 证书申请是否一次成功：
-- 第一次夜间运行：开始时间 / 结束时间 / `worker` 内存峰值（`docker stats`）：
+- 第一次夜间运行（网页保持运行）：开始时间 / 结束时间 / `docker stats` 内存峰值 `worker` 　 `web` 　 `db` ：
+- 第一次登录后 `audit_log` 里的 IP 是公网 IP（不是 172.x）：
 - 邮件送达测试：QQ 　 163 　 Gmail ：
 - 条款文字已过目：
 - 遇到的问题与处理：

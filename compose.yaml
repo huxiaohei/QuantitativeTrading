@@ -1,7 +1,16 @@
 # 生产/日常运行：数据库 + 后台任务 + 网页（+ 公网反向代理，仅 public 档位）
+
+# 每个服务共用的日志设置：单个文件最多 10 MB，保留 3 个，防止日志把磁盘写满
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:16
+    logging: *logging
     restart: unless-stopped
     environment:
       POSTGRES_USER: qt
@@ -10,6 +19,8 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - qt_pg:/var/lib/postgresql/data
+    # 内存不够时让内核优先杀别的进程，不先杀数据库
+    oom_score_adj: -500
     # 容器网络内用 db:5432；另映射到本机 54330 供管理命令使用，仅监听回环地址
     ports:
       - "127.0.0.1:54330:5432"
@@ -22,6 +33,7 @@ services:
   # 一次性服务：把数据库升级到最新结构，成功后退出；worker 等它成功才启动
   migrate:
     build: .
+    logging: *logging
     restart: "no"
     depends_on:
       db:
@@ -33,6 +45,7 @@ services:
 
   worker:
     build: .
+    logging: *logging
     restart: unless-stopped
     depends_on:
       db:
@@ -57,9 +70,11 @@ services:
 
   # 网页：与 worker 同一镜像；不映射宿主机端口，只在容器网络内被 proxy 访问
   # （本机开发用 compose.dev.yaml 映射到 127.0.0.1:8000）。
-  # 网页进程不构建全市场行情面板，按使用者缓存股票集合；1500m 只是兜底上限。
+  # 网页进程不构建全市场行情面板，按使用者缓存股票集合；800m 是兜底上限
+  # （小内存主机上要给夜间运行的 worker 和数据库留出空间）。
   web:
     build: .
+    logging: *logging
     restart: unless-stopped
     depends_on:
       db:
@@ -82,7 +97,7 @@ services:
       # MAIL_BACKEND=file 时，网页发的验证邮件也写到这里
       - ./mail_out:/app/mail_out
     command: ["qt", "web", "--host", "0.0.0.0", "--port", "8000"]
-    mem_limit: 1500m
+    mem_limit: 800m
     healthcheck:
       # 镜像里没有 curl，用 Python 请求 /healthz；空 ProxyHandler 让请求不受 HTTP_PROXY 影响
       test:
@@ -99,6 +114,7 @@ services:
   # 服务器上用 docker compose --profile public up -d；本机开发的 docker compose up 不会启动它。
   proxy:
     image: caddy:2
+    logging: *logging
     restart: unless-stopped
     profiles: ["public"]
     depends_on:

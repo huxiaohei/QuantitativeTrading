@@ -32,7 +32,7 @@ def test_web_命令与数据只读挂载() -> None:
     assert any(v.endswith(":/app/data:ro") for v in volumes)
     assert "./reports:/app/reports:ro" in volumes
     assert not any(v.split(":")[1:2] == ["/app/data"] and not v.endswith(":ro") for v in volumes)
-    assert web["mem_limit"] == "1500m"
+    assert web["mem_limit"] == "800m"
     assert web["restart"] == "unless-stopped"
 
 
@@ -69,3 +69,23 @@ def test_web_健康检查不走代理且NO_PROXY含回环地址() -> None:
     env = cast(dict[str, object], web["environment"])
     for key in ("NO_PROXY", "no_proxy"):
         assert "127.0.0.1" in str(env[key]).split(",")
+
+
+def test_db_不先被内核挑中杀掉() -> None:
+    assert _service("db")["oom_score_adj"] == -500
+
+
+def test_每个服务的日志都有大小上限() -> None:
+    services = cast(dict[str, dict[str, object]], _load("compose.yaml")["services"])
+    for name, service in services.items():
+        logging = cast(dict[str, object], service.get("logging"))
+        assert logging is not None, name
+        assert logging["driver"] == "json-file", name
+        options = cast(dict[str, object], logging["options"])
+        assert options == {"max-size": "10m", "max-file": "3"}, name
+
+
+def test_caddyfile_说明转发头是替换而不是追加() -> None:
+    text = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
+    assert "追加 X-Forwarded-For" not in text
+    assert "X-Forwarded-For" in text and "替换" in text

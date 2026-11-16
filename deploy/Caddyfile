@@ -6,7 +6,8 @@
 	# 注意：这里故意不写 log 指令，Caddy 的访问日志保持关闭。
 	# 邮箱验证和重置密码的令牌放在网址的查询串里，写访问日志会把令牌落到磁盘。
 	# 安全响应头（HSTS、CSP 等）由应用自己设置，这里不重复、不覆盖。
-	# reverse_proxy 默认原样传递 Host，并追加 X-Forwarded-For，
-	# 应用据此做来源校验和取客户端地址。
+	# reverse_proxy 默认原样传递 Host；来访者不在 trusted_proxies 里（这里没有配置，即谁都不信任）时，
+	# Caddy 丢掉来访者自带的 X-Forwarded-For，替换成它看到的真实来访地址，
+	# 应用据此做来源校验和取客户端地址（取最后一段）。
 	reverse_proxy web:8000
 }
