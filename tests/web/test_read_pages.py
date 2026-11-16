@@ -1,5 +1,6 @@
 """四个只读页面（总览、信号、系统账、日志）：三种状态下的说明文字与关键数字、订阅归属、只读的历史订阅。"""
 
+import dataclasses
 import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -150,3 +151,15 @@ def test_current_subscription_has_no_read_only_banner(
     sub = subscribe(db, world, user.id)
     for path in PAGES:
         assert READ_ONLY not in _get(client, f"{path}?sub={sub.id}"), path
+
+
+def test_no_run_notice_uses_configured_run_time(
+    deps: WebDeps, make_user: MakeUser, world: World
+) -> None:
+    service = deps.cfg.service.model_copy(update={"run_time": "19:45"})
+    later = dataclasses.replace(deps, cfg=deps.cfg.model_copy(update={"service": service}))
+    with TestClient(create_app(later), base_url=BASE) as c:
+        _login(c, make_user)
+        text = _get(c, "/overview")
+    assert "系统还没有运行过，第一个交易日 19:45 之后会有结果" in text
+    assert "18:00" not in text

@@ -358,6 +358,7 @@ def render(
         csrf=csrf,
         user=None if found is None else found.user,
         terms_version=deps.cfg.web.terms_version,
+        run_time=deps.cfg.service.run_time,  # 每日运行时刻，与 worker 用的是同一个配置值
         **(context or {}),
     )
     return HTMLResponse(page, status_code=status_code)
