@@ -460,16 +460,84 @@ def test_subscription_starting_later_is_skipped_and_late_one_is_caught_up(
     assert len(equity) == 16 and whole.equity.iloc[-1] != whole.equity.iloc[0]  # 期间有成交
 
 
-def test_disabled_user_gets_no_signal_mail(env: Env, db: Session) -> None:
-    day = env.days[DAY]
-    sub = subscribe(db, "a@example.com", day)
+def _set_user(db: Session, sub: Subscription, **fields: object) -> None:
     user = db.get(User, sub.user_id)
     assert user is not None
-    user.status = "disabled"
+    for name, value in fields.items():
+        setattr(user, name, value)
     db.commit()
+
+
+def test_disabled_user_books_do_not_advance_and_others_are_unaffected(
+    env: Env, db: Session
+) -> None:
+    day = env.days[DAY]
+    off = subscribe(db, "a@example.com", day)
+    on = subscribe(db, "b@example.com", day)
+    _set_user(db, off, status="disabled")
     assert run_day(env.ctx, day, True, False) == "done"
-    assert processed_through(db, sub, "manual") == day
-    assert env.sender.sent == []
+    for kind in ("system", "manual"):
+        assert processed_through(db, off, kind) is None
+        assert book_signals(db, off, kind) == []
+        assert _equity(db, off, kind) == []
+    assert processed_through(db, on, "system") == processed_through(db, on, "manual") == day
+    assert [m.to_addr for m in env.sender.sent] == ["b@example.com"]
+    assert db.scalars(select(Outbox).where(Outbox.to_addr == "a@example.com")).all() == []
+
+
+def test_reenabled_user_system_book_catches_up_and_equals_backtest(env: Env, db: Session) -> None:
+    days = env.days
+    sub = subscribe(db, "a@example.com", days[DAY])
+    _set_user(db, sub, status="disabled")
+    assert run_day(env.ctx, days[DAY], True, False) == "done"
+    assert processed_through(db, sub, "system") is None
+    _set_user(db, sub, status="active")
+    assert run_day(env.ctx, days[DAY + 1], True, False) == "done"
+    assert processed_through(db, sub, "system") == days[DAY + 1]
+    whole = run_period(subscription_config(CFG, sub), env.store, days[DAY], days[DAY + 1])
+    equity = _equity(db, sub, "system")
+    assert len(equity) == 2
+    assert equity == pytest.approx(list(whole.equity), rel=0, abs=0)
+    assert [x.hex() for x in equity] == [float(x).hex() for x in whole.equity]
+
+
+def test_abandon_mail_switch_off_keeps_sell_signal_mail(env: Env, db: Session) -> None:
+    days = env.days
+    sub = subscribe(db, "a@example.com", days[DAY])
+    _set_user(db, sub, abandon_mail=False)
+    market = StoreMarket(
+        env.store, build_panel(env.store, env.calendar, CFG, days[DAY], days[DAY]), CFG
+    )
+    symbol = TRADING_SYMBOLS[0]
+    bars = env.store.read(Table.BARS, symbols=[symbol])
+    close = float(bars.loc[bars["day"] == pd.Timestamp(days[DAY]), "close"].iloc[0])
+    record_holding(  # 成本远高于现价：触发止损，每晚都有卖出提示
+        db,
+        sub.user_id,
+        sub.id,
+        market,
+        env.calendar,
+        CFG,
+        days[DAY],
+        symbol,
+        days[DAY - 1],
+        close * 2,
+        1000,
+        actor=CLI,
+    )
+    db.commit()
+    for i in range(DAY, DAY + 5):  # DAY+4 晚上，DAY 晚的买入信号到期放弃
+        assert run_day(env.ctx, days[i], True, False) == "done"
+    last = days[DAY + 4]
+    abandoned = [s for s in book_signals(db, sub, "manual") if s.status == "abandoned"]
+    assert abandoned and all(s.status_day == last for s in abandoned)
+    subjects = [m.subject for m in env.sender.sent]
+    assert not [x for x in subjects if x.startswith("【信号已过期】")]
+    assert [x for x in subjects if x.startswith("【卖出")]
+    # 打开开关后，那条放弃提醒在下一个通知日补发
+    _set_user(db, sub, abandon_mail=True)
+    assert run_day(env.ctx, days[DAY + 5], True, False) == "done"
+    assert [m for m in env.sender.sent if m.subject.startswith("【信号已过期】")]
 
 
 def test_failed_calendar_refresh_alerts_when_stored_calendar_is_stale(

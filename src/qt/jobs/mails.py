@@ -206,7 +206,12 @@ def queue_signal_mails(
                 _risk_mail(event.day, event, thresholds, books),
             )
     abandoned: dict[date, list[Signal]] = {}
-    for sig in repo.list_signals(s, sub.user_id, manual.id, "buy", ("abandoned",)):
+    abandoned_signals = (
+        repo.list_signals(s, sub.user_id, manual.id, "buy", ("abandoned",))
+        if user.abandon_mail  # 使用者关掉了放弃提醒；信号邮件与风控邮件不受影响
+        else []
+    )
+    for sig in abandoned_signals:
         if since <= sig.status_day <= day:
             abandoned.setdefault(sig.status_day, []).append(sig)
     for when, signals in sorted(abandoned.items()):

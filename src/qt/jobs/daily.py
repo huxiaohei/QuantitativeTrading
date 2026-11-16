@@ -371,7 +371,7 @@ class _Panels:
 
 
 def _due_subscriptions(s: Session, day: date) -> list[Subscription]:
-    """当天要处理的订阅：生效中且起始日不晚于 day（暂停、关闭、尚未开始的跳过）。"""
+    """当天要处理的订阅：生效中、使用者未停用、起始日不晚于 day（其余一律跳过）。"""
     return [sub for sub in admin_repo.list_active_subscriptions(s) if sub.start_day <= day]
 
 
@@ -529,6 +529,8 @@ def _process_subscription(
             sub = s.get(Subscription, sub_id)
             if sub is None or sub.status != "active" or sub.start_day > day:
                 return None  # 处理过程中被暂停或关闭
+            if repo.get_user(s, sub.user_id).status != "active":
+                return None  # 处理过程中使用者被停用
             _advance_user(ctx, s, sub, panels, day, notify, names)
             s.commit()
         except Exception as exc:

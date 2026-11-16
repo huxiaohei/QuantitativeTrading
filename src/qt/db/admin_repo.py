@@ -19,8 +19,13 @@ def list_users(s: Session) -> list[User]:
 
 
 def list_active_subscriptions(s: Session) -> list[Subscription]:
-    """全部处于生效状态的订阅（暂停与关闭的不含），按编号排序。"""
-    stmt = select(Subscription).where(Subscription.status == "active").order_by(Subscription.id)
+    """全部处于生效状态、且所属使用者未被停用的订阅（暂停与关闭的不含），按编号排序。"""
+    stmt = (
+        select(Subscription)
+        .join(User, User.id == Subscription.user_id)
+        .where(Subscription.status == "active", User.status == "active")
+        .order_by(Subscription.id)
+    )
     return list(s.scalars(stmt))
 
 
