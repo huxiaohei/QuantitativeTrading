@@ -144,3 +144,7 @@ uv run qt backtest run --period in --config config/my.yaml
 免费数据有缺口，回测里做了近似处理，这些会影响结果的可信度。完整清单和每一项偏差的方向见 [docs/data-gaps.md](docs/data-gaps.md)，每份回测报告的"数据局限与近似处理"一节也会逐条列出。看结果之前请先读一遍。
 
 回测结果不代表未来收益，本项目不构成投资建议。
+
+## 许可
+
+本项目以 [MIT 协议](LICENSE) 发布。
