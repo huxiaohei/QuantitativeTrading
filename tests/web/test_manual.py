@@ -686,3 +686,13 @@ def test_web_entry_matches_cli_book_show(
         assert f"{holding.shares:,.0f}" in result.output and f"{holding.shares:,.0f}" in web
     count = db.scalar(select(func.count()).select_from(LedgerEntry))
     assert count == 3
+
+
+def test_nul_byte_in_symbol_is_400_and_records_nothing(
+    client: TestClient, make_user: MakeUser, world: World, db: Session
+) -> None:
+    sub = subscribe(db, world, _login(client, make_user))
+    resp = _post(client, "/manual/trade", _buy_form(world, symbol="600\x00001"))
+    assert resp.status_code == 400
+    assert "提交的内容无法识别" in resp.text
+    assert _ledger(db, sub) == []

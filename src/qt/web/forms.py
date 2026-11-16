@@ -10,6 +10,8 @@ _NUMBER = re.compile(r"^[+-]?\d+(\.\d+)?$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _INTEGER = re.compile(r"^[+-]?\d+$")
 _TRUE = frozenset({"on", "true", "1", "yes"})
+# C0 控制字符（制表、换行、回车除外）与 DEL：正常输入不会有；NUL 还会让数据库报错
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 PASSWORD_MAX_LENGTH = 1024
 # 数字输入的最大长度：过长的数字串没有意义，也避免整数转换超出解释器的位数上限
 NUMBER_MAX_LENGTH = 40
@@ -22,6 +24,11 @@ class FormError(Exception):
         super().__init__(message)
         self.field = field
         self.message = message
+
+
+def has_control_chars(text: str) -> bool:
+    """是否含控制字符（制表、换行、回车不算）。"""
+    return _CONTROL.search(text) is not None
 
 
 def parse_date(text: str, field: str) -> date:

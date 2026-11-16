@@ -490,3 +490,24 @@ def test_logout_after_session_extension_clears_cookie(
     assert len(session_cookies) == 1, session_cookies
     assert "max-age=0" in session_cookies[0].lower()
     assert client.get("/overview", follow_redirects=False).status_code == 303
+
+
+@pytest.mark.parametrize("bad", ["\x00", "\x07", "\x1b", "\x7f"])
+def test_control_characters_in_form_are_400_not_500(
+    client: TestClient, make_user: MakeUser, bad: str
+) -> None:
+    make_user("foo@example.com")
+    page = client.get("/login")
+    data = {"email": f"foo{bad}@example.com", "password": PW, "csrf": csrf_of(page)}
+    resp = client.post("/login", data=data, follow_redirects=False)
+    assert resp.status_code == 400
+    assert "提交的内容无法识别" in resp.text
+
+
+def test_tab_and_newline_in_form_are_not_control_errors(
+    client: TestClient, make_user: MakeUser
+) -> None:
+    make_user("foo@example.com")
+    page = client.get("/login")
+    data = {"email": " foo@example.com\t\r\n", "password": PW, "csrf": csrf_of(page)}
+    assert client.post("/login", data=data, follow_redirects=False).status_code == 303

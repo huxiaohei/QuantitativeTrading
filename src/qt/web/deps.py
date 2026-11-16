@@ -28,6 +28,7 @@ from qt.mail.send import Sender
 from qt.runtime import cookie_secure
 from qt.service import auth
 from qt.service.market import StoreMarket
+from qt.web.forms import has_control_chars
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -310,6 +311,13 @@ async def _form_csrf(request: Request) -> str:
     return value if isinstance(value, str) else ""
 
 
+async def _reject_control_chars(request: Request) -> None:
+    """表单任何字段含控制字符（制表、换行、回车除外）一律 400，不进路由。"""
+    for _, value in (await request.form()).multi_items():
+        if isinstance(value, str) and has_control_chars(value):
+            raise HTTPException(400)
+
+
 def _same(expected: str | None, given: str) -> bool:
     if not expected or not given:
         return False
@@ -321,6 +329,7 @@ async def check_public_csrf(request: Request, deps: Deps) -> None:
     _check_origin(request, deps)
     if not _same(request.cookies.get(deps.csrf_cookie), await _form_csrf(request)):
         raise _forbidden()
+    await _reject_control_chars(request)
 
 
 async def check_session_csrf(request: Request, deps: Deps, found: CurrentUser) -> None:
@@ -328,6 +337,7 @@ async def check_session_csrf(request: Request, deps: Deps, found: CurrentUser) -
     _check_origin(request, deps)
     if not _same(found.session.csrf_token, await _form_csrf(request)):
         raise _forbidden()
+    await _reject_control_chars(request)
 
 
 # ---- 模板 ----

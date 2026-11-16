@@ -6,6 +6,7 @@ import pytest
 
 from qt.web.forms import (
     FormError,
+    has_control_chars,
     parse_bool,
     parse_date,
     parse_decimal,
@@ -78,3 +79,18 @@ def test_parse_numbers_reject_overlong_input() -> None:
     for parser in (parse_decimal, parse_money, parse_shares):
         with pytest.raises(FormError):
             parser(long, "x")
+
+
+@pytest.mark.parametrize(
+    ("text", "bad"),
+    [
+        ("a\x00b", True),
+        ("\x1f", True),
+        ("\x7f", True),
+        ("a\tb\r\nc", False),
+        ("中文 abc", False),
+        ("", False),
+    ],
+)
+def test_has_control_chars(text: str, bad: bool) -> None:
+    assert has_control_chars(text) is bad
