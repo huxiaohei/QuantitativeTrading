@@ -206,19 +206,20 @@ def list_param_changes(s: Session, user_id: int, subscription_id: int) -> list[P
 
 def add_audit(
     s: Session,
-    user_id: int,
+    user_id: int | None,
     action: str,
     target: str,
     detail: Mapping[str, Any],
     actor: Actor,
 ) -> AuditLog:
-    """写一条审计日志：user_id 是被操作的使用者（记入 detail），actor 记录操作人与渠道。"""
+    """写一条审计日志：user_id 是被操作的使用者（记入 detail；没有明确对象时为 None，不记），
+    actor 记录操作人与渠道。"""
     entry = AuditLog(
         actor_user_id=actor.user_id,
         channel=actor.channel,
         action=action,
         target=target,
-        detail={**detail, "user_id": user_id},
+        detail=dict(detail) if user_id is None else {**detail, "user_id": user_id},
     )
     s.add(entry)
     s.flush()

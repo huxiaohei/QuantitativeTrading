@@ -5,7 +5,7 @@ from datetime import date
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from qt.db.models import DailyRun, Followup, Outbox, Subscription, User
+from qt.db.models import DailyRun, Followup, Invite, Outbox, Subscription, User
 
 
 def find_user_by_email(s: Session, email: str) -> User | None:
@@ -61,3 +61,8 @@ def count_outbox_by_status(s: Session) -> dict[str, int]:
     """发件箱里各状态（pending、sent、failed）的邮件数；没有的状态不在其中。"""
     stmt = select(Outbox.status, func.count()).group_by(Outbox.status)
     return {str(row[0]): int(row[1]) for row in s.execute(stmt)}
+
+
+def list_invites(s: Session) -> list[Invite]:
+    """全部邀请码，编号从新到旧。"""
+    return list(s.scalars(select(Invite).order_by(Invite.id.desc())))
