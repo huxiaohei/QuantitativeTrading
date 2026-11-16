@@ -19,7 +19,7 @@ from qt.web.app import create_app
 from qt.web.deps import WebDeps, client_ip, require_admin, safe_next
 from tests.web.conftest import BASE, PW, Clock, MakeUser, csrf_of, login_as, make_deps
 
-CSP = "default-src 'self'; frame-ancestors 'none'"
+CSP = "default-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'"
 
 
 def _cookie_headers(resp: httpx.Response) -> list[str]:

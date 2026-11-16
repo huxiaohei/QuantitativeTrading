@@ -1,6 +1,7 @@
 """安全中间件：统一的安全响应头、防伪造 Cookie、请求体大小上限、500 错误页。
 
 放在所有路由之外：任何响应（含错误页、静态文件）都经过这里加头；
+路由自己设了内容安全策略（只有 /report 这样做）时保留路由的，其余一律用全站的严格策略；
 路由里没接住的异常在这里记日志并换成不含任何异常信息的中文 500 页面。
 """
 
@@ -15,7 +16,9 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from qt.web.deps import TEMPLATES, WebDeps, cookie_header
 
 MAX_BODY_BYTES = 64 * 1024
-CSP = "default-src 'self'; frame-ancestors 'none'"
+CSP = "default-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'"
+# 回测报告（/report）自带 <style> 与 style= 属性：只给它这一份放开内联样式，脚本一律不许，并放进沙箱
+REPORT_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox"
 _HSTS = "max-age=31536000"
 _STATIC_PREFIX = "/static/"
 _CSRF_COOKIE_MAX_AGE = 30 * 86400
@@ -68,7 +71,8 @@ class SecurityMiddleware:
             if message["type"] == "http.response.start":
                 started = True
                 headers = MutableHeaders(scope=message)
-                headers["Content-Security-Policy"] = CSP
+                if "content-security-policy" not in headers:
+                    headers["Content-Security-Policy"] = CSP
                 headers["X-Content-Type-Options"] = "nosniff"
                 headers["Referrer-Policy"] = "same-origin"
                 if deps.secure:

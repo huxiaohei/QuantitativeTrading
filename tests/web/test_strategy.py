@@ -28,6 +28,7 @@ TOMORROW = DAYS[1]
 NOTE = "修改参数后没有对应的回测结果可看"
 _HIDDEN = re.compile(r'<input type="hidden" name="([^"]+)" value="([^"]*)">')
 STOP_LOSS = "strategy.stop_loss"
+SITE_CSP = "default-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'"
 
 
 def _calendar() -> TradingCalendar:
@@ -297,3 +298,25 @@ def test_params_overlong_number_is_422_not_500(client: TestClient, make_user: Ma
     for key in (STOP_LOSS, "risk.max_positions"):
         resp = _post(client, "/strategy/params", {key: "9" * 5000})
         assert resp.status_code == 422 and "field-error" in resp.text, key
+
+
+def test_report_has_own_csp_allowing_inline_styles(
+    deps: WebDeps, make_user: MakeUser, tmp_path: Path
+) -> None:
+    """回测报告自带 <style> 和 style= 属性：只给这一页放开内联样式，并放进沙箱。"""
+    report = tmp_path / "report.html"
+    report.write_text(
+        "<html><head><style>td { color: red; }</style></head>"
+        '<body><table><tr><td style="text-align: right">1.23</td></tr></table></body></html>',
+        encoding="utf-8",
+    )
+    web = CFG.web.model_copy(update={"report_file": str(report)})
+    configured = dataclasses.replace(deps, cfg=CFG.model_copy(update={"web": web}))
+    with TestClient(create_app(configured), base_url=BASE) as c:
+        _login(c, make_user)
+        resp = c.get("/report")
+        assert resp.status_code == 200 and 'style="text-align: right"' in resp.text
+        assert resp.headers.get_list("content-security-policy") == [
+            "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox"
+        ]
+        assert c.get("/strategy").headers.get_list("content-security-policy") == [SITE_CSP]

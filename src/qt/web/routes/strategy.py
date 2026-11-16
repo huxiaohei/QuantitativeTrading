@@ -33,6 +33,7 @@ from qt.web.deps import (
     render,
 )
 from qt.web.forms import FormError, parse_decimal, parse_integer, parse_money
+from qt.web.security import REPORT_CSP
 
 router = APIRouter()
 
@@ -525,4 +526,4 @@ def report(deps: Deps, found: CurrentUser) -> Response:
     path = _report_file(deps)
     if path is None:
         raise HTTPException(404)
-    return FileResponse(path)
+    return FileResponse(path, headers={"Content-Security-Policy": REPORT_CSP})
