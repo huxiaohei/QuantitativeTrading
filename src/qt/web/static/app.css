@@ -179,3 +179,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .concepts pre, .concepts code { font-size: .9rem; }
 .concepts pre { overflow-x: auto; }
 td.desc { white-space: normal; min-width: 16rem; font-size: .9rem; color: var(--muted); }
+
+/* ---- 管理页面 ---- */
+
+.subnav { display: flex; gap: 1rem; margin: 0 0 1rem; }
+.subnav a[aria-current="page"] { font-weight: 600; color: var(--fg); text-decoration: none; }
+.run h3 { font-size: 1rem; margin: 1rem 0 .2rem; }
+.reasons { white-space: pre-wrap; background: var(--bg); border-radius: 6px; padding: .5rem .7rem; margin: .3rem 0; }
+td input[type="text"][readonly] { min-width: 18rem; }

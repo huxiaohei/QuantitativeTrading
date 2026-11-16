@@ -752,6 +752,18 @@ def due_day(now: datetime, calendar: TradingCalendar, run_time: str) -> date:
     return as_of
 
 
+def due_pending(
+    s: Session, calendar: TradingCalendar, now: datetime, run_time: str
+) -> tuple[date, list[date]]:
+    """此刻该跑到哪一天、以及其中还没跑完的交易日（升序）。
+
+    补跑（catch_up）与网页上"有没有未完成的交易日"共用这一个规则：补跑到的截止日是
+    due_day，待跑的日子是起始日到截止日之间还不是 done 的交易日。没有生效订阅时没有待跑的日子。
+    """
+    as_of = due_day(now, calendar, run_time)
+    return as_of, pending_days(s, calendar, as_of, first_start_day(s))
+
+
 def catch_up(ctx: RunContext) -> list[tuple[date, str]]:
     """按日期顺序补上所有没跑完的交易日，返回 [(交易日, 状态)]。
 
@@ -774,9 +786,8 @@ def _catch_up(ctx: RunContext) -> list[tuple[date, str]]:
     except SharedTableError as exc:
         refresh_error = str(exc)  # 先用已存储的日历判断有没有要补的日子
     calendar = load_calendar(ctx.store)
-    as_of = due_day(ctx.now(), calendar, ctx.cfg.service.run_time)
     with _session(ctx) as s:
-        days = pending_days(s, calendar, as_of, first)
+        as_of, days = due_pending(s, calendar, ctx.now(), ctx.cfg.service.run_time)
     if not days:
         _warn_stale_calendar(ctx, calendar, refresh_error)
         return []

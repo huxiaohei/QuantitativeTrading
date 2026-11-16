@@ -85,6 +85,15 @@ FLASH_MESSAGES: dict[str, str] = {
     "manual_withdraw": "已录入出金",
     "manual_void": "已作废流水",
     "manual_duplicate": "这笔已经录入过，没有重复记录",
+    "settings_saved": "设置已保存",
+    "password_changed": "密码已修改，其他设备上的登录已失效",
+    "logout_all": "已退出所有设备，请重新登录",
+    "invite_created": "邀请码已生成，注册链接在下面的列表里",
+    "invite_revoked": "邀请码已作废",
+    "user_disabled": "已停用该账号，其登录已全部失效",
+    "user_enabled": "已恢复该账号",
+    "retry_requested": "已提交立即重试，worker 会在一分钟内开始处理",
+    "outbox_requeued": "失败的邮件已重新排队",
     "void_na": "这条流水不能作废（已经作废，或本身是作废记录）",
 }
 

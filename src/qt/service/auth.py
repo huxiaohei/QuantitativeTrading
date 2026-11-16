@@ -165,6 +165,17 @@ def revoke_invite(s: Session, admin_id: int, invite_id: int, now: datetime) -> I
     return invite
 
 
+def invite_state(invite: Invite, now: datetime) -> Literal["usable", "used", "expired", "revoked"]:
+    """邀请码此刻的状态：已使用优先，其次已作废、已过期，都不是则可用（与注册时的判断一致）。"""
+    if invite.used_by is not None:
+        return "used"
+    if invite.revoked_at is not None:
+        return "revoked"
+    if invite.expires_at <= now:
+        return "expired"
+    return "usable"
+
+
 def _lock_valid_invite(s: Session, code: str, now: datetime) -> Invite:
     """按邀请码加锁取出可用的那条；不存在、过期、作废、已用一律同一句话。"""
     invite = s.scalars(select(Invite).where(Invite.code == code.strip()).with_for_update()).first()

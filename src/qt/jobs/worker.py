@@ -32,6 +32,7 @@ from qt.jobs.daily import (
     run_deadline_at,
     send_outbox,
 )
+from qt.service import reruns
 
 _log = logging.getLogger(__name__)
 
@@ -173,6 +174,28 @@ class _Worker:
         if calendar is not None:
             self.check_deadline(now, calendar)
         self.flush_outbox(now)
+        self.handle_rerun()
+
+    def handle_rerun(self) -> None:
+        """管理员在网页上请求了"立即重试"：执行与到点时相同的补跑，把结果写回请求。
+
+        与常规补跑在同一个单线程循环里，不会并发；不改 last_attempt 与重试时间，
+        所以不影响常规的夜间运行时刻。补跑抛出异常也要写回（异常类型与消息）。
+        """
+        with Session(self.ctx.engine) as s:
+            found = reruns.take_pending(s)
+            request_id = None if found is None else found.id
+        if request_id is None:
+            return
+        _log.info("管理员请求立即重试（请求 #%s）", request_id)
+        try:
+            result = reruns.day_results(catch_up(self.ctx))
+        except Exception as exc:
+            _log.exception("立即重试出错")
+            result = f"出错：{describe(exc)}"
+        with Session(self.ctx.engine) as s:
+            reruns.finish(s, request_id, result, self.ctx.now())
+            s.commit()
 
     def check_deadline(self, now: datetime, calendar: TradingCalendar) -> None:
         """期限已过的最近一个交易日还没跑完：给管理员发一次超时告警（每个交易日一次）。

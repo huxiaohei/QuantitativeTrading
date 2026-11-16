@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from qt import cli
+from qt.db.models import RerunRequest
 from qt.jobs import worker
 from qt.jobs.daily import (
     RUN_LOCK_KEY,
@@ -22,6 +23,9 @@ from qt.jobs.daily import (
     run_deadline_at,
 )
 from qt.jobs.worker import is_due, run_forever
+from qt.service import reruns
+from qt.service.accounts import create_user
+from qt.service.actor import CLI
 from tests.jobs.conftest import (
     ADMIN,
     DAY,
@@ -295,3 +299,78 @@ def test_second_daily_run_exits_without_running_or_alerting(
     assert daily_run(db, day) is None and env.sender.sent == []
     assert processed_through(db, sub, "manual") is None
     assert run_day(ctx, day, True, False) == "done"  # 锁释放之后照常运行
+
+
+def _request_rerun(db: Session, env: Env) -> int:
+    admin = create_user(db, "boss@example.com", is_admin=True, actor=CLI)
+    row = reruns.request(db, admin.id, env.clock.now)
+    db.commit()
+    return row.id
+
+
+def _one_tick(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[RunContext],
+    result: Exception | None,
+) -> None:
+    """启动补跑之后再跑一个空转节拍；catch_up 换成记录调用的替身（result 不为空时抛出）。
+
+    启动时的补跑算一次调用；节拍里常规补跑不会触发（刚尝试过、没有重试计划），
+    所以多出来的调用就是处理重试请求。
+    """
+
+    def fake_catch_up(ctx: RunContext) -> list[tuple[date, str]]:
+        calls.append(ctx)
+        if result is not None and len(calls) > 1:
+            raise result
+        return [(env.days[DAY], "done")]
+
+    monkeypatch.setattr(worker, "catch_up", fake_catch_up)
+    ticks = 0
+
+    def sleep(seconds: float) -> None:
+        nonlocal ticks
+        del seconds
+        ticks += 1
+        if ticks > 1:
+            raise _Stop
+
+    with pytest.raises(_Stop):
+        run_forever(env.ctx, sleep)
+
+
+def test_worker_handles_rerun_request_in_one_tick(
+    env: Env, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = _request_rerun(db, env)
+    calls: list[RunContext] = []
+    _one_tick(env, monkeypatch, calls, None)
+    assert len(calls) == 2  # 启动 1 次 + 重试请求 1 次
+    db.rollback()
+    row = db.get(RerunRequest, request_id)
+    assert row is not None
+    assert row.handled_at == env.clock.now
+    assert row.result == f"{env.days[DAY]} done"
+
+
+def test_worker_finishes_rerun_request_when_catch_up_raises(
+    env: Env, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = _request_rerun(db, env)
+    calls: list[RunContext] = []
+    _one_tick(env, monkeypatch, calls, ValueError("数据坏了"))
+    assert len(calls) == 2
+    db.rollback()
+    row = db.get(RerunRequest, request_id)
+    assert row is not None and row.handled_at is not None
+    assert row.result is not None and "ValueError" in row.result and "数据坏了" in row.result
+
+
+def test_worker_does_not_catch_up_without_rerun_request(
+    env: Env, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del db
+    calls: list[RunContext] = []
+    _one_tick(env, monkeypatch, calls, None)
+    assert len(calls) == 1  # 只有启动时那一次

@@ -68,6 +68,21 @@ def list_invites(s: Session) -> list[Invite]:
     return list(s.scalars(select(Invite).order_by(Invite.id.desc())))
 
 
+def subscription_status_by_user(s: Session) -> dict[int, str]:
+    """每个使用者的订阅状态：有未关闭的订阅取它的状态，否则取最近一个（已关闭）；没有订阅的不在其中。
+
+    只读订阅的状态，不碰账本、信号等内容（管理页面用）。
+    """
+    status: dict[int, str] = {}
+    for user_id, sub_status in s.execute(
+        select(Subscription.user_id, Subscription.status).order_by(Subscription.id)
+    ):
+        if status.get(int(user_id)) in ("active", "paused") and sub_status == "closed":
+            continue
+        status[int(user_id)] = str(sub_status)
+    return status
+
+
 def latest_done_day(s: Session) -> date | None:
     """最近一次状态为 done 的每日运行的交易日；还没有则为 None。"""
     stmt = select(func.max(DailyRun.trade_day)).where(DailyRun.status == "done")

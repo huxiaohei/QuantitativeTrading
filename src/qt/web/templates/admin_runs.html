@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}运行记录 · 管理 · 量化信号{% endblock %}
+{% block content %}
+<h1>管理</h1>
+{% include "_admin_nav.html" %}
+{% if flash %}<p class="notice">{{ flash }}</p>{% endif %}
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<section class="card">
+  <h2>立即重试</h2>
+  <p>有交易日没有跑完时（例如数据异常），可以请求 worker 马上再补跑一次，不用等下一个节拍。</p>
+  <p>最近一次请求：{{ rerun }}</p>
+  <form method="post" action="/admin/runs/retry" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="primary">立即重试</button>
+  </form>
+</section>
+<section class="card">
+  <h2>发件箱</h2>
+  <p>待发 {{ view.pending_mails }} 封，发送失败 {{ view.failed_mails }} 封。</p>
+  <form method="post" action="/admin/outbox/requeue" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">失败的邮件重新排队</button>
+  </form>
+</section>
+<section class="card">
+  <h2>最近 {{ view.runs | length }} 次运行</h2>
+  {% if view.runs %}
+  {% for run in view.runs %}
+  <article class="run">
+    <h3>{{ run.day }}　{{ run.status_label }}</h3>
+    <p class="muted">阶段 {{ run.stage }}；开始 {{ run.started_at.strftime("%Y-%m-%d %H:%M") }}；{% if run.finished_at %}结束 {{ run.finished_at.strftime("%Y-%m-%d %H:%M") }}{% else %}未结束{% endif %}</p>
+    {% if run.reasons %}<pre class="reasons">{{ run.reasons | join("\n") }}</pre>{% endif %}
+  </article>
+  {% endfor %}
+  {% else %}
+  <p>还没有运行记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

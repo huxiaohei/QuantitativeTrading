@@ -188,8 +188,9 @@ def _register_page(
 
 
 @route(router, "GET", "/register", "public")
-def register_page(request: Request, deps: Deps) -> Response:
-    return _register_page(request, deps)
+def register_page(request: Request, deps: Deps, invite: str = "") -> Response:
+    """管理员给出的注册链接带 ?invite=，把邀请码填进表单。"""
+    return _register_page(request, deps, invite=invite)
 
 
 @route(router, "POST", "/register", "public")
