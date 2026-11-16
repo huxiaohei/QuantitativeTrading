@@ -2,7 +2,7 @@
 
 本文说明怎样在自己的 Mac 上用 Docker 把每日信号服务跑起来。以后搬到服务器见 `docs/migrate-to-server.md`。
 
-整个服务由三个容器服务组成（见 `compose.yaml`）：
+整个服务由三个容器服务组成（见 `compose.yaml`；另有网页 `web` 与反向代理 `proxy`，见文末）：
 
 | 服务 | 作用 |
 | --- | --- |
@@ -200,6 +200,17 @@ launchctl load ~/Library/LaunchAgents/com.qt.keepawake.plist
 - 更新代码后：`docker compose build && docker compose up -d`（`migrate` 会自动升级数据库结构）。
 - 停止：`docker compose stop`；再启动：`docker compose start`。
 - 不要执行 `docker compose down -v`：`-v` 会删除数据库卷。
+
+## 本机运行网页（可选）
+
+`web` 默认不映射宿主机端口。本机开发用覆盖文件把它映射到 `127.0.0.1:8000`，并固定 `QT_BASE_URL=http://localhost:8000`：
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build db migrate web
+curl -s http://127.0.0.1:8000/healthz     # 返回 ok
+```
+
+务必点名服务；不要不带服务名执行 `up`，否则 worker 也会启动。`proxy`（80/443、HTTPS）只用于服务器，见 `docs/deploy-server.md`。
 
 ## 首次试运行记录
 

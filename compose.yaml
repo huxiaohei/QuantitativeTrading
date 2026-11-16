@@ -1,4 +1,4 @@
-# 生产/日常运行：数据库 + 后台任务
+# 生产/日常运行：数据库 + 后台任务 + 网页（+ 公网反向代理，仅 public 档位）
 services:
   db:
     image: postgres:16
@@ -55,5 +55,64 @@ services:
     # 常驻定时进程：每个交易日 run_time 运行，休眠醒来后补跑，运行完成后备份数据库
     command: ["qt", "worker"]
 
+  # 网页：与 worker 同一镜像；不映射宿主机端口，只在容器网络内被 proxy 访问
+  # （本机开发用 compose.dev.yaml 映射到 127.0.0.1:8000）。
+  # 网页进程不构建全市场行情面板，按使用者缓存股票集合；1500m 只是兜底上限。
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+      DATABASE_URL: postgresql+psycopg://qt:${POSTGRES_PASSWORD:-qt}@db:5432/qt
+      QT_DATA_DIR: /app/data
+      MAIL_FILE_DIR: /app/mail_out
+    volumes:
+      # 行情数据只读：网页不写数据
+      - ${QT_DATA_DIR:-./data}:/app/data:ro
+      - ./reports:/app/reports:ro
+      # MAIL_BACKEND=file 时，网页发的验证邮件也写到这里
+      - ./mail_out:/app/mail_out
+    command: ["qt", "web", "--host", "0.0.0.0", "--port", "8000"]
+    mem_limit: 1500m
+    healthcheck:
+      # 镜像里没有 curl，用 Python 请求 /healthz
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # 公网反向代理（自动申请 HTTPS 证书）：只在 public 档位启动，
+  # 服务器上用 docker compose --profile public up -d；本机开发的 docker compose up 不会启动它。
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    profiles: ["public"]
+    depends_on:
+      - web
+    environment:
+      # 站点域名取自 .env 的 QT_SITE，必须与 QT_BASE_URL 是同一个域名；未设置时 Caddy 因配置无效而启动失败
+      QT_SITE: ${QT_SITE:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书与账号数据：务必保留，否则重建后要重新申请（有频率限制）
+      - caddy_data:/data
+      - caddy_config:/config
+
 volumes:
   qt_pg:
+  caddy_data:
+  caddy_config:

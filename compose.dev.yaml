@@ -1,0 +1,9 @@
+# 本机开发覆盖文件：把网页映射到宿主机回环地址 127.0.0.1:8000
+# 用法：docker compose -f compose.yaml -f compose.dev.yaml up -d --build db migrate web
+# 注意：必须点名服务；不要不带服务名执行 up（会把 worker 一起启动）。
+services:
+  web:
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      QT_BASE_URL: http://localhost:8000

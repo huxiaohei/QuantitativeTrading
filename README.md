@@ -65,7 +65,7 @@ uv run qt backtest sweep \
 
 在回测之外，项目还能作为多人使用的每日信号服务运行：每个交易日 18:00 起更新数据，按每位使用者订阅的参数计算信号，发邮件，并记录“系统账”（照信号严格执行的模拟账）和“手动账”（你实际做了的买卖）。系统只出信号，不下单，不构成投资建议。
 
-用 Docker Compose 部署（详见 [Mac 部署说明](docs/deploy-mac.md)，迁移见 [迁移到服务器](docs/migrate-to-server.md)，使用者须知见 [每日信号与回测的差异](docs/live-vs-backtest.md)）：
+用 Docker Compose 部署（详见 [Mac 部署说明](docs/deploy-mac.md)，迁移见 [迁移到服务器](docs/migrate-to-server.md)，网页与 HTTPS 上线见 [服务器部署说明](docs/deploy-server.md)，使用者须知见 [每日信号与回测的差异](docs/live-vs-backtest.md)）：
 
 ```bash
 cp .env.example .env                  # 填写邮箱、管理员邮箱等；授权码只放在 .env 里
@@ -90,6 +90,18 @@ qt run-day [--day 2026-11-13]                         # 手动跑一天
 ```
 
 Mac 必须在 18:00 起的约 3.5 小时里保持唤醒并接电，防休眠设置见部署说明。
+
+## 网页
+
+第二阶段还带一个网页（`qt web`）：使用者在网页上登录、查看信号与账本、录入手动账；管理员管理邀请码与使用者。
+服务器上用 Caddy 自动申请 HTTPS 证书：
+
+```bash
+docker compose --profile public up -d --build    # 服务器：db、migrate、worker、web、proxy
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build db migrate web   # 本机开发：网页在 http://127.0.0.1:8000
+```
+
+从零到上线的步骤见 [服务器部署说明](docs/deploy-server.md)。本机开发务必点名服务，不带服务名的 `up` 会把 worker 一起启动。
 
 ## 输出放在哪里
 

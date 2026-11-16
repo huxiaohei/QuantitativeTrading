@@ -32,6 +32,7 @@ chmod 600 .env
 - 把 `POSTGRES_PASSWORD` 改成强密码（新建数据库卷时才会生效，所以要在第 4 步之前改）。
 - `QT_DATA_DIR` 改成服务器上的实际路径（默认 `./data`）。
 - 确认 `MAIL_BACKEND=smtp` 与 SMTP 各项仍然正确。
+- 要对外提供网页：设置 `QT_BASE_URL=https://<你的域名>` 和 `QT_SITE=<你的域名>`（同一个域名），其余步骤见 [服务器部署说明](deploy-server.md)。
 
 ## 4. 恢复数据库
 
@@ -60,8 +61,8 @@ docker compose exec db psql -U qt -d qt -c 'DROP SCHEMA public CASCADE; CREATE S
 ## 6. 启动并核对
 
 ```bash
-docker compose up -d
-docker compose ps                        # db healthy，migrate Exited (0)，worker running
+docker compose up -d                     # 提供网页时改用 docker compose --profile public up -d --build，见 deploy-server.md
+docker compose ps                        # db healthy，migrate Exited (0)，worker running（有网页时还有 web、proxy）
 docker compose run --rm worker qt admin runs --last 10
 docker compose run --rm worker qt admin user list
 docker compose logs -f worker
