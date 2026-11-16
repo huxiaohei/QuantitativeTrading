@@ -25,23 +25,24 @@ from qt.web.app import create_app
 from qt.web.deps import WebDeps
 from tests.conftest import resolve_test_db_url
 from tests.jobs.conftest import CASH, CFG, DAY, run_two_days
-from tests.web.conftest import BASE, MakeUser, csrf_of, login_as, make_deps
-from tests.web.test_read_pages import DISCLAIMER, World
+from tests.web.conftest import (
+    BASE,
+    MakeUser,
+    World,
+    csrf_of,
+    login_as,
+    subscribe,
+    world_deps,
+)
+from tests.web.test_read_pages import DISCLAIMER
 
 ROOT = Path(__file__).resolve().parents[2]
 EMAIL = "a@example.com"
 
 
 @pytest.fixture
-def world(tmp_path: Path, db_engine: Engine, db: Session) -> World:
-    return World(tmp_path, db_engine)
-
-
-@pytest.fixture
 def deps(world: World, db_engine: Engine, tmp_path: Path) -> WebDeps:
-    return make_deps(
-        db_engine, tmp_path, world.clock, tmp_path / "mails", calendar=lambda: world.calendar
-    )
+    return world_deps(world, db_engine, tmp_path)
 
 
 @pytest.fixture
@@ -54,12 +55,6 @@ def _login(client: TestClient, make_user: MakeUser, email: str = EMAIL) -> int:
     user = make_user(email)
     assert login_as(client, email).status_code == 303
     return user.id
-
-
-def _subscribe(db: Session, world: World, user_id: int) -> Subscription:
-    sub = accounts.create_subscription(db, user_id, CFG, CASH, world.days[DAY], None, actor=CLI)
-    db.commit()
-    return sub
 
 
 def _post(client: TestClient, path: str, data: dict[str, str]) -> httpx.Response:
@@ -104,7 +99,7 @@ def _page(client: TestClient, path: str) -> str:
 
 
 def test_buy_then_sell(client: TestClient, make_user: MakeUser, world: World, db: Session) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     resp = _post(client, "/manual/trade", _buy_form(world))
     assert resp.status_code == 303
     assert resp.headers["location"].startswith("/manual?msg=manual_trade&entry=")
@@ -142,14 +137,14 @@ def _market(world: World) -> StoreMarket:
 def test_explicit_fees_are_kept(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     assert _post(client, "/manual/trade", _buy_form(world, fees="7.5")).status_code == 303
     (row,) = _ledger(db, sub)
     assert row.fees == 7.5 and not row.fees_estimated
 
 
 def test_record_holding(client: TestClient, make_user: MakeUser, world: World, db: Session) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     resp = _post(
         client,
         "/manual/holding",
@@ -170,7 +165,7 @@ def test_record_holding(client: TestClient, make_user: MakeUser, world: World, d
 def test_deposit_and_withdraw(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     day = str(world.days[DAY])
     dep = _post(client, "/manual/cash", {"kind": "deposit", "day": day, "amount": "5000"})
     assert dep.status_code == 303 and "已录入入金" in _page(client, dep.headers["location"])
@@ -183,7 +178,7 @@ def test_deposit_and_withdraw(
 def test_void_entry_with_confirmation(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     _post(client, "/manual/trade", _buy_form(world))
     (buy,) = _ledger(db, sub)
     manual = _page(client, "/manual")
@@ -222,7 +217,7 @@ def _failed(resp: httpx.Response, reason: str, *kept: str) -> None:
 def test_buy_non_main_board_is_rejected(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     resp = _post(client, "/manual/trade", _buy_form(world, symbol="300001"))
     _failed(resp, "主板", "300001", "10.00", "1000")
     assert _ledger(db, sub) == []
@@ -233,7 +228,7 @@ def test_buy_non_main_board_is_rejected(
 def test_buy_future_date_is_rejected(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     future = str(world.days[DAY + 5])
     resp = _post(client, "/manual/trade", _buy_form(world, day=future))
     _failed(resp, "晚于今天", future)
@@ -243,7 +238,7 @@ def test_buy_future_date_is_rejected(
 def test_sell_more_than_held_is_rejected(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     _post(client, "/manual/trade", _buy_form(world, shares="100"))
     resp = _post(
         client,
@@ -257,7 +252,7 @@ def test_sell_more_than_held_is_rejected(
 def test_withdraw_more_than_cash_is_rejected(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     amount = f"{CASH * 10:.0f}"
     resp = _post(
         client, "/manual/cash", {"kind": "withdraw", "day": str(world.days[DAY]), "amount": amount}
@@ -269,7 +264,7 @@ def test_withdraw_more_than_cash_is_rejected(
 def test_holding_future_buy_day_is_rejected(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     resp = _post(
         client,
         "/manual/holding",
@@ -286,7 +281,7 @@ def test_holding_future_buy_day_is_rejected(
 def test_bad_format_shows_field_errors_and_keeps_inputs(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     resp = _post(
         client,
         "/manual/trade",
@@ -306,7 +301,7 @@ def test_bad_format_shows_field_errors_and_keeps_inputs(
 def test_pages_say_main_board_only(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    _subscribe(db, world, _login(client, make_user))
+    subscribe(db, world, _login(client, make_user))
     assert "目前只支持沪深主板股票" in _page(client, "/manual/trade")
     assert "目前只支持沪深主板股票" in _page(client, "/manual/holding")
     assert "目前只支持沪深主板股票" in _page(client, "/manual")
@@ -316,7 +311,7 @@ def test_same_form_submitted_twice_writes_one_entry(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
     """同一个表单（同一个一次性值）连点两次：只有一条流水，第二次 303 到 /manual 并提示已录入过。"""
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     form = {**_buy_form(world), "form_key": _form_key(_page(client, "/manual/trade"))}
     first = _post(client, "/manual/trade", form)
     second = _post(client, "/manual/trade", form)
@@ -329,7 +324,7 @@ def test_same_form_submitted_twice_writes_one_entry(
 def test_holding_and_cash_forms_are_also_deduplicated(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     holding = {
         "symbol": "600003",
         "buy_day": str(world.days[DAY - 30]),
@@ -353,7 +348,7 @@ def test_holding_and_cash_forms_are_also_deduplicated(
 def test_two_renders_with_same_content_are_two_trades(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     first_key = _form_key(_page(client, "/manual/trade"))
     second_key = _form_key(_page(client, "/manual/trade"))
     assert first_key != second_key
@@ -367,7 +362,7 @@ def test_two_renders_with_same_content_are_two_trades(
 def test_failed_write_does_not_burn_the_form_value(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     key = new_form_value()
     bad = _post(client, "/manual/trade", {**_buy_form(world, shares="150"), "form_key": key})
     assert bad.status_code == 422 and _ledger(db, sub) == []
@@ -385,7 +380,7 @@ def test_failed_write_does_not_burn_the_form_value(
 def test_missing_or_malformed_form_value_is_rejected(
     client: TestClient, make_user: MakeUser, world: World, db: Session, value: str
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     token = csrf_of(client.get("/manual/cash"))
     paths = {
         "/manual/trade": _buy_form(world),
@@ -406,7 +401,7 @@ def test_missing_or_malformed_form_value_is_rejected(
 def test_forms_carry_a_form_value(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    _subscribe(db, world, _login(client, make_user))
+    subscribe(db, world, _login(client, make_user))
     for path in ("/manual/trade", "/manual/holding", "/manual/cash"):
         assert len(_form_key(_page(client, path))) >= 16
 
@@ -414,7 +409,7 @@ def test_forms_carry_a_form_value(
 def test_void_twice_is_a_clear_422_with_one_void(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     _post(client, "/manual/trade", _buy_form(world))
     (buy,) = _ledger(db, sub)
     assert _post(client, f"/manual/entries/{buy.id}/void", {}).status_code == 303
@@ -433,7 +428,7 @@ def test_unsupported_symbol_does_not_build_a_market(
         return deps.market(today, symbols)
 
     with TestClient(create_app(dataclasses.replace(deps, market=counting)), base_url=BASE) as c:
-        sub = _subscribe(db, world, _login(c, make_user))
+        sub = subscribe(db, world, _login(c, make_user))
         before = len(builds)
         for symbol in ("abc", "300001", "9" * 500):
             resp = _post(c, "/manual/trade", _buy_form(world, symbol=symbol))
@@ -463,7 +458,7 @@ def test_without_open_subscription_everything_redirects_to_strategy(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
     user_id = _login(client, make_user)
-    sub = _subscribe(db, world, user_id)
+    sub = subscribe(db, world, user_id)
     accounts.close_subscription(db, user_id, sub.id, actor=CLI)
     db.commit()
     for path in ("/manual", "/manual/trade", "/manual/holding", "/manual/cash"):
@@ -522,19 +517,19 @@ def test_signal_prefill_and_isolation(
 
     other, other_id = _other_client(deps, make_user)
     with other:
-        _subscribe(db, world, other_id)
+        subscribe(db, world, other_id)
         assert other.get(f"/manual/trade?signal={sig.id}").status_code == 404
 
 
 def test_cannot_void_someone_elses_entry(
     client: TestClient, deps: WebDeps, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     _post(client, "/manual/trade", _buy_form(world))
     (mine,) = _ledger(db, sub)
     other, other_id = _other_client(deps, make_user)
     with other:
-        other_sub = _subscribe(db, world, other_id)
+        other_sub = subscribe(db, world, other_id)
         assert other.get(f"/manual/entries/{mine.id}/void").status_code == 404
         token = csrf_of(other.get("/manual/cash"))
         resp = other.post(
@@ -562,13 +557,13 @@ def test_manual_page_with_someone_elses_entry_is_404(
     client: TestClient, deps: WebDeps, make_user: MakeUser, world: World, db: Session
 ) -> None:
     """网址里的流水编号只按本人名下查找：别人的、不存在的一律 404，不当作没给。"""
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     _post(client, "/manual/trade", _buy_form(world))
     (mine,) = _ledger(db, sub)
     assert "买入 600001" in _page(client, f"/manual?msg=manual_trade&entry={mine.id}")
     other, other_id = _other_client(deps, make_user)
     with other:
-        _subscribe(db, world, other_id)
+        subscribe(db, world, other_id)
         assert other.get(f"/manual?msg=manual_trade&entry={mine.id}").status_code == 404
         assert other.get(f"/manual?entry={mine.id}").status_code == 404
         assert other.get("/manual?msg=manual_trade&entry=999999").status_code == 404
@@ -607,7 +602,7 @@ def _break_ledger(db: Session, sub: Subscription, world: World) -> LedgerEntry:
 def test_inconsistent_ledger_pages_do_not_fail(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     bad = _break_ledger(db, sub, world)
     manual = _page(client, "/manual")
     assert "互相对不上" in manual and "超过" in manual
@@ -628,7 +623,7 @@ def test_inconsistent_ledger_pages_do_not_fail(
 def test_unrelated_write_on_inconsistent_ledger_is_422_not_500(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     _break_ledger(db, sub, world)
     resp = _post(client, "/manual/trade", _buy_form(world))
     assert resp.status_code == 422 and "现有流水" in resp.text
@@ -647,7 +642,7 @@ def test_web_entry_matches_cli_book_show(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    sub = _subscribe(db, world, _login(client, make_user))
+    sub = subscribe(db, world, _login(client, make_user))
     _post(client, "/manual/trade", _buy_form(world))
     _post(
         client,

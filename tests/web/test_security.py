@@ -1,4 +1,7 @@
-"""网页安全：防伪造、来源检查、响应头、Cookie 属性、会话过期、错误页、来访 IP、路由登记。"""
+"""网页安全：防伪造、来源检查、响应头、Cookie 属性、会话过期、错误页、来访 IP。
+
+路由登记与访问类别的总表在 test_access.py。
+"""
 
 from collections.abc import Iterator
 from datetime import timedelta
@@ -7,13 +10,12 @@ from pathlib import Path
 import httpx2 as httpx
 import pytest
 from fastapi import Depends
-from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
-from qt.web.app import ROUTES, create_app
+from qt.web.app import create_app
 from qt.web.deps import WebDeps, client_ip, require_admin, safe_next
 from tests.web.conftest import BASE, PW, Clock, MakeUser, csrf_of, login_as, make_deps
 
@@ -305,27 +307,3 @@ def test_client_ip(host: str, forwarded: str | None, expected: str) -> None:
 )
 def test_safe_next(raw: str | None, expected: str | None) -> None:
     assert safe_next(raw) == expected
-
-
-# ---- 路由登记 ----
-
-
-def test_every_route_is_registered(web_deps: WebDeps) -> None:
-    app = create_app(web_deps)
-    before = list(ROUTES)
-    create_app(web_deps)
-    assert before == ROUTES
-    registered = {(r.method, r.path) for r in ROUTES}
-    assert len(registered) == len(ROUTES)
-    actual = {
-        (method, route.path)
-        for route in app.routes
-        if isinstance(route, APIRoute)
-        for method in route.methods or ()
-    }
-    assert actual == registered
-    assert all(r.access in ("public", "user", "admin") for r in ROUTES)
-    public = {(r.method, r.path) for r in ROUTES if r.access == "public"}
-    assert ("GET", "/login") in public
-    assert ("POST", "/logout") not in public
-    assert ("GET", "/terms/accept") not in public

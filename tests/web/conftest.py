@@ -20,14 +20,16 @@ from qt.calendar import TradingCalendar
 from qt.config import AppConfig, load_config
 from qt.data.store import ParquetStore
 from qt.db import admin_repo
-from qt.db.models import User
+from qt.db.models import Subscription, User
 from qt.mail.send import FileSender
 from qt.service import auth
-from qt.service.accounts import create_user
+from qt.service.accounts import create_subscription, create_user
 from qt.service.actor import CLI
 from qt.service.market import StoreMarket, build_store_market
 from qt.web.app import create_app
 from qt.web.deps import WebDeps
+from tests.fakes import populate_trading_store
+from tests.jobs.conftest import CASH, DAY, Env, FakeClock, evening
 
 CFG: AppConfig = load_config(Path(__file__).resolve().parents[2] / "config" / "default.yaml")
 BASE = "https://quant.test"
@@ -98,6 +100,38 @@ def make_deps(
         market=small_market(store, calendar),
         background=False,
     )
+
+
+class World:
+    """测试数据：交易日历、行情存储与停在第二晚的时钟（2A 的每日任务夹具在 env 里）。"""
+
+    def __init__(self, tmp_path: Path, engine: Engine) -> None:
+        self.store = ParquetStore(tmp_path / "data")
+        self.days = populate_trading_store(self.store)
+        self.calendar = TradingCalendar(self.days)
+        self.clock = Clock(evening(self.days[DAY + 1]))
+        self.env = Env(engine, self.store, self.days, FakeClock(evening(self.days[DAY])))
+
+
+@pytest.fixture
+def world(tmp_path: Path, db_engine: Engine, db: Session) -> World:
+    # 依赖 db 夹具：测试结束后清空所有表
+    del db
+    return World(tmp_path, db_engine)
+
+
+def world_deps(world: World, engine: Engine, tmp_path: Path) -> WebDeps:
+    """用 World 的交易日历、行情存储（同一目录）与时钟构造 WebDeps。"""
+    return make_deps(
+        engine, tmp_path, world.clock, tmp_path / "mails", calendar=lambda: world.calendar
+    )
+
+
+def subscribe(db: Session, world: World, user_id: int) -> Subscription:
+    """给使用者建订阅：起始资金 CASH，起始日 days[DAY]。"""
+    sub = create_subscription(db, user_id, CFG, CASH, world.days[DAY], None, actor=CLI)
+    db.commit()
+    return sub
 
 
 @pytest.fixture

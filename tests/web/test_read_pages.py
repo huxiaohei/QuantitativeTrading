@@ -10,17 +10,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
-from qt.calendar import TradingCalendar
-from qt.data.store import ParquetStore
 from qt.db import repo
-from qt.db.models import DailyRun, Subscription, User
+from qt.db.models import DailyRun, User
 from qt.service import accounts
 from qt.service.actor import CLI
 from qt.web.app import create_app
 from qt.web.deps import WebDeps
-from tests.fakes import populate_trading_store
-from tests.jobs.conftest import CASH, CFG, DAY, Env, FakeClock, evening, run_two_days
-from tests.web.conftest import BASE, Clock, MakeUser, login_as, make_deps
+from tests.jobs.conftest import CASH, DAY, run_two_days
+from tests.web.conftest import BASE, MakeUser, World, login_as, subscribe, world_deps
 
 PAGES = ("/overview", "/signals", "/system", "/journal")
 DISCLAIMER = "以上内容是按你设定的规则计算的结果，不构成投资建议。"
@@ -31,27 +28,9 @@ READ_ONLY = "正在查看已关闭的订阅（只读）"
 _POST_FORM = re.compile(r'<form method="post"[^>]*>')
 
 
-class World:
-    """测试数据：交易日历、行情存储与停在第二晚的时钟。"""
-
-    def __init__(self, tmp_path: Path, engine: Engine) -> None:
-        self.store = ParquetStore(tmp_path / "data")
-        self.days = populate_trading_store(self.store)
-        self.calendar = TradingCalendar(self.days)
-        self.clock = Clock(evening(self.days[DAY + 1]))
-        self.env = Env(engine, self.store, self.days, FakeClock(evening(self.days[DAY])))
-
-
-@pytest.fixture
-def world(tmp_path: Path, db_engine: Engine, db: Session) -> World:
-    return World(tmp_path, db_engine)
-
-
 @pytest.fixture
 def deps(world: World, db_engine: Engine, tmp_path: Path) -> WebDeps:
-    return make_deps(
-        db_engine, tmp_path, world.clock, tmp_path / "mails", calendar=lambda: world.calendar
-    )
+    return world_deps(world, db_engine, tmp_path)
 
 
 @pytest.fixture
@@ -64,12 +43,6 @@ def _login(client: TestClient, make_user: MakeUser, email: str = "a@example.com"
     user = make_user(email)
     assert login_as(client, email).status_code == 303
     return user
-
-
-def _subscribe(db: Session, world: World, user_id: int) -> Subscription:
-    sub = accounts.create_subscription(db, user_id, CFG, CASH, world.days[DAY], None, actor=CLI)
-    db.commit()
-    return sub
 
 
 def _get(client: TestClient, path: str) -> str:
@@ -92,7 +65,7 @@ def test_pages_with_subscription_but_no_run(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
     user = _login(client, make_user)
-    _subscribe(db, world, user.id)
+    subscribe(db, world, user.id)
     for path in PAGES:
         text = _get(client, path)
         assert NO_RUN in text and NO_SUB not in text, path
@@ -127,7 +100,7 @@ def test_overview_shows_data_failure(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
     user = _login(client, make_user)
-    _subscribe(db, world, user.id)
+    subscribe(db, world, user.id)
     moment = datetime(2022, 1, 4, 10, 0, tzinfo=UTC)
     db.add(
         DailyRun(
@@ -148,7 +121,7 @@ def test_foreign_subscription_is_404(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
     other = make_user("b@example.com")
-    theirs = _subscribe(db, world, other.id)
+    theirs = subscribe(db, world, other.id)
     _login(client, make_user)
     for path in PAGES:
         assert client.get(f"{path}?sub={theirs.id}").status_code == 404, path
@@ -174,6 +147,6 @@ def test_current_subscription_has_no_read_only_banner(
     client: TestClient, make_user: MakeUser, world: World, db: Session
 ) -> None:
     user = _login(client, make_user)
-    sub = _subscribe(db, world, user.id)
+    sub = subscribe(db, world, user.id)
     for path in PAGES:
         assert READ_ONLY not in _get(client, f"{path}?sub={sub.id}"), path
