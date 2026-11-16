@@ -193,9 +193,12 @@ def _manual_page(
         names=stock_names(deps),
     )
     flash = FLASH_MESSAGES.get(msg or "")
-    if flash is not None and entry is not None:
+    if entry is not None:
+        # 网址里的流水编号只在本人当前手动账里找：别人的、不存在的一律 404，不当作没给
         row = next((e for e in page.entries if e.id == entry), None)
-        if row is not None:
+        if row is None:
+            raise NotFoundError("流水不存在")
+        if flash is not None:
             flash = f"{flash}：{_entry_text(row)}"
     context: dict[str, object] = {
         "active": "manual",

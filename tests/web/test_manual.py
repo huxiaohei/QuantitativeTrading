@@ -558,6 +558,23 @@ def test_cannot_void_someone_elses_entry(
     assert "600002" not in _page(client, "/manual")
 
 
+def test_manual_page_with_someone_elses_entry_is_404(
+    client: TestClient, deps: WebDeps, make_user: MakeUser, world: World, db: Session
+) -> None:
+    """网址里的流水编号只按本人名下查找：别人的、不存在的一律 404，不当作没给。"""
+    sub = _subscribe(db, world, _login(client, make_user))
+    _post(client, "/manual/trade", _buy_form(world))
+    (mine,) = _ledger(db, sub)
+    assert "买入 600001" in _page(client, f"/manual?msg=manual_trade&entry={mine.id}")
+    other, other_id = _other_client(deps, make_user)
+    with other:
+        _subscribe(db, world, other_id)
+        assert other.get(f"/manual?msg=manual_trade&entry={mine.id}").status_code == 404
+        assert other.get(f"/manual?entry={mine.id}").status_code == 404
+        assert other.get("/manual?msg=manual_trade&entry=999999").status_code == 404
+        assert other.get("/manual").status_code == 200
+
+
 def test_unauthenticated_access_redirects_to_login(client: TestClient) -> None:
     for path in ("/manual", "/manual/trade", "/manual/holding", "/manual/cash"):
         resp = client.get(path, follow_redirects=False)
