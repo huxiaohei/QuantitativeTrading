@@ -2,6 +2,12 @@
 
 from fastapi import APIRouter
 
-from qt.web.routes import overview, public
+from qt.web.routes import journal, overview, public, signals, system
 
-ROUTERS: tuple[APIRouter, ...] = (public.router, overview.router)
+ROUTERS: tuple[APIRouter, ...] = (
+    public.router,
+    overview.router,
+    signals.router,
+    system.router,
+    journal.router,
+)

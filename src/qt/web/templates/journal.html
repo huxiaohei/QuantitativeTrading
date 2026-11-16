@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}日志 · 量化信号{% endblock %}
+{% block content %}
+<h1>日志</h1>
+{% include "_page_head.html" %}
+{% if view is not none %}
+{% for label, j in [("手动账", view.manual), ("系统账", view.system)] %}
+<section class="card">
+  <h2>{{ label }} · 已完成的交易</h2>
+  {% if j.trades %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th>股票</th><th>买入日</th><th>卖出日</th><th class="num">股数</th><th class="num">成本</th>
+      <th class="num">收回</th><th class="num">收益</th><th class="num">持有天数</th><th>离场</th><th>来源</th>
+    </tr></thead>
+    <tbody>
+    {% for t in j.trades | reverse %}
+    <tr>
+      <td>{{ t.symbol }} {{ t.name }}</td>
+      <td>{{ t.entry_day }}</td>
+      <td>{{ t.exit_day }}</td>
+      <td class="num">{{ t.shares | shares }}</td>
+      <td class="num">{{ t.cost | money }}</td>
+      <td class="num">{{ t.received | money }}</td>
+      <td class="num {{ t.ret | trend }}">{{ t.ret | pct }}</td>
+      <td class="num">{{ t.holding_days }}</td>
+      <td>{{ t.exit_label }}</td>
+      <td>{{ t.origin_label }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">暂无。</p>
+  {% endif %}
+  <h2>{{ label }} · 跟踪记录</h2>
+  <p class="muted">事件之后 20、60 个交易日的复权涨跌。</p>
+  {% if j.followups %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>股票</th><th>事件</th><th>事件日</th><th class="num">20 日</th><th class="num">60 日</th></tr></thead>
+    <tbody>
+    {% for f in j.followups | reverse %}
+    <tr>
+      <td>{{ f.symbol }} {{ f.name }}</td>
+      <td>{{ f.event_label }}</td>
+      <td>{{ f.event_day }}</td>
+      <td class="num {{ f.ret_20 | trend }}">{{ f.ret_20 | pct if f.ret_20 is not none else "待填" }}</td>
+      <td class="num {{ f.ret_60 | trend }}">{{ f.ret_60 | pct if f.ret_60 is not none else "待填" }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">暂无。</p>
+  {% endif %}
+</section>
+{% endfor %}
+{% endif %}
+{% endblock %}

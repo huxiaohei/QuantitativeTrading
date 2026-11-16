@@ -18,9 +18,12 @@ from qt.data.source import DataSource
 from qt.data.store import ParquetStore
 from qt.db import repo
 from qt.db.models import DailyRun, Signal, Subscription
-from qt.jobs.daily import RunContext
+from qt.jobs.daily import RunContext, run_day
+from qt.models import Side
 from qt.service.accounts import create_subscription, create_user
 from qt.service.actor import CLI
+from qt.service.manual_ops import record_trade
+from qt.service.market import StoreMarket, build_store_market
 from tests.fakes import FakeSource, populate_trading_store
 
 CFG: AppConfig = load_config(Path(__file__).resolve().parents[2] / "config" / "default.yaml")
@@ -128,6 +131,34 @@ def subscribe(
     user = create_user(db, email, actor=CLI)
     sub = create_subscription(db, user.id, CFG, CASH, start, overrides, actor=CLI)
     db.commit()
+    return sub
+
+
+def market_on(env: Env, day: date) -> StoreMarket:
+    """day 的全量行情（测试用，不缓存）。"""
+    return build_store_market(env.store, CFG, env.calendar, day)
+
+
+def run_two_days(env: Env, db: Session, user_id: int) -> Subscription:
+    """给使用者建订阅（起始日 days[DAY]）并跑两个交易日。
+
+    第一晚出买入信号；第二天按 600001 的信号录入买入，再自主卖出其中 100 股（得到一笔已完成交易），
+    然后跑第二晚：系统账成交、手动账推进。时钟停在第二晚。
+    """
+    first, second = env.days[DAY], env.days[DAY + 1]
+    sub = create_subscription(db, user_id, CFG, CASH, first, None, actor=CLI)
+    db.commit()
+    env.clock.now = evening(first)
+    assert run_day(env.ctx, first, notify=True, update_data=False) == "done"
+    env.clock.now = evening(second)
+    signal = next(sig for sig in book_signals(db, sub, "manual") if sig.symbol == "600001")
+    market = market_on(env, second)
+    args = (db, user_id, sub.id, market, env.calendar, CFG, second)
+    record_trade(*args, Side.BUY, "600001", second, 10.0, signal.shares, None, actor=CLI)
+    record_trade(*args, Side.SELL, "600001", second, 10.2, 100.0, None, actor=CLI)
+    db.commit()
+    assert run_day(env.ctx, second, notify=True, update_data=False) == "done"
+    db.rollback()
     return sub
 
 

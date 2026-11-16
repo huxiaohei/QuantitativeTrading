@@ -37,6 +37,36 @@ TEMPLATES = jinja2.Environment(
     undefined=jinja2.StrictUndefined,
 )
 
+
+def _money(value: float | None) -> str:
+    """金额：两位小数，千分位；没有值显示 -。"""
+    return "-" if value is None else f"{value:,.2f}"
+
+
+def _price(value: float | None) -> str:
+    """价格：两位小数；没有值显示 -。"""
+    return "-" if value is None else f"{value:.2f}"
+
+
+def _shares(value: float) -> str:
+    """股数：整数，千分位。"""
+    return f"{value:,.0f}"
+
+
+def _pct(value: float | None) -> str:
+    """比例（0.05 → 5.00%）；没有值显示 -。"""
+    return "-" if value is None else f"{value * 100:.2f}%"
+
+
+def _trend(value: float | None) -> str:
+    """涨跌的样式名：涨为 up（红），跌为 down（绿），其余为空。"""
+    if value is None or value == 0:
+        return ""
+    return "up" if value > 0 else "down"
+
+
+TEMPLATES.filters.update(money=_money, price=_price, shares=_shares, pct=_pct, trend=_trend)
+
 # 已登录但条款版本过期时，只放行这两个地址
 _TERMS_EXEMPT = frozenset({"/terms/accept", "/logout"})
 # 跳转后显示的提示：网址里只带代号，文字取自这张表，绝不显示网址里的任意文字

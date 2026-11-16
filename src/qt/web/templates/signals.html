@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% from "_tables.html" import signal_table %}
+{% block title %}信号 · 量化信号{% endblock %}
+{% block content %}
+<h1>信号</h1>
+{% include "_page_head.html" %}
+{% if view is not none %}
+<p class="muted">信号是按你设定的规则计算出的提示，系统不会替你下单。</p>
+<section class="card">
+  <h2>待处理的信号</h2>
+  {% if view.pending %}
+  {{ signal_table(view.pending, show_book=false, show_record=not view.subscription.read_only) }}
+  {% else %}
+  <p class="muted">没有待处理的信号。</p>
+  {% endif %}
+</section>
+<section class="card">
+  <h2>历史信号</h2>
+  {% if view.history %}
+  {{ signal_table(view.history) }}
+  {% else %}
+  <p class="muted">还没有历史信号。</p>
+  {% endif %}
+</section>
+<section class="card">
+  <h2>被规则否决的候选</h2>
+  {% if view.rejections %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>账本</th><th>股票</th><th>原因</th><th>首次</th><th>最近</th></tr></thead>
+    <tbody>
+    {% for r in view.rejections %}
+    <tr>
+      <td>{{ "手动账" if r.book == "manual" else "系统账" }}</td>
+      <td>{{ r.symbol }} {{ r.name }}</td>
+      <td>{{ r.message }}</td>
+      <td>{{ r.first_day }}</td>
+      <td>{{ r.last_day }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">没有被否决的候选。</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

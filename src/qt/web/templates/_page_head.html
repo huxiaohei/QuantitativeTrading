@@ -1,0 +1,23 @@
+{# 只读页面顶部：订阅状态（没有订阅、只读的历史订阅、切换订阅）与"还没有运行过"的说明 #}
+{% if subscription is none %}
+<section class="card">
+  <p>你还没有订阅策略。</p>
+  <p><a href="/strategy">去"策略"页创建订阅</a></p>
+</section>
+{% else %}
+  {% if subscription.read_only %}
+  <p class="notice">正在查看已关闭的订阅（只读）。<a href="{{ path }}">回到当前订阅</a></p>
+  {% endif %}
+  {% if subscriptions | length > 1 %}
+  <p class="muted sub-switch">订阅：
+    {% for item in subscriptions %}
+      {% if item.id == subscription.id %}<strong>#{{ item.id }} {{ item.status_label }}</strong>
+      {% else %}<a href="{{ path }}?sub={{ item.id }}">#{{ item.id }} {{ item.status_label }}</a>
+      {% endif %}
+    {% endfor %}
+  </p>
+  {% endif %}
+{% endif %}
+{% if run is none %}
+<p class="notice">系统还没有运行过，第一个交易日 18:00 之后会有结果。</p>
+{% endif %}

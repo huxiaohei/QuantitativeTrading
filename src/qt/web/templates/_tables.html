@@ -1,0 +1,118 @@
+{# 各页面共用的表格。表格外包可横向滚动的容器，窄屏不隐藏列。 #}
+
+{% macro signal_table(rows, show_book=true, show_record=false) %}
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    {% if show_book %}<th>账本</th>{% endif %}
+    <th>信号日</th><th>方向</th><th>股票</th><th class="num">股数</th><th class="num">参考价</th>
+    <th>有效期至</th><th>状态</th><th>说明</th>{% if show_record %}<th></th>{% endif %}
+  </tr></thead>
+  <tbody>
+  {% for r in rows %}
+  <tr>
+    {% if show_book %}<td>{{ "手动账" if r.book == "manual" else "系统账" }}</td>{% endif %}
+    <td>{{ r.signal_day }}</td>
+    <td>{{ r.side_label }}</td>
+    <td>{{ r.symbol }} {{ r.name }}</td>
+    <td class="num">{{ r.shares | shares }}</td>
+    <td class="num">{{ r.ref_price | price }}</td>
+    <td>{{ r.valid_until if r.valid_until is not none else "-" }}</td>
+    <td>{{ r.status_label }}{% if r.status_day != r.signal_day %}（{{ r.status_day }}）{% endif %}</td>
+    <td>{{ r.reason }}{% if r.void_note %}（{{ r.void_note }}）{% endif %}</td>
+    {% if show_record %}<td>{% if r.can_record %}<a href="/manual/trade?signal={{ r.id }}">按此信号录入</a>{% endif %}</td>{% endif %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endmacro %}
+
+{% macro summary_table(manual, system) %}
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    <th>账本</th><th class="num">净值</th><th class="num">现金</th><th class="num">持仓市值</th>
+    <th class="num">持仓只数</th><th class="num">收益</th><th>截至</th>
+  </tr></thead>
+  <tbody>
+  {% for label, b in [("手动账", manual), ("系统账", system)] %}
+  {% if b is not none %}
+  <tr>
+    <td>{{ label }}</td>
+    <td class="num">{{ b.nav | money }}</td>
+    <td class="num">{{ b.cash | money }}</td>
+    <td class="num">{{ b.holdings_value | money }}</td>
+    <td class="num">{{ b.holdings_count }}</td>
+    <td class="num {{ (b.unit_nav - 1) | trend }}">{{ (b.unit_nav - 1) | pct }}</td>
+    <td>{{ b.as_of }}</td>
+  </tr>
+  {% else %}
+  <tr><td>{{ label }}</td><td colspan="6" class="muted">尚未推进过（每日运行之后才有数据）</td></tr>
+  {% endif %}
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endmacro %}
+
+{% macro holdings_table(rows, levels=false) %}
+{% if rows %}
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    <th>股票</th><th class="num">股数</th><th class="num">成本价</th><th class="num">现价</th>
+    <th class="num">市值</th><th class="num">盈亏</th><th class="num">收益</th>
+    {% if levels %}<th class="num">止损位</th><th class="num">止盈位</th>{% endif %}<th>来源</th>
+  </tr></thead>
+  <tbody>
+  {% for h in rows %}
+  <tr>
+    <td>{{ h.symbol }} {{ h.name }}</td>
+    <td class="num">{{ h.shares | shares }}</td>
+    <td class="num">{{ h.cost_price | price }}</td>
+    <td class="num">{{ h.close | price }}</td>
+    <td class="num">{{ h.value | money }}</td>
+    <td class="num {{ h.pnl | trend }}">{{ h.pnl | money }}</td>
+    <td class="num {{ h.ret | trend }}">{{ h.ret | pct }}</td>
+    {% if levels %}<td class="num">{{ h.stop_price | price }}</td><td class="num">{{ h.take_price | price }}</td>{% endif %}
+    <td>{{ h.origin_label }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">没有持仓。</p>
+{% endif %}
+{% endmacro %}
+
+{% macro entries_table(rows) %}
+{% if rows %}
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    <th>编号</th><th>日期</th><th>类型</th><th>股票</th><th class="num">股数</th>
+    <th class="num">价格</th><th class="num">金额</th><th class="num">费用</th><th>备注</th>
+  </tr></thead>
+  <tbody>
+  {% for e in rows | reverse %}
+  <tr>
+    <td>{{ "#" ~ e.id if e.id is not none else "" }}</td>
+    <td>{{ e.day }}</td>
+    <td>{{ e.kind_label }}{% if e.voided %}（已作废）{% endif %}</td>
+    <td>{{ e.symbol or "" }} {{ e.name }}</td>
+    <td class="num">{{ e.shares | shares if e.shares else "" }}</td>
+    <td class="num">{{ e.price | price if e.kind in ("buy", "sell", "transfer_in") else "" }}</td>
+    <td class="num">{{ e.amount | money if e.amount else "" }}</td>
+    <td class="num">{{ e.fees | money if e.fees else "" }}{% if e.fees_estimated %}（估算）{% endif %}</td>
+    <td>{% if e.kind == "void" %}作废 #{{ e.voids_entry_id }}{% endif %}{% if e.kind == "transfer_in" %}从 {{ e.effective_day }} 起进入净值{% endif %}{% if e.signal_id is not none %}信号 #{{ e.signal_id }}{% endif %}{% if e.note %} {{ e.note }}{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">暂无流水。</p>
+{% endif %}
+{% endmacro %}

@@ -66,19 +66,26 @@ def _calendar() -> TradingCalendar:
     return TradingCalendar([date(2026, 11, 16)])
 
 
-def small_market(store: ParquetStore) -> Callable[[date, Collection[str]], StoreMarket]:
+def small_market(
+    store: ParquetStore, calendar: Callable[[], TradingCalendar] = _calendar
+) -> Callable[[date, Collection[str]], StoreMarket]:
     """用小夹具数据现建行情的函数（测试里不缓存）。"""
 
     def _market(today: date, symbols: Collection[str]) -> StoreMarket:
-        return build_store_market(store, CFG, _calendar(), today, symbols)
+        return build_store_market(store, CFG, calendar(), today, symbols)
 
     return _market
 
 
 def make_deps(
-    engine: Engine, tmp_path: Path, clock: Clock, mail_dir: Path, base_url: str = BASE
+    engine: Engine,
+    tmp_path: Path,
+    clock: Clock,
+    mail_dir: Path,
+    base_url: str = BASE,
+    calendar: Callable[[], TradingCalendar] = _calendar,
 ) -> WebDeps:
-    """按测试需要构造 WebDeps；后台线程关闭。"""
+    """按测试需要构造 WebDeps；后台线程关闭。calendar 缺省是只有 2026-11-16 一天的日历。"""
     store = ParquetStore(tmp_path / "data")
     return WebDeps(
         engine=engine,
@@ -87,8 +94,8 @@ def make_deps(
         sender=FileSender(mail_dir),
         now=clock,
         store=store,
-        calendar=_calendar,
-        market=small_market(store),
+        calendar=calendar,
+        market=small_market(store, calendar),
         background=False,
     )
 

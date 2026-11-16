@@ -12,21 +12,20 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import date, datetime, time, timedelta
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Literal, cast
 from zoneinfo import ZoneInfo
 
 import typer
 from sqlalchemy.orm import Session
 
-from qt.backtest.state import load_state
 from qt.calendar import TradingCalendar
 from qt.data.schema import SchemaError
-from qt.data.update import DataIntegrityError, format_bulk
+from qt.data.update import DataIntegrityError
 from qt.db import admin_repo, repo
 from qt.db.engine import session_scope
-from qt.db.models import Book, LedgerEntry, Signal, Subscription, User
+from qt.db.models import Subscription, User
 from qt.mail.outbox import requeue_failed
-from qt.models import Position, Side
+from qt.models import Side
 from qt.runtime import (
     DEFAULT_CONFIG,
     DEFAULT_DATA_DIR,
@@ -36,10 +35,9 @@ from qt.runtime import (
     SetupError,
 )
 from qt.runtime import now as runtime_now
-from qt.service import accounts, manual_ops, rules
+from qt.service import accounts, manual_ops, rules, views
 from qt.service.actor import CLI
 from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
-from qt.service.manual_book import CorporateAction
 from qt.service.market import StoreMarket, build_store_market
 from qt.service.signals import SignalStatus
 
@@ -81,43 +79,11 @@ BookOption = Annotated[
 ]
 
 _PARAM_LABELS: dict[str, str] = {p.key: p.label for p in rules.PARAMS}
-_SUB_STATUS = {"active": "生效中", "paused": "已暂停", "closed": "已关闭"}
+_SUB_STATUS = views.SUB_STATUS_LABELS
 _USER_STATUS = {"active": "正常", "disabled": "停用"}
-_KIND_LABELS = {
-    "buy": "买入",
-    "sell": "卖出",
-    "transfer_in": "转入持仓",
-    "deposit": "入金",
-    "withdraw": "出金",
-    "void": "作废流水",
-}
-_SIGNAL_STATUS_LABELS = {
-    "created": "已生成",
-    "notified": "已通知",
-    "executed": "已执行",
-    "abandoned": "已放弃",
-    "voided": "已作废",
-    "unnotified": "未通知（补跑）",
-}
-_SIDE_LABELS = {"buy": "买入信号", "sell": "卖出信号"}
-_EXIT_LABELS = {
-    "take_profit_fixed": "固定止盈",
-    "take_profit_trailing": "移动止盈",
-    "stop_loss": "止损",
-    "time_stop": "持有期满",
-    "fundamental": "基本面",
-    "delisted": "退市",
-    "manual": "自主卖出",
-}
-_FOLLOWUP_LABELS = {"exit": "离场后", "abandoned": "放弃买入后", "rejected": "被规则否决后"}
+_SIGNAL_STATUS_LABELS = views.SIGNAL_STATUS_LABELS
 _OUTBOX_STATUS_LABELS = {"pending": "待发", "sent": "已发", "failed": "发送失败"}
 _OUTBOX_ERROR_CHARS = 80  # outbox list 里错误信息最多显示的字数
-_RUN_STATUS_LABELS = {
-    "running": "运行中（或中途中断）",
-    "done": "完成",
-    "done_with_errors": "完成，但有使用者处理出错",
-    "data_failed": "数据异常，本日未出信号",
-}
 
 
 def now() -> datetime:
@@ -309,8 +275,7 @@ def _json_text(value: object) -> str:
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
-def _origin_label(origin: str | None, side: str = "买入") -> str:
-    return f"按信号{side}" if origin == "signal" else f"自主{side}"
+_origin_label = views.origin_label
 
 
 # ---------- 使用者 ----------
@@ -700,141 +665,108 @@ def entry_void(
 # ---------- 账本 ----------
 
 
-def _entry_text(row: LedgerEntry, voided: set[int]) -> str:
-    kind = _KIND_LABELS.get(row.kind, row.kind)
-    head = f"#{row.id}  {row.trade_day}  {kind}"
-    if row.kind in ("deposit", "withdraw"):
-        body = f"金额 {money(row.price)}"
-    elif row.kind == "void":
-        body = f"#{row.voids_entry_id}  {row.symbol or ''}".rstrip()
-    elif row.kind == "transfer_in":
+def _entry_text(e: views.EntryRow) -> str:
+    """一条流水（或推算出的分红送转）的文字。"""
+    if e.kind == "dividend":
+        return f"{e.day}  {e.kind_label}  {e.symbol}  现金 {money(e.amount)}"
+    if e.kind == "bonus":
+        return f"{e.day}  {e.kind_label}  {e.symbol}  送转 {e.shares:,.2f} 股"
+    head = f"#{e.id}  {e.day}  {e.kind_label}"
+    if e.kind in ("deposit", "withdraw"):
+        body = f"金额 {money(e.price)}"
+    elif e.kind == "void":
+        body = f"#{e.voids_entry_id}  {e.symbol or ''}".rstrip()
+    elif e.kind == "transfer_in":
         body = (
-            f"{row.symbol}  {row.shares:,.0f} 股  成本价 {money(row.price)}"
-            f"  从 {row.effective_day} 起进入净值"
+            f"{e.symbol}  {e.shares:,.0f} 股  成本价 {money(e.price)}"
+            f"  从 {e.effective_day} 起进入净值"
         )
     else:
-        estimated = "（估算）" if row.fees_estimated else ""
+        estimated = "（估算）" if e.fees_estimated else ""
         body = (
-            f"{row.symbol}  {row.shares:,.0f} 股 @ {money(row.price)}"
-            f"  费用 {money(row.fees)}{estimated}  {'按信号' if row.origin == 'signal' else '自主'}"
+            f"{e.symbol}  {e.shares:,.0f} 股 @ {money(e.price)}"
+            f"  费用 {money(e.fees)}{estimated}  {'按信号' if e.origin == 'signal' else '自主'}"
         )
-        if row.signal_id is not None:
-            body += f"  信号 #{row.signal_id}"
+        if e.signal_id is not None:
+            body += f"  信号 #{e.signal_id}"
     text = f"{head}  {body}"
-    if row.id in voided:
+    if e.voided:
         text += "  [已作废]"
-    if row.note:
-        text += f"  提示：{row.note}"
+    if e.note:
+        text += f"  提示：{e.note}"
     return text
 
 
-def _action_texts(action: CorporateAction) -> list[str]:
-    texts: list[str] = []
-    if action.cash > 0:
-        texts.append(f"{action.day}  分红（推算）  {action.symbol}  现金 {money(action.cash)}")
-    if action.bonus_shares > 0:
-        texts.append(
-            f"{action.day}  送转（推算）  {action.symbol}  送转 {action.bonus_shares:,.2f} 股"
-        )
-    return texts
-
-
-def _recent_entries(rows: Sequence[LedgerEntry], actions: Sequence[CorporateAction]) -> list[str]:
-    """最近的流水（含推算出的分红送转）：按日期排序，同日先实际流水后推算记录。"""
-    voided = {r.voids_entry_id for r in rows if r.kind == "void" and r.voids_entry_id is not None}
-    items: list[tuple[date, int, int, str]] = [
-        (r.trade_day, 0, i, _entry_text(r, voided)) for i, r in enumerate(rows)
-    ]
-    for j, action in enumerate(actions):
-        items.extend((action.day, 1, j * 2 + k, t) for k, t in enumerate(_action_texts(action)))
-    items.sort(key=lambda it: it[:3])
-    return [text for *_, text in items[-_RECENT_ENTRIES:]]
-
-
 def _show_header(
-    user: User, sub: Subscription, kind: str, through: date, equity: float, cash: float, nav: float
+    user: User, sub: views.SubscriptionView, kind: str, summary: views.BookSummary
 ) -> None:
     name = "手动账" if kind == "manual" else "系统账"
     _emit(
-        f"{user.email} · 订阅 {sub.id}（{_SUB_STATUS.get(sub.status, sub.status)}）· {name}"
-        f" · 截至 {through}（按你设定的规则计算，仅供提示）"
+        f"{user.email} · 订阅 {sub.id}（{sub.status_label}）· {name}"
+        f" · 截至 {summary.as_of}（按你设定的规则计算，仅供提示）"
     )
-    _emit(f"净值 {money(equity)}  现金 {money(cash)}  单位净值 {nav:.4f}  收益 {pct(nav - 1)}")
+    _emit(
+        f"净值 {money(summary.nav)}  现金 {money(summary.cash)}"
+        f"  单位净值 {summary.unit_nav:.4f}  收益 {pct(summary.unit_nav - 1)}"
+    )
 
 
-def _position_rows(
-    positions: Sequence[tuple[Position, str]], market: StoreMarket, through: date
-) -> list[list[str]]:
-    """(持仓, 来源) -> 表格行；收益含持有期间收到的现金分红，现价取不到时显示 -。"""
-    rows: list[list[str]] = []
-    for pos, origin in positions:
-        symbol, shares, cost = pos.symbol, pos.shares, pos.cost
-        try:
-            close: float | None = market.last_close(through, symbol)
-        except KeyError:
-            close = None
-        rows.append(
-            [
-                symbol,
-                f"{shares:,.0f}",
-                money(cost / shares),
-                "-" if close is None else money(close),
-                "-" if close is None else money(shares * close),
-                "-" if close is None else pct(pos.ret(close)),
-                origin,
-            ]
-        )
-    return rows
+def _position_rows(holdings: Sequence[views.HoldingRow]) -> list[list[str]]:
+    """持仓 -> 表格行；收益含持有期间收到的现金分红，现价取不到时显示 -。"""
+    return [
+        [
+            h.symbol,
+            f"{h.shares:,.0f}",
+            money(h.cost_price),
+            "-" if h.close is None else money(h.close),
+            "-" if h.value is None else money(h.value),
+            "-" if h.ret is None else pct(h.ret),
+            h.origin_label,
+        ]
+        for h in holdings
+    ]
 
 
 _POSITION_HEADERS = ["代码", "股数", "成本价", "现价", "市值", "收益", "来源"]
 
 
+def _show_holdings(holdings: Sequence[views.HoldingRow]) -> None:
+    if holdings:
+        _emit("持仓：")
+        _table(_POSITION_HEADERS, _position_rows(holdings), right=[1, 2, 3, 4, 5])
+    else:
+        _emit("持仓：无")
+
+
 def _show_manual(
-    cli: Runtime, s: Session, user: User, sub: Subscription, book: Book, calendar: TradingCalendar
+    cli: Runtime, s: Session, user: User, sub: Subscription, calendar: TradingCalendar
 ) -> None:
     today = _today()
     market = _market(cli, calendar, today)
-    rows = repo.list_ledger_entries(s, user.id, book.id)
-    days = calendar.between(_EARLIEST, today)
-    through = max([days[-1], *(r.effective_day for r in rows if r.kind != "void")])
-    state = manual_ops.manual_state(s, user.id, sub.id, market, calendar, cli.cfg(), through)
-    equity = state.equity[-1] if state.equity else sub.initial_cash
-    nav = state.unit_nav[-1] if state.unit_nav else 1.0
-    _show_header(user, sub, "manual", through, equity, state.cash, nav)
+    view = views.manual_book(s, user.id, sub.id, market, calendar, cli.cfg(), today)
+    _show_header(user, view.subscription, "manual", view.summary)
     _emit("")
-    if state.positions:
-        _emit("持仓：")
-        held = [(p, _origin_label(state.origins.get(p.symbol))) for p in state.positions.values()]
-        _table(_POSITION_HEADERS, _position_rows(held, market, through), right=[1, 2, 3, 4, 5])
-    else:
-        _emit("持仓：无")
+    _show_holdings(view.holdings)
     _emit("")
     _emit(f"最近 {_RECENT_ENTRIES} 条流水（含推算出的除权记录）：")
-    lines = _recent_entries(rows, state.actions)
+    lines = [_entry_text(e) for e in view.entries[-_RECENT_ENTRIES:]]
     for line in lines or ["暂无流水"]:
         _emit(f"  {line}")
 
 
 def _show_system(
-    cli: Runtime, s: Session, user: User, sub: Subscription, book: Book, calendar: TradingCalendar
+    cli: Runtime, s: Session, user: User, sub: Subscription, calendar: TradingCalendar
 ) -> None:
-    state_row = repo.get_system_state(s, user.id, book.id)
-    book_days = repo.list_book_days(s, user.id, book.id)
-    if state_row is None or not book_days:
+    bare = views.system_book(s, user.id, sub.id)
+    if bare.summary is None:
         _emit(f"{user.email} 的系统账尚未推进过（每日运行之后才有数据）")
         return
-    engine_state, _risk = load_state(state_row.state)
-    last = book_days[-1]
-    _show_header(user, sub, "system", last.day, last.equity, last.cash, last.unit_nav)
+    market = _market(cli, calendar, bare.summary.as_of)
+    view = views.system_book(s, user.id, sub.id, market)
+    assert view.summary is not None
+    _show_header(user, view.subscription, "system", view.summary)
     _emit("")
-    market = _market(cli, calendar, last.day)
-    if engine_state.positions:
-        _emit("持仓：")
-        held = [(p, "按信号买入") for p in engine_state.positions.values()]
-        _table(_POSITION_HEADERS, _position_rows(held, market, last.day), right=[1, 2, 3, 4, 5])
-    else:
-        _emit("持仓：无")
+    _show_holdings(view.holdings)
 
 
 @book_app.command("show")
@@ -844,12 +776,11 @@ def book_show(ctx: typer.Context, email: Email, book: BookOption = "manual") -> 
         kind = _book_kind(book)
         user = _user(s, email)
         sub = _shown_sub(s, user)
-        row = repo.get_book_of_kind(s, user.id, sub.id, kind)
         calendar = cli.calendar()
         if kind == "manual":
-            _show_manual(cli, s, user, sub, row, calendar)
+            _show_manual(cli, s, user, sub, calendar)
         else:
-            _show_system(cli, s, user, sub, row, calendar)
+            _show_system(cli, s, user, sub, calendar)
 
 
 # ---------- 信号、日志、运行记录 ----------
@@ -867,17 +798,16 @@ def _status_value(text: str) -> str:
     )
 
 
-def _signal_row(sig: Signal) -> list[str]:
-    status = _SIGNAL_STATUS_LABELS.get(sig.status, sig.status)
+def _signal_row(sig: views.SignalRow) -> list[str]:
     note = sig.reason + (f"（{sig.void_note}）" if sig.void_note else "")
     return [
         str(sig.id),
         str(sig.signal_day),
-        _SIDE_LABELS.get(sig.side, sig.side),
+        sig.side_label,
         sig.symbol,
         f"{sig.shares:,.0f}",
         money(sig.ref_price),
-        status,
+        sig.status_label,
         str(sig.status_day),
         "-" if sig.valid_until is None else str(sig.valid_until),
         note,
@@ -893,20 +823,23 @@ def signals(
     days: Annotated[int, typer.Option("--days", help="只看最近多少天的信号")] = 30,
 ) -> None:
     """信号列表（按你设定的规则计算出的提示）。"""
-    with _unit(ctx) as (_cli, s):
+    with _unit(ctx) as (cli, s):
         kind = _book_kind(book)
         wanted = None if status is None else _status_value(status)
         user = _user(s, email)
         sub = _shown_sub(s, user)
-        row = repo.get_book_of_kind(s, user.id, sub.id, kind)
-        since = _today() - timedelta(days=days)
-        found = [
-            sig
-            for sig in repo.list_signals(
-                s, user.id, row.id, statuses=None if wanted is None else [wanted]
-            )
-            if sig.signal_day >= since
-        ]
+        today = _today()
+        found = views.signal_rows(
+            s,
+            user.id,
+            sub.id,
+            kind,
+            cli.calendar(),
+            cli.cfg(),
+            today,
+            statuses=None if wanted is None else [wanted],
+            since=today - timedelta(days=days),
+        )
         if not found:
             _emit(f"最近 {days} 天没有符合条件的信号")
             return
@@ -924,7 +857,7 @@ def signals(
                 "有效期至",
                 "说明",
             ],
-            [_signal_row(sig) for sig in reversed(found)],
+            [_signal_row(sig) for sig in found],
             right=[0, 4, 5],
         )
 
@@ -936,8 +869,8 @@ def journal(ctx: typer.Context, email: Email, book: BookOption = "manual") -> No
         kind = _book_kind(book)
         user = _user(s, email)
         sub = _shown_sub(s, user)
-        row = repo.get_book_of_kind(s, user.id, sub.id, kind)
-        trades = repo.list_trades(s, user.id, row.id)
+        found = views.book_journal(s, user.id, sub.id, kind)
+        trades = found.trades
         _emit(f"{user.email} · {'手动账' if kind == 'manual' else '系统账'}")
         _emit("已完成的交易：")
         if trades:
@@ -961,11 +894,11 @@ def journal(ctx: typer.Context, email: Email, book: BookOption = "manual") -> No
                         str(t.exit_day),
                         f"{t.shares:,.0f}",
                         money(t.cost),
-                        money(t.proceeds + t.cash_received),
-                        pct((t.proceeds + t.cash_received) / t.cost - 1),
+                        money(t.received),
+                        pct(t.ret),
                         str(t.holding_days),
-                        _EXIT_LABELS.get(t.exit_reason, t.exit_reason),
-                        _origin_label(t.origin),
+                        t.exit_label,
+                        t.origin_label,
                     ]
                     for t in trades
                 ],
@@ -975,14 +908,14 @@ def journal(ctx: typer.Context, email: Email, book: BookOption = "manual") -> No
             _emit("  暂无")
         _emit("")
         _emit("跟踪记录（事件之后 20、60 个交易日的复权涨跌）：")
-        followups = repo.list_followups(s, user.id, row.id)
+        followups = found.followups
         if followups:
             _table(
                 ["代码", "事件", "事件日", "20 日", "60 日"],
                 [
                     [
                         f.symbol,
-                        _FOLLOWUP_LABELS.get(f.event, f.event),
+                        f.event_label,
                         str(f.event_day),
                         "待填" if f.ret_20 is None else pct(f.ret_20),
                         "待填" if f.ret_60 is None else pct(f.ret_60),
@@ -995,56 +928,6 @@ def journal(ctx: typer.Context, email: Email, book: BookOption = "manual") -> No
             _emit("  暂无")
 
 
-def _reason_lines(detail: dict[str, Any]) -> list[str]:
-    """从每日运行的 detail 里取出失败原因与异常明细。"""
-    lines: list[str] = []
-    error = detail.get("error")
-    if error:
-        lines.append(f"原因：{error}")
-    for problem in cast("list[Any]", detail.get("problems") or []):
-        lines.append(f"数据问题：{problem}")
-    failed = cast("dict[str, Any]", detail.get("download_failed") or {})
-    if failed:
-        lines.append(f"下载失败 {len(failed)} 只（已沿用本地数据）：")
-        lines.extend(f"  {symbol}：{message}" for symbol, message in failed.items())
-    bulk = detail.get("bulk")
-    if isinstance(bulk, dict):
-        info = cast("dict[str, Any]", bulk)
-        lines.append(
-            format_bulk(
-                bool(info.get("used")),
-                int(info.get("bars") or 0),
-                int(info.get("suspended") or 0),
-                int(info.get("per_symbol") or 0),
-                str(info.get("reason") or ""),
-            )
-        )
-    retried = detail.get("bars_retried")
-    if retried:
-        lines.append(f"缺当日日线、已再下载一次：{_json_text(retried)}")
-    for item in cast("list[dict[str, Any]]", detail.get("user_errors") or []):
-        lines.append(
-            f"使用者 {item.get('user_id')}（订阅 {item.get('subscription_id')}）处理出错："
-            f"{item.get('error')}"
-        )
-    labels = {
-        "followups_error": "跟踪记录回填出错",
-        "mail_error": "邮件发送出错",
-        "fundamentals_failed": "基本面复核失败",
-        "recheck_errors": "基本面复核出错",
-        "weekly_errors": "周报出错",
-    }
-    for key, label in labels.items():
-        value = detail.get(key)
-        if value:
-            lines.append(f"{label}：{value if isinstance(value, str) else _json_text(value)}")
-    mail = detail.get("mail")
-    if isinstance(mail, dict):
-        sent = cast("dict[str, Any]", mail)
-        lines.append(f"邮件：已发 {sent.get('sent', 0)} 封，失败 {sent.get('failed', 0)} 封")
-    return lines
-
-
 @admin_app.command("runs")
 def runs(
     ctx: typer.Context,
@@ -1052,16 +935,15 @@ def runs(
 ) -> None:
     """每日运行记录与失败原因。"""
     with _unit(ctx) as (_cli, s):
-        counts = admin_repo.count_outbox_by_status(s)
+        found = views.recent_runs(s, last)
         _emit(
-            f"发件箱：待发 {counts.get('pending', 0)} 封，发送失败 {counts.get('failed', 0)} 封"
+            f"发件箱：待发 {found.pending_mails} 封，发送失败 {found.failed_mails} 封"
             "（qt admin outbox list 查看）"
         )
-        found = admin_repo.list_recent_runs(s, last)
-        if not found:
+        if not found.runs:
             _emit("还没有运行记录")
             return
-        for run in found:
+        for run in found.runs:
             started = run.started_at.astimezone(_MARKET_TZ).strftime("%Y-%m-%d %H:%M")
             finished = (
                 "未结束"
@@ -1069,10 +951,9 @@ def runs(
                 else run.finished_at.astimezone(_MARKET_TZ).strftime("%H:%M")
             )
             _emit(
-                f"{run.trade_day}  {_RUN_STATUS_LABELS.get(run.status, run.status)}"
-                f"  阶段 {run.stage}  开始 {started}  结束 {finished}"
+                f"{run.day}  {run.status_label}  阶段 {run.stage}  开始 {started}  结束 {finished}"
             )
-            for line in _reason_lines(run.detail):
+            for line in run.reasons:
                 _emit(f"    {line}")
 
 

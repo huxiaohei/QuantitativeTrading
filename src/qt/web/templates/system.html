@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% from "_tables.html" import holdings_table, entries_table %}
+{% block title %}系统账 · 量化信号{% endblock %}
+{% block content %}
+<h1>系统账</h1>
+{% include "_page_head.html" %}
+{% if view is not none %}
+<p class="muted">系统账在每个信号出现后按规则自动执行，结果与回测一致，仅供对照；你实际的账户请看"手动账"。</p>
+{% if view.summary is none %}
+<section class="card"><p>系统账尚未推进过（每日运行之后才有数据）。</p></section>
+{% else %}
+<section class="card">
+  <h2>截至 {{ view.summary.as_of }}</h2>
+  <div class="table-wrap">
+  <table>
+    <tbody>
+      <tr><th>净值</th><td class="num">{{ view.summary.nav | money }}</td></tr>
+      <tr><th>现金</th><td class="num">{{ view.summary.cash | money }}</td></tr>
+      <tr><th>持仓市值</th><td class="num">{{ view.summary.holdings_value | money }}</td></tr>
+      <tr><th>收益</th><td class="num {{ (view.summary.unit_nav - 1) | trend }}">{{ (view.summary.unit_nav - 1) | pct }}</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+<section class="card">
+  <h2>持仓</h2>
+  {{ holdings_table(view.holdings) }}
+</section>
+{% endif %}
+<section class="card">
+  <h2>流水</h2>
+  {{ entries_table(view.entries) }}
+</section>
+{% if view.nav %}
+<section class="card">
+  <h2>每日净值</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>日期</th><th class="num">净值</th><th class="num">现金</th><th class="num">单位净值</th></tr></thead>
+    <tbody>
+    {% for p in view.nav | reverse %}
+    <tr>
+      <td>{{ p.day }}</td>
+      <td class="num">{{ p.equity | money }}</td>
+      <td class="num">{{ p.cash | money }}</td>
+      <td class="num {{ (p.unit_nav - 1) | trend }}">{{ "%.4f" | format(p.unit_nav) }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+{% endif %}
+{% endblock %}

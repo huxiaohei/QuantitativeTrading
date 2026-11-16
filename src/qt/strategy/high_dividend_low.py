@@ -188,3 +188,24 @@ class HighDividendLow:
                 f"当前收益 {ret:.1%}",
             )
         return None
+
+
+def exit_levels(pos: Position, cfg: StrategyConfig) -> tuple[float | None, float | None]:
+    """持仓的 (止损位, 止盈位)：收盘价到达该价位时，价格止损、止盈规则（见 _check）开始触发。
+
+    由 Position.ret 反解：收益 = (股数 * 价 + 已收现金分红) / 成本 - 1。
+    移动止盈在峰值收益还没到启动涨幅之前没有止盈位（None）；止损位小于等于 0 时也记为 None。
+    """
+
+    def price_at(ret: float) -> float | None:
+        price = (pos.cost * (1 + ret) - pos.cash_received) / pos.shares
+        return price if price > 0 else None
+
+    stop = price_at(-cfg.stop_loss)
+    if cfg.take_profit_mode == "fixed":
+        take = price_at(cfg.take_profit_fixed)
+    elif pos.peak_return >= cfg.trailing_activate:
+        take = price_at((1 + pos.peak_return) * (1 - cfg.trailing_drawdown) - 1)
+    else:
+        take = None
+    return stop, take

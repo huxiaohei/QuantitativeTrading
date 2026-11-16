@@ -135,6 +135,13 @@ def latest_rejection(
     return s.scalars(stmt.order_by(Rejection.last_day.desc(), Rejection.id.desc())).first()
 
 
+def list_rejections(s: Session, user_id: int, book_id: int) -> list[Rejection]:
+    """账本里被规则否决的候选，最近一次出现的日期从新到旧（同日按编号从新到旧）。"""
+    get_book(s, user_id, book_id)
+    stmt = select(Rejection).where(Rejection.user_id == user_id, Rejection.book_id == book_id)
+    return list(s.scalars(stmt.order_by(Rejection.last_day.desc(), Rejection.id.desc())))
+
+
 def list_ledger_entries(s: Session, user_id: int, book_id: int) -> list[LedgerEntry]:
     """账本的全部流水（含作废记录），按编号升序（即录入顺序）。"""
     get_book(s, user_id, book_id)

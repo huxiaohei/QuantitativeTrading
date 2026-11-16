@@ -318,7 +318,7 @@ def _estimate_fees(b: _Book, side: Side, price: float, shares: float, day: date)
     return gross - exact.sell_proceeds(price, shares, day)
 
 
-def _buy_valid_on(sig: Signal, day: date, calendar: TradingCalendar, valid_days: int) -> bool:
+def buy_valid_on(sig: Signal, day: date, calendar: TradingCalendar, valid_days: int) -> bool:
     """day 是否还在买入信号的有效期内（含最后一天）。
 
     有效期为空（生成信号时日历还没覆盖到）时按信号日之后经过的交易日数判断，与有效期的定义一致。
@@ -335,7 +335,7 @@ def _in_window(
     if not sig.signal_day < trade_day:
         return False
     if side is Side.BUY:
-        return _buy_valid_on(sig, trade_day, calendar, valid_days)
+        return buy_valid_on(sig, trade_day, calendar, valid_days)
     return True
 
 
@@ -869,7 +869,7 @@ def _abandon_expired(n: _Night) -> list[Signal]:
     abandoned: list[Signal] = []
     valid_days = n.b.cfg.service.signal_valid_days
     for sig in repo.list_signals(n.s, n.b.book.user_id, n.b.book.id, Side.BUY.value, _OPEN):
-        if not _buy_valid_on(sig, n.day, n.calendar, valid_days):
+        if not buy_valid_on(sig, n.day, n.calendar, valid_days):
             mark_signal(n.s, sig, SignalStatus.ABANDONED, n.day)
             abandoned.append(sig)
     return abandoned

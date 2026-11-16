@@ -42,14 +42,13 @@ from qt.jobs.mails import (
     is_last_trading_day_of_week,
     queue_signal_mails,
     queue_weekly,
-    security_names,
 )
 from qt.mail.outbox import send_pending
 from qt.mail.send import Sender
 from qt.service.accounts import subscription_config
 from qt.service.journal import fill_followups, open_followups
 from qt.service.manual_ops import advance_manual_book, manual_state
-from qt.service.market import StoreMarket
+from qt.service.market import StoreMarket, security_names
 from qt.service.system_book import advance_system_book
 from qt.strategy.high_dividend_low import HighDividendLow
 

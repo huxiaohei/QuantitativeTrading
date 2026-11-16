@@ -70,12 +70,6 @@ _BOOK_LABELS: Mapping[str, str] = {"manual": "手动账", "system": "系统账"}
 _OPEN = ("created", "notified")
 
 
-def security_names(store: ParquetStore) -> dict[str, str]:
-    """股票代码 -> 名称（证券表里没有的不在其中）。"""
-    secs = store.read(Table.SECURITIES)
-    return {str(s): str(n) for s, n in zip(secs["symbol"], secs["name"], strict=True)}
-
-
 def alert_admin(s: Session, admin_email: str, day: date, title: str, lines: Sequence[str]) -> bool:
     """给管理员的系统异常邮件入队；同一天同一标题只入队一次。"""
     mail = render_admin_alert(day, title, lines)

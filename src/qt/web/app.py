@@ -25,6 +25,7 @@ from starlette.exceptions import HTTPException
 from qt.mail import outbox
 from qt.mail.account import ACCOUNT_KINDS
 from qt.service import auth
+from qt.service.errors import NotFoundError
 from qt.web.deps import (
     STATIC_DIR,
     RedirectError,
@@ -135,6 +136,11 @@ async def _http_error(request: Request, exc: Exception) -> Response:
     return HTMLResponse(error_page(exc.status_code), status_code=exc.status_code)
 
 
+async def _not_found(request: Request, exc: Exception) -> Response:
+    """服务层取不到本人名下的记录（含别人的编号）：一律 404，不区分"不存在"与"不是你的"。"""
+    return HTMLResponse(error_page(404), status_code=404)
+
+
 async def _validation_error(request: Request, exc: Exception) -> Response:
     return HTMLResponse(error_page(400), status_code=400)
 
@@ -181,5 +187,6 @@ def create_app(deps: WebDeps) -> FastAPI:
     app.add_exception_handler(RedirectError, _redirect)
     app.add_exception_handler(HTTPException, _http_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
+    app.add_exception_handler(NotFoundError, _not_found)
     app.add_middleware(SecurityMiddleware, deps=deps)
     return app

@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% from "_tables.html" import signal_table, summary_table %}
+{% block title %}总览 · 量化信号{% endblock %}
+{% block content %}
+<h1>总览</h1>
+{% include "_page_head.html" %}
+{% if view.run is not none %}
+<section class="card">
+  <h2>最近一次运行</h2>
+  <p>{{ view.run.day }}：{{ view.run.status_label }}</p>
+  {% if not view.run.data_ok %}<p class="error">今日数据异常，未出信号。</p>{% endif %}
+</section>
+{% endif %}
+{% if view.subscription is not none %}
+<section class="card">
+  <h2>两本账</h2>
+  <p class="muted">手动账是你实际账户的记录，信号以它为准；系统账按信号自动执行，仅供对照。</p>
+  {{ summary_table(view.manual, view.system) }}
+</section>
+<section class="card">
+  <h2>最近一次运行出的信号</h2>
+  {% if view.todays_signals %}
+  {{ signal_table(view.todays_signals) }}
+  <p><a href="/signals{% if view.subscription.read_only %}?sub={{ view.subscription.id }}{% endif %}">查看全部信号</a></p>
+  {% else %}
+  <p class="muted">没有新的信号。</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

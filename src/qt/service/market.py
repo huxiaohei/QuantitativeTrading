@@ -139,6 +139,12 @@ class StoreMarket:
         return float(bars["low"].min()), float(bars["high"].max())
 
 
+def security_names(store: ParquetStore) -> dict[str, str]:
+    """股票代码 -> 名称（证券表里没有的不在其中）。"""
+    secs = store.read(Table.SECURITIES)
+    return {str(s): str(n) for s, n in zip(secs["symbol"], secs["name"], strict=True)}
+
+
 _EARLIEST = date(1990, 1, 1)
 
 
