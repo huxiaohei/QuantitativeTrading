@@ -17,8 +17,12 @@ def database_url() -> str:
 
 
 def make_engine(url: str) -> Engine:
-    """创建引擎；连接前先探测，避免使用已被服务端断开的连接。"""
-    return create_engine(url, pool_pre_ping=True)
+    """创建引擎；连接前先探测，避免使用已被服务端断开的连接。
+
+    hide_parameters：报错文字里不带 SQL 参数值（邮件正文里的链接令牌、防伪造令牌等），
+    免得经异常信息进日志。
+    """
+    return create_engine(url, pool_pre_ping=True, hide_parameters=True)
 
 
 @contextmanager

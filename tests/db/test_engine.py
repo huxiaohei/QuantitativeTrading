@@ -1,5 +1,6 @@
 import pytest
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from qt.db.engine import database_url, session_scope
@@ -46,3 +47,22 @@ def test_truncate_all_clears_rows_but_keeps_tables(db_engine: Engine) -> None:
 
 def test_db_fixture_gives_working_session(db: Session) -> None:
     assert db.execute(text("select 1")).scalar_one() == 1
+
+
+def test_errors_do_not_carry_parameter_values(db_engine: Engine) -> None:
+    """报错文字里不带 SQL 参数值（邮件正文里的令牌、防伪造令牌等不会经异常进日志）。
+
+    冲突的是主键 k，秘密只在另一列 v 的参数里；数据库自己的 DETAIL 只报主键的值。
+    """
+    secret = "secret-token-value-XYZ"
+    with db_engine.begin() as conn:
+        conn.execute(text("create table t_secret (k int primary key, v text)"))
+    try:
+        with pytest.raises(IntegrityError) as exc, db_engine.begin() as conn:
+            for _ in range(2):
+                conn.execute(text("insert into t_secret values (1, :v)"), {"v": secret})
+        assert "t_secret" in str(exc.value)
+        assert secret not in str(exc.value)
+    finally:
+        with db_engine.begin() as conn:
+            conn.execute(text("drop table t_secret"))
