@@ -58,6 +58,7 @@ class SignalView:
     stop_price: float | None
     take_price: float | None
     valid_until: date | None
+    id: int | None = None  # 信号编号；网页录入链接用，手动账信号才需要
 
 
 @dataclass(frozen=True)
@@ -112,10 +113,11 @@ class WeeklyView:
 
 @dataclass(frozen=True)
 class _Card:
-    """一只股票的信号卡片：标题加若干（标签，内容）。"""
+    """一只股票的信号卡片：标题加若干（标签，内容），以及若干（标签，链接地址）。"""
 
     title: str
     fields: Sequence[tuple[str, str]]
+    links: Sequence[tuple[str, str]] = ()
 
 
 @dataclass(frozen=True)
@@ -161,7 +163,30 @@ def _command(side: str, v: SignalView, to_email: str) -> str:
     return f"{head} --price <实际成交价> --shares {v.shares}"
 
 
-def _buy_card(v: SignalView, to_email: str | None) -> _Card:
+def _entry_link(v: SignalView, base_url: str) -> tuple[str, str]:
+    return ("去网页录入", f"{base_url}/manual/trade?signal={v.id}")
+
+
+def _entry(
+    side: str, v: SignalView, to_email: str | None, base_url: str | None
+) -> tuple[Sequence[tuple[str, str]], Sequence[tuple[str, str]]]:
+    """录入入口：有网页地址给链接，否则给命令行命令；系统账（to_email 为空）两者皆无。"""
+    if to_email is None:
+        return [], []
+    if base_url is not None and v.id is not None:
+        return [], [_entry_link(v, base_url)]
+    return [("录入命令", _command(side, v, to_email))], []
+
+
+def _signals_links(base_url: str | None) -> list[tuple[str, str]]:
+    return [] if base_url is None else [("查看全部信号", f"{base_url}/signals")]
+
+
+def _overview_links(base_url: str | None) -> list[tuple[str, str]]:
+    return [] if base_url is None else [("查看总览", f"{base_url}/overview")]
+
+
+def _buy_card(v: SignalView, to_email: str | None, base_url: str | None = None) -> _Card:
     metrics = "；".join(f"{k} {val:.2f}" for k, val in v.metrics.items()) or _DASH
     fields = [
         ("数量", f"{v.shares} 股"),
@@ -173,9 +198,8 @@ def _buy_card(v: SignalView, to_email: str | None) -> _Card:
     ]
     if v.valid_until is not None:
         fields.append(("有效至", v.valid_until.isoformat()))
-    if to_email is not None:
-        fields.append(("录入命令", _command("buy", v, to_email)))
-    return _Card(f"{v.symbol} {v.name}", fields)
+    extra_fields, links = _entry("buy", v, to_email, base_url)
+    return _Card(f"{v.symbol} {v.name}", [*fields, *extra_fields], links)
 
 
 def _exit_label(v: SignalView) -> str:
@@ -184,7 +208,7 @@ def _exit_label(v: SignalView) -> str:
     return EXIT_REASON_LABELS.get(v.exit_reason, v.exit_reason)
 
 
-def _sell_card(v: SignalView, to_email: str | None) -> _Card:
+def _sell_card(v: SignalView, to_email: str | None, base_url: str | None = None) -> _Card:
     fields = [
         ("数量", f"{v.shares} 股"),
         ("参考价", f"{v.ref_price:.2f}（{_PRICE_NOTE}）"),
@@ -193,9 +217,8 @@ def _sell_card(v: SignalView, to_email: str | None) -> _Card:
     ]
     if v.valid_until is not None:
         fields.append(("有效至", v.valid_until.isoformat()))
-    if to_email is not None:
-        fields.append(("录入命令", _command("sell", v, to_email)))
-    return _Card(f"{v.symbol} {v.name}", fields)
+    extra_fields, links = _entry("sell", v, to_email, base_url)
+    return _Card(f"{v.symbol} {v.name}", [*fields, *extra_fields], links)
 
 
 def _expired_card(v: SignalView) -> _Card:
@@ -232,6 +255,7 @@ def _text_cards(cards: Sequence[_Card], empty_text: str) -> list[str]:
     for card in cards:
         lines.append(card.title)
         lines.extend(f"  {label}：{value}" for label, value in card.fields)
+        lines.extend(f"  {label}：{url}" for label, url in card.links)
         lines.append("")
     if lines[-1] == "":
         lines.pop()
@@ -247,6 +271,7 @@ def _compose(
     disclaimer: bool,
     extra: Mapping[str, object] | None = None,
     extra_text: Sequence[str] = (),
+    links: Sequence[tuple[str, str]] = (),
 ) -> Mail:
     """统一拼装：HTML 走模板，纯文本在此生成。"""
     html = (
@@ -258,6 +283,7 @@ def _compose(
             sections=sections,
             facts=facts,
             disclaimer=DISCLAIMER if disclaimer else None,
+            links=links,
             **(extra or {}),
         )
     )
@@ -270,6 +296,9 @@ def _compose(
     if facts:
         lines.extend(f"{label}：{value}" for label, value in facts)
         lines.append("")
+    if links:
+        lines.extend(f"{label}：{url}" for label, url in links)
+        lines.append("")
     if disclaimer:
         lines.append(DISCLAIMER)
     return Mail(subject, html, "\n".join(lines).rstrip("\n") + "\n")
@@ -281,14 +310,23 @@ def render_buy_signals(
     system: Sequence[SignalView],
     books: BooksSummary,
     to_email: str,
+    base_url: str | None,
 ) -> Mail:
     subject = f"【买入信号】{day} {len(manual)} 只"
     sections = [
-        _Section(MANUAL_HEADING, [_buy_card(v, to_email) for v in manual]),
+        _Section(MANUAL_HEADING, [_buy_card(v, to_email, base_url) for v in manual]),
         _Section(SYSTEM_HEADING, [_buy_card(v, None) for v in system]),
     ]
     intro = f"按你设定的规则计算，{day} 收盘后产生以下买入信号。"
-    return _compose(subject, "buy_signal.html.j2", intro, sections, _books_lines(books), True)
+    return _compose(
+        subject,
+        "buy_signal.html.j2",
+        intro,
+        sections,
+        _books_lines(books),
+        True,
+        links=_signals_links(base_url),
+    )
 
 
 def render_sell_signals(
@@ -298,26 +336,41 @@ def render_sell_signals(
     books: BooksSummary,
     reminder: bool,
     to_email: str,
+    base_url: str | None,
 ) -> Mail:
     prefix = "【卖出信号·再次提醒】" if reminder else "【卖出信号】"
     subject = f"{prefix}{day} {len(manual)} 只"
     sections = [
-        _Section(MANUAL_HEADING, [_sell_card(v, to_email) for v in manual]),
+        _Section(MANUAL_HEADING, [_sell_card(v, to_email, base_url) for v in manual]),
         _Section(SYSTEM_HEADING, [_sell_card(v, None) for v in system]),
     ]
     intro = f"按你设定的规则计算，{day} 收盘后以下持仓触发卖出条件。"
     if reminder:
         intro += "这些信号此前已通知过，目前仍未录入卖出。"
-    return _compose_sell(subject, intro, sections, books)
+    return _compose_sell(subject, intro, sections, books, base_url)
 
 
 def _compose_sell(
-    subject: str, intro: str, sections: Sequence[_Section], books: BooksSummary
+    subject: str,
+    intro: str,
+    sections: Sequence[_Section],
+    books: BooksSummary,
+    base_url: str | None,
 ) -> Mail:
-    return _compose(subject, "sell_signal.html.j2", intro, sections, _books_lines(books), True)
+    return _compose(
+        subject,
+        "sell_signal.html.j2",
+        intro,
+        sections,
+        _books_lines(books),
+        True,
+        links=_signals_links(base_url),
+    )
 
 
-def render_risk_alert(day: date, event: RiskEventView, books: BooksSummary) -> Mail:
+def render_risk_alert(
+    day: date, event: RiskEventView, books: BooksSummary, base_url: str | None
+) -> Mail:
     title = _RISK_TITLES.get(event.kind)
     if title is None:
         raise ValueError(f"未知的风控事件类型：{event.kind}")
@@ -330,17 +383,27 @@ def render_risk_alert(day: date, event: RiskEventView, books: BooksSummary) -> M
         *_books_lines(books),
     ]
     intro = "按你设定的规则计算，手动账触发了风控提示。"
-    return _compose(subject, "risk_alert.html.j2", intro, [], facts, True)
+    return _compose(
+        subject, "risk_alert.html.j2", intro, [], facts, True, links=_overview_links(base_url)
+    )
 
 
-def render_abandon_reminder(day: date, signals: Sequence[SignalView]) -> Mail:
+def render_abandon_reminder(day: date, signals: Sequence[SignalView], base_url: str | None) -> Mail:
     subject = f"【信号已过期】{len(signals)} 只未录入"
     sections = [_Section("已过期未录入的买入信号", [_expired_card(v) for v in signals])]
     intro = f"截至 {day}，以下买入信号已过有效期且没有录入成交，此提示只发一次。"
-    return _compose(subject, "abandon_reminder.html.j2", intro, sections, [], True)
+    return _compose(
+        subject,
+        "abandon_reminder.html.j2",
+        intro,
+        sections,
+        [],
+        True,
+        links=_signals_links(base_url),
+    )
 
 
-def render_weekly(week_end: date, report: WeeklyView) -> Mail:
+def render_weekly(week_end: date, report: WeeklyView, base_url: str | None) -> Mail:
     subject = f"【周报】{week_end}"
     facts = [
         (
@@ -385,6 +448,7 @@ def render_weekly(week_end: date, report: WeeklyView) -> Mail:
             "none_text": _NONE_TEXT,
         },
         extra_text=extra_text,
+        links=_overview_links(base_url),
     )
 
 

@@ -82,6 +82,7 @@ class RunContext:
     sender: Sender
     admin_email: str
     now: Callable[[], datetime]
+    base_url: str | None  # 网页对外地址；为空时邮件里仍印命令行命令
 
 
 def describe(exc: BaseException) -> str:
@@ -511,7 +512,7 @@ def _advance_user(
         for book in books:
             open_followups(s, book, d, market, calendar, lookback)
         if tonight:
-            queue_signal_mails(s, sub, d, result, ctx.cfg, names, calendar, lookback)
+            queue_signal_mails(s, sub, d, result, ctx.cfg, names, calendar, lookback, ctx.base_url)
 
 
 def _process_subscription(
@@ -574,7 +575,15 @@ def _mail_stage(
                 sub = s.get(Subscription, sub_id)
                 if sub is not None:
                     queue_weekly(
-                        s, sub, day, panels.calendar, ctx.store, panels.market, ctx.cfg, names
+                        s,
+                        sub,
+                        day,
+                        panels.calendar,
+                        ctx.store,
+                        panels.market,
+                        ctx.cfg,
+                        names,
+                        ctx.base_url,
                     )
                 s.commit()
             except Exception as exc:

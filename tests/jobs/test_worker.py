@@ -374,3 +374,18 @@ def test_worker_does_not_catch_up_without_rerun_request(
     calls: list[RunContext] = []
     _one_tick(env, monkeypatch, calls, None)
     assert len(calls) == 1  # 只有启动时那一次
+
+
+def test_make_context_reads_base_url_once_and_tolerates_a_bad_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@127.0.0.1:1/x")
+    monkeypatch.setenv("MAIL_BACKEND", "file")
+    monkeypatch.setenv("ADMIN_EMAIL", "boss@example.com")
+    config = Path(__file__).resolve().parents[2] / "config" / "default.yaml"
+    monkeypatch.delenv("QT_BASE_URL", raising=False)
+    assert cli.make_context(config, tmp_path).base_url is None
+    monkeypatch.setenv("QT_BASE_URL", "https://quant.test/")
+    assert cli.make_context(config, tmp_path).base_url == "https://quant.test"
+    monkeypatch.setenv("QT_BASE_URL", "ftp://坏地址")
+    assert cli.make_context(config, tmp_path).base_url is None  # 写错不让常驻进程起不来

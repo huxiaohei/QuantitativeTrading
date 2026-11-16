@@ -98,6 +98,7 @@ def _metrics(raw: Mapping[str, object]) -> dict[str, float]:
 def signal_view(sig: Signal, names: Mapping[str, str]) -> SignalView:
     """数据库里的信号 -> 邮件展示字段。"""
     return SignalView(
+        id=sig.id,
         side=sig.side,
         symbol=sig.symbol,
         name=names.get(sig.symbol, ""),
@@ -150,6 +151,7 @@ def queue_signal_mails(
     names: Mapping[str, str],
     calendar: TradingCalendar,
     lookback_days: int,
+    base_url: str | None,
 ) -> int:
     """按手动账当晚的结果写买入、卖出、再提醒、风控、放弃提醒邮件，返回新入队的封数。
 
@@ -178,16 +180,18 @@ def queue_signal_mails(
 
     if result.new_buy_signals:
         others = [sig for sig in system_today if sig.side == "buy"]
-        mail = render_buy_signals(day, views(result.new_buy_signals), views(others), books, to)
+        mail = render_buy_signals(
+            day, views(result.new_buy_signals), views(others), books, to, base_url
+        )
         put("buy", f"buy:{manual.id}:{day}", mail)
     if result.new_sell_signals:
         others = [sig for sig in system_today if sig.side == "sell"]
         mail = render_sell_signals(
-            day, views(result.new_sell_signals), views(others), books, False, to
+            day, views(result.new_sell_signals), views(others), books, False, to, base_url
         )
         put("sell", f"sell:{manual.id}:{day}", mail)
     if result.reminders:
-        mail = render_sell_signals(day, views(result.reminders), [], books, True, to)
+        mail = render_sell_signals(day, views(result.reminders), [], books, True, to, base_url)
         put("sell-remind", f"sell-remind:{manual.id}:{day}", mail)
     risk_cfg = subscription_config(cfg, sub).risk
     thresholds = {"warn": risk_cfg.warn_drawdown, "pause": risk_cfg.pause_drawdown}
@@ -197,7 +201,7 @@ def queue_signal_mails(
             put(
                 "risk",
                 f"risk:{manual.id}:{event.day}:{event.kind}",
-                _risk_mail(event.day, event, thresholds, books),
+                _risk_mail(event.day, event, thresholds, books, base_url),
             )
     abandoned: dict[date, list[Signal]] = {}
     abandoned_signals = (
@@ -209,7 +213,7 @@ def queue_signal_mails(
         if since <= sig.status_day <= day:
             abandoned.setdefault(sig.status_day, []).append(sig)
     for when, signals in sorted(abandoned.items()):
-        mail = render_abandon_reminder(when, views(signals))
+        mail = render_abandon_reminder(when, views(signals), base_url)
         put("abandon", f"abandon:{manual.id}:{when}", mail)
     return queued
 
@@ -223,7 +227,11 @@ def _window_start(calendar: TradingCalendar, day: date, lookback_days: int) -> d
 
 
 def _risk_mail(
-    day: date, event: RiskEventRow, thresholds: Mapping[str, float], books: BooksSummary
+    day: date,
+    event: RiskEventRow,
+    thresholds: Mapping[str, float],
+    books: BooksSummary,
+    base_url: str | None,
 ) -> Mail:
     view = RiskEventView(
         kind=_RISK_KINDS[event.kind],
@@ -231,7 +239,7 @@ def _risk_mail(
         threshold=thresholds.get(event.kind),
         message=event.message,
     )
-    return render_risk_alert(day, view, books)
+    return render_risk_alert(day, view, books, base_url)
 
 
 # ---------- 周报 ----------
@@ -343,6 +351,7 @@ def queue_weekly(
     market: StoreMarket,
     cfg: AppConfig,
     names: Mapping[str, str],
+    base_url: str | None,
 ) -> bool:
     """为开启周报、两本账都已推进到 day 的使用者写本周周报；返回是否新入队。"""
     user = repo.get_user(s, sub.user_id)
@@ -383,6 +392,5 @@ def queue_weekly(
         signal_lines=_signal_lines(s, sub, books, week, names),
         trade_lines=_trade_lines(s, sub, books, week, names),
     )
-    return _put(
-        s, user.id, user.email, "weekly", f"weekly:{user.id}:{day}", render_weekly(day, report)
-    )
+    mail = render_weekly(day, report, base_url)
+    return _put(s, user.id, user.email, "weekly", f"weekly:{user.id}:{day}", mail)

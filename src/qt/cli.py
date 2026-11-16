@@ -50,6 +50,8 @@ from qt.runtime import (
     now,
 )
 
+_log = logging.getLogger(__name__)
+
 app = typer.Typer(help="A 股量化回测工具", no_args_is_help=True)
 data_app = typer.Typer(help="数据下载与检查", no_args_is_help=True)
 app.add_typer(data_app, name="data")
@@ -239,6 +241,15 @@ _STATUS_LABELS = {
 }
 
 
+def _mail_base_url() -> str | None:
+    """邮件里网页链接的地址：启动时读一次；写错了就退回命令行文案，不让常驻进程因此起不来。"""
+    try:
+        return base_url()
+    except SetupError as exc:
+        _log.warning("QT_BASE_URL 无效，邮件改用命令行文案：%s", exc)
+        return None
+
+
 def make_context(config: Path, data_dir: Path) -> RunContext:
     """每日任务的运行环境：共用的 Runtime 之上加 ADMIN_EMAIL、数据源与发信器。"""
     runtime = Runtime(config, data_dir)
@@ -254,6 +265,7 @@ def make_context(config: Path, data_dir: Path) -> RunContext:
         sender=make_sender(),
         admin_email=admin,
         now=_now,
+        base_url=_mail_base_url(),
     )
 
 

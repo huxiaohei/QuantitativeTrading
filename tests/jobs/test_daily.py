@@ -566,7 +566,7 @@ def test_weekly_holding_with_unknown_cost_shows_dash() -> None:
         signal_lines=[],
         trade_lines=[],
     )
-    text = render_weekly(date(2022, 1, 7), report).text
+    text = render_weekly(date(2022, 1, 7), report, None).text
     assert "成本：—" in text and "浮动盈亏：—" in text
 
 
@@ -976,3 +976,32 @@ def test_holding_wrongly_suspended_in_snapshot_gets_its_bar_from_the_recheck(
     run = daily_run(db, day)
     assert run is not None
     assert run.detail["bars_retried"] == {"symbols": ["600001"], "still_missing": [], "failed": {}}
+
+
+def test_mails_link_to_web_when_base_url_is_set(env: Env, db: Session) -> None:
+    env.base_url = "https://quant.test"
+    day = env.days[DAY]
+    sub = subscribe(db, "a@example.com", day)
+    assert run_day(env.ctx, day, notify=True, update_data=False) == "done"
+    mail = env.sender.sent[0]
+    manual_ids = {sig.id for sig in book_signals(db, sub, "manual") if sig.side == "buy"}
+    assert manual_ids
+    for signal_id in manual_ids:
+        assert f"https://quant.test/manual/trade?signal={signal_id}" in mail.text
+        assert f"https://quant.test/manual/trade?signal={signal_id}" in mail.html
+    assert "https://quant.test/signals" in mail.text
+    assert "qt admin" not in mail.text and "qt admin" not in mail.html
+    system_ids = {sig.id for sig in book_signals(db, sub, "system")}
+    for signal_id in system_ids:
+        assert f"signal={signal_id}" not in mail.text
+
+
+def test_weekly_mail_links_to_overview_when_base_url_is_set(env: Env, db: Session) -> None:
+    env.base_url = "https://quant.test"
+    subscribe(db, "a@example.com", env.days[DAY])
+    for i in range(DAY, DAY + 5):
+        assert run_day(env.ctx, env.days[i], True, False) == "done"
+    weekly = [m for m in env.sender.sent if m.subject.startswith("【周报】")]
+    assert len(weekly) == 1
+    assert "https://quant.test/overview" in weekly[0].text
+    assert "https://quant.test/overview" in weekly[0].html

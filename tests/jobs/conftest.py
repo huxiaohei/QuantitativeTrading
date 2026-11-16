@@ -95,6 +95,7 @@ class Env:
     clock: FakeClock
     sender: CollectingSender = field(default_factory=CollectingSender)
     source: DataSource | None = None
+    base_url: str | None = None
 
     @property
     def calendar(self) -> TradingCalendar:
@@ -112,6 +113,7 @@ class Env:
             sender=self.sender,
             admin_email=ADMIN,
             now=self.clock,
+            base_url=self.base_url,
         )
 
 
