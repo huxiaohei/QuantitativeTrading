@@ -11,6 +11,8 @@ _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _INTEGER = re.compile(r"^[+-]?\d+$")
 _TRUE = frozenset({"on", "true", "1", "yes"})
 PASSWORD_MAX_LENGTH = 1024
+# 数字输入的最大长度：过长的数字串没有意义，也避免整数转换超出解释器的位数上限
+NUMBER_MAX_LENGTH = 40
 
 
 class FormError(Exception):
@@ -35,6 +37,8 @@ def parse_date(text: str, field: str) -> date:
 
 def _parse_number(text: str) -> float | None:
     value = text.strip()
+    if len(value) > NUMBER_MAX_LENGTH:
+        return None
     return float(value) if _NUMBER.match(value) else None
 
 
@@ -65,7 +69,7 @@ def parse_decimal(text: str, field: str) -> float:
 def parse_integer(text: str, field: str) -> int:
     """整数（参数值用）。"""
     value = text.strip()
-    if not _INTEGER.match(value):
+    if len(value) > NUMBER_MAX_LENGTH or not _INTEGER.match(value):
         raise FormError(field, "应为整数，例如 5")
     return int(value)
 

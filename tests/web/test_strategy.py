@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from qt.calendar import TradingCalendar
 from qt.db import repo
 from qt.db.models import AuditLog, ParamChange, Subscription
+from qt.service import rules
 from qt.web.app import create_app
 from qt.web.deps import WebDeps
 from qt.web.routes import strategy
@@ -280,3 +281,19 @@ def test_report_is_served_when_configured(
         report.unlink()
         assert c.get("/report").status_code == 404
         assert "/report" not in c.get("/strategy").text
+
+
+def test_strategy_page_shows_param_descriptions(client: TestClient, make_user: MakeUser) -> None:
+    _login(client, make_user)
+    _create(client)
+    text = client.get("/strategy").text
+    stop_loss = next(p for p in rules.PARAMS if p.key == STOP_LOSS)
+    assert stop_loss.description in text and "<th>说明</th>" in text
+
+
+def test_params_overlong_number_is_422_not_500(client: TestClient, make_user: MakeUser) -> None:
+    _login(client, make_user)
+    _create(client)
+    for key in (STOP_LOSS, "risk.max_positions"):
+        resp = _post(client, "/strategy/params", {key: "9" * 5000})
+        assert resp.status_code == 422 and "field-error" in resp.text, key

@@ -8,6 +8,8 @@ from qt.web.forms import (
     FormError,
     parse_bool,
     parse_date,
+    parse_decimal,
+    parse_integer,
     parse_money,
     parse_password,
     parse_shares,
@@ -67,3 +69,12 @@ def test_parse_password_length_cap() -> None:
     with pytest.raises(FormError) as info:
         parse_password("x" * 1025, "password")
     assert info.value.message == "密码不能超过 1024 个字符"
+
+
+def test_parse_numbers_reject_overlong_input() -> None:
+    long = "9" * 5000
+    with pytest.raises(FormError):
+        parse_integer(long, "x")
+    for parser in (parse_decimal, parse_money, parse_shares):
+        with pytest.raises(FormError):
+            parser(long, "x")

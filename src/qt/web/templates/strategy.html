@@ -41,11 +41,12 @@
   <h2>参数</h2>
   <div class="table-wrap">
   <table>
-    <thead><tr><th>参数</th><th class="num">当前值</th><th class="num">默认值</th></tr></thead>
+    <thead><tr><th>参数</th><th>说明</th><th class="num">当前值</th><th class="num">默认值</th></tr></thead>
     <tbody>
     {% for row in rows %}
     <tr>
       <td>{{ row.info.label }}</td>
+      <td class="desc">{{ row.info.description }}</td>
       <td class="num">{{ row.current }}</td>
       <td class="num">{{ row.default }}</td>
     </tr>
