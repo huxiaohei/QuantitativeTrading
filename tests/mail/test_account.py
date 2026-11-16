@@ -27,7 +27,7 @@ def _mails() -> list[tuple[str, Mail]]:
         ("verify", render_verify(BASE, TOKEN, 24)),
         ("reset", render_reset(BASE, TOKEN, 2)),
         ("attempt", render_register_attempt(BASE)),
-        ("changed", render_password_changed(BASE, NOW)),
+        ("changed", render_password_changed(BASE, NOW, kept_current=False)),
     ]
 
 
@@ -70,8 +70,9 @@ def test_every_mail_has_text_ignore_notice_and_no_banned_words(name: str) -> Non
 
 
 def test_password_changed_shows_time_and_has_no_token_or_password() -> None:
-    mail = render_password_changed(BASE, NOW)
-    assert "2026-11-16 09:30" in mail.text and "2026-11-16 09:30" in mail.html
+    mail = render_password_changed(BASE, NOW, kept_current=False)
+    assert "2026-11-16 09:30（北京时间）" in mail.text
+    assert "2026-11-16 09:30（北京时间）" in mail.html
     assert "token=" not in mail.text and "token=" not in mail.html
 
 
@@ -92,3 +93,14 @@ def test_queue_account_mail_returns_row_id_and_dedupe_key(db: Session) -> None:
     assert (row.user_id, row.to_addr, row.kind) == (user.id, user.email, "account_verify")
     assert TOKEN not in row.dedupe_key
     assert queue_account_mail(db, user, "account_verify", mail, NOW) is None
+
+
+def test_password_changed_wording_depends_on_kept_session() -> None:
+    reset = render_password_changed(BASE, NOW, kept_current=False)
+    change = render_password_changed(BASE, NOW, kept_current=True)
+    for body in (reset.text, reset.html):
+        assert "所有设备需要重新登录" in body
+        assert "当前浏览器" not in body
+    for body in (change.text, change.html):
+        assert "其他设备需要重新登录，当前浏览器不受影响" in body
+        assert "所有" not in body

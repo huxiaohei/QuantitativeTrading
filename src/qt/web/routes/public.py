@@ -340,7 +340,7 @@ def reset_submit(
         deps,
         user,
         "account_password_changed",
-        render_password_changed(deps.base_url, now),
+        render_password_changed(deps.base_url, now, kept_current=False),
     )
     return RedirectResponse("/login?msg=reset", status_code=303)
 

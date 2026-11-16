@@ -385,6 +385,7 @@ def test_reset_flow(
     assert resp.status_code == 303
     assert resp.headers["location"] == "/login?msg=reset"
     assert "密码已修改" in last_mail("foo@example.com")
+    assert "所有设备需要重新登录" in last_mail("foo@example.com")
     assert _session_count(db_engine) == 0
     assert login_as(client, "foo@example.com", PW).status_code == 400
     assert login_as(client, "foo@example.com", NEW_PW).status_code == 303

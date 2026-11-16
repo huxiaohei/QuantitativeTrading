@@ -15,6 +15,7 @@ from tests.web.conftest import (
     MakeUser,
     csrf_of,
     login_as,
+    mail_text,
     read_mails,
 )
 
@@ -102,6 +103,7 @@ def test_change_password_sends_notice_mail(
     mails = read_mails(mail_dir, EMAIL)
     assert [m["Subject"] for m in mails] == ["【账号提示】你的密码已修改"]
     assert NEW_PW not in str(mails[0]) and PW not in str(mails[0])
+    assert "其他设备需要重新登录，当前浏览器不受影响" in mail_text(mails[0])
 
 
 def test_change_password_wrong_current_is_422(

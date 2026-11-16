@@ -73,7 +73,11 @@ def _queue_changed_mail(s: Session, tasks: BackgroundTasks, deps: WebDeps, found
     """ "密码已修改"通知入队；提交之后由后台任务立即发送。deps.now() 是上海时间。"""
     now = deps.now()
     outbox_id = queue_account_mail(
-        s, found.user, "account_password_changed", render_password_changed(deps.base_url, now), now
+        s,
+        found.user,
+        "account_password_changed",
+        render_password_changed(deps.base_url, now, kept_current=True),
+        now,
     )
     if outbox_id is not None:
         tasks.add_task(send_account_mail, deps, outbox_id)

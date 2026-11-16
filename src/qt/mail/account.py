@@ -60,19 +60,23 @@ def render_register_attempt(base_url: str) -> Mail:
     return Mail(subject, _html("account_register_attempt.html.j2", subject, link=link), text)
 
 
-def render_password_changed(base_url: str, at: datetime) -> Mail:
-    """密码已修改的通知，不含密码。"""
+def render_password_changed(base_url: str, at: datetime, *, kept_current: bool) -> Mail:
+    """密码已修改的通知，不含密码。at 是北京时间。
+
+    kept_current 为真表示登录后在设置页修改（当前浏览器的登录保留），
+    为假表示通过找回密码重置（全部登录都已失效）。
+    """
     subject = "【账号提示】你的密码已修改"
     link = _link(base_url, "forgot")
-    when = at.strftime("%Y-%m-%d %H:%M")
+    when = at.strftime("%Y-%m-%d %H:%M") + "（北京时间）"
+    effect = "其他设备需要重新登录，当前浏览器不受影响" if kept_current else "所有设备需要重新登录"
     text = (
-        f"{subject}\n\n你的账号密码已于 {when} 修改，所有已登录的设备需要重新登录。\n"
+        f"{subject}\n\n你的账号密码已于 {when} 修改，{effect}。\n"
         f"如果不是你本人操作，请立即通过下面的链接找回密码：\n{link}\n\n"
         "如果是你本人操作，忽略即可。\n"
     )
-    return Mail(
-        subject, _html("account_password_changed.html.j2", subject, link=link, at=when), text
-    )
+    html = _html("account_password_changed.html.j2", subject, link=link, at=when, effect=effect)
+    return Mail(subject, html, text)
 
 
 def queue_account_mail(s: Session, user: User, kind: str, mail: Mail, now: datetime) -> int | None:
