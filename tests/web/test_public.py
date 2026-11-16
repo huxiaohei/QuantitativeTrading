@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from qt.db import admin_repo
 from qt.db.models import Invite, WebSession
+from qt.jobs.backup import KEEP_DAYS
 from tests.web.conftest import (
     CFG,
     PW,
@@ -429,6 +430,9 @@ def test_terms_page_public(client: TestClient) -> None:
     assert CFG.web.terms_version in resp.text
     assert "本页不是法律意见" in resp.text
     assert "不构成投资建议" in resp.text
+    # 第八节如实列出保存的内容：登录记录、操作记录、邮件副本、备份保留期
+    for stored in ("IP 地址", "浏览器标识", "操作记录", "邮件的副本", "14 天"):
+        assert stored in resp.text, stored
 
 
 def test_new_terms_version_requires_accept(client: TestClient, make_user: MakeUser) -> None:
@@ -511,3 +515,7 @@ def test_tab_and_newline_in_form_are_not_control_errors(
     page = client.get("/login")
     data = {"email": " foo@example.com\t\r\n", "password": PW, "csrf": csrf_of(page)}
     assert client.post("/login", data=data, follow_redirects=False).status_code == 303
+
+
+def test_terms_backup_days_match_backup_job() -> None:
+    assert KEEP_DAYS == 14  # 条款第八节写的是"保留 14 天"，改了备份天数要同步改条款
