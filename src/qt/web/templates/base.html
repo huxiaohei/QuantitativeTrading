@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{# 内容安全策略不允许行内样式：关掉 HTMX 自带的行内指示器样式 #}
+<meta name="htmx-config" content='{"includeIndicatorStyles": false}'>
+<title>{% block title %}量化信号{% endblock %}</title>
+<link rel="stylesheet" href="/static/app.css">
+{% block scripts %}<script src="/static/htmx.min.js" defer></script>{% endblock %}
+</head>
+<body>
+<header class="site-header">
+{% block header %}
+  <div class="bar">
+    <a class="brand" href="/overview">量化信号</a>
+    {% if user %}
+    <span class="who">{{ user.email }}</span>
+    <form method="post" action="/logout" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="link">退出</button>
+    </form>
+    {% endif %}
+  </div>
+  {% set active = active | default("") %}
+  <nav class="nav" aria-label="主导航">
+    <a href="/overview"{% if active == "overview" %} aria-current="page"{% endif %}>总览</a>
+    <a href="/signals"{% if active == "signals" %} aria-current="page"{% endif %}>信号</a>
+    <a href="/manual"{% if active == "manual" %} aria-current="page"{% endif %}>手动账</a>
+    <a href="/system"{% if active == "system" %} aria-current="page"{% endif %}>系统账</a>
+    <a href="/strategy"{% if active == "strategy" %} aria-current="page"{% endif %}>策略</a>
+    <a href="/journal"{% if active == "journal" %} aria-current="page"{% endif %}>日志</a>
+    <a href="/settings"{% if active == "settings" %} aria-current="page"{% endif %}>设置</a>
+    {% if user and user.is_admin %}
+    <a href="/admin/invites"{% if active == "admin" %} aria-current="page"{% endif %}>管理</a>
+    {% endif %}
+  </nav>
+{% endblock %}
+</header>
+<main class="main">
+{% block content %}
+{% if placeholder is defined %}<p>{{ placeholder }}</p>{% endif %}
+{% endblock %}
+</main>
+<footer class="site-footer">
+{% block footer %}
+  <p class="disclaimer">以上内容是按你设定的规则计算的结果，不构成投资建议。</p>
+  <p><a href="/terms">使用条款与风险提示</a></p>
+{% endblock %}
+</footer>
+</body>
+</html>

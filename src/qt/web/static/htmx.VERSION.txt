@@ -1,0 +1,7 @@
+htmx 2.0.11（官方发行的压缩单文件 dist/htmx.min.js，未做任何修改）
+来源：https://unpkg.com/htmx.org@2.0.11/dist/htmx.min.js
+校验：与 npm 官方包 https://registry.npmjs.org/htmx.org/-/htmx.org-2.0.11.tgz 中的
+      package/dist/htmx.min.js 逐字节相同（该包的 integrity 与 npm 登记的 sha512 一致）
+sha256：d6fdc75f204e6bdefa99b69bf1e6d4ac69b8a364f77929f45c13476b4000f717
+取得日期：2026-11-16
+许可：0BSD（BSD Zero Clause License）

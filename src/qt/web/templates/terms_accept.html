@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}同意新版条款 · 量化信号{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>使用条款与风险提示已更新</h1>
+  <p>请阅读新版本，同意后才能继续使用。</p>
+  {% include "_terms_text.html" %}
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="/terms/accept" class="form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label class="check">
+      <input type="checkbox" name="accept" value="on" required>
+      我已阅读并同意以上《使用条款与风险提示》（版本 {{ terms_version }}）
+    </label>
+    <button type="submit" class="primary">同意并继续</button>
+  </form>
+</section>
+{% endblock %}

@@ -1,4 +1,4 @@
-"""命令行入口：data、backtest、admin（管理）、run-day（手动跑一天）、worker（定时进程）。"""
+"""命令行入口：data、backtest、admin（管理）、run-day（手动跑一天）、worker（定时进程）、web（网页）。"""
 
 import json
 import logging
@@ -39,7 +39,16 @@ from qt.jobs.backup import backup_from_env
 from qt.jobs.daily import DailyRunBusy, RunContext, due_day, run_day
 from qt.jobs.worker import run_forever
 from qt.mail.send import make_sender
-from qt.runtime import DEFAULT_CONFIG, DEFAULT_DATA_DIR, ConfigOption, DataDirOption, Runtime, now
+from qt.runtime import (
+    DEFAULT_CONFIG,
+    DEFAULT_DATA_DIR,
+    ConfigOption,
+    DataDirOption,
+    Runtime,
+    SetupError,
+    base_url,
+    now,
+)
 
 app = typer.Typer(help="A 股量化回测工具", no_args_is_help=True)
 data_app = typer.Typer(help="数据下载与检查", no_args_is_help=True)
@@ -303,3 +312,47 @@ def worker_command(
     """常驻的定时进程：每个交易日到点运行，电脑休眠醒来后补跑错过的日子，运行完成后备份数据库。"""
     _setup_logging()
     run_forever(_context_or_exit(config, data_dir), backup=backup_from_env)
+
+
+@app.command("web")
+def web_command(
+    host: Annotated[str, typer.Option(help="监听地址；容器里用 0.0.0.0")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="监听端口")] = 8000,
+    config: ConfigOption = DEFAULT_CONFIG,
+    data_dir: DataDirOption = DEFAULT_DATA_DIR,
+) -> None:
+    """网页服务（单进程）。对外地址取环境变量 QT_BASE_URL，未设置时不启动。"""
+    # 网页依赖较重，只在这个命令里导入，不拖慢其他命令
+    import uvicorn
+
+    from qt.web.app import create_app
+    from qt.web.deps import WebDeps
+
+    _setup_logging()
+    try:
+        url = base_url()
+        if url is None:
+            raise SetupError("未设置环境变量 QT_BASE_URL（网页的对外地址），网页服务无法启动")
+        runtime = Runtime(config, data_dir)
+        deps = WebDeps(
+            engine=runtime.engine(),
+            cfg=runtime.cfg(),
+            base_url=url,
+            sender=make_sender(),
+            now=now,
+            store=runtime.store(),
+            calendar=runtime.calendar,
+        )
+    except RuntimeError as exc:  # SetupError 与缺少邮件环境变量都是 RuntimeError
+        typer.echo(f"无法启动：{exc}")
+        raise typer.Exit(code=1) from exc
+    # 来访 IP 由应用自己按 X-Forwarded-For 规则取，uvicorn 不再改写；
+    # 不记访问日志：验证、重置链接的令牌在网址查询串里
+    uvicorn.run(
+        create_app(deps),
+        host=host,
+        port=port,
+        proxy_headers=False,
+        access_log=False,
+        server_header=False,
+    )

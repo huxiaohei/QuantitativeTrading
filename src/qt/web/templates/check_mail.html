@@ -1,0 +1,17 @@
+{% extends "public_base.html" %}
+{% block title %}请查收邮件 · 量化信号{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>请查收邮件</h1>
+  <p class="notice">{{ message }}</p>
+  <p class="muted">邮件可能要几分钟才到，也可能被放进了垃圾邮件箱。</p>
+  <form method="post" action="/verify/resend" class="form resend">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>没收到验证邮件？填写注册邮箱重新发送
+      <input type="email" name="email" autocomplete="email" required>
+    </label>
+    <button type="submit">重新发送验证邮件</button>
+  </form>
+  <p class="links"><a href="/login">去登录</a></p>
+</section>
+{% endblock %}

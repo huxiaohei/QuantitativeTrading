@@ -1,0 +1,23 @@
+{% extends "public_base.html" %}
+{% block title %}设置新密码 · 量化信号{% endblock %}
+{% block content %}
+<section class="card narrow">
+  {% if valid %}
+  <h1>设置新密码</h1>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="/reset" class="form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <label>新密码
+      <input type="password" name="password" autocomplete="new-password" minlength="{{ min_length }}" maxlength="1024" required>
+      <span class="hint">至少 {{ min_length }} 位，不能与邮箱相同。设置后所有已登录的设备需要重新登录。</span>
+    </label>
+    <button type="submit" class="primary">设置新密码</button>
+  </form>
+  {% else %}
+  <h1>链接已使用或已过期</h1>
+  <p>重置链接只能使用一次，并且有有效期。需要的话请重新申请。</p>
+  <p class="links"><a href="/forgot">重新找回密码</a> · <a href="/login">去登录</a></p>
+  {% endif %}
+</section>
+{% endblock %}

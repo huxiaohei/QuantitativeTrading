@@ -1,0 +1,10 @@
+{% extends "public_base.html" %}
+{% block title %}{{ title }} · 量化信号{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>{{ title }}</h1>
+  <p>{{ message }}</p>
+  <p class="muted">错误代码 {{ status }}</p>
+  <p><a href="/">返回首页</a></p>
+</section>
+{% endblock %}
