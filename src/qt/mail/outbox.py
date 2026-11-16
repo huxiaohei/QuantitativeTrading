@@ -6,7 +6,7 @@ failed；管理员可以用 qt admin outbox retry 把 failed 的邮件重新排�
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -64,24 +64,51 @@ def _describe_error(exc: Exception) -> str:
     return text[:_MAX_ERROR_CHARS]
 
 
+def _deliver(s: Session, sender: Sender, row: Outbox, moment: datetime, max_age: timedelta) -> bool:
+    """发送已加锁的一封邮件并记账、提交；成功返回 True。"""
+    try:
+        sender.send(row.to_addr, row.subject, row.body_html, row.body_text)
+    except Exception as exc:
+        row.attempts += 1
+        row.last_error = _describe_error(exc)
+        if moment - row.created_at >= max_age:
+            row.status = "failed"
+        if row.kind == "admin":
+            _log.error("管理员告警邮件没有发出：%s（%s）", row.subject, row.last_error)
+        delivered = False
+    else:
+        row.attempts += 1
+        row.status = "sent"
+        row.sent_at = moment
+        row.last_error = None
+        delivered = True
+    s.commit()
+    return delivered
+
+
 def send_pending(
     s: Session,
     sender: Sender,
     now: datetime | None = None,
     max_age: timedelta = MAX_PENDING_AGE,
+    kinds: Collection[str] | None = None,
 ) -> tuple[int, int]:
     """发送所有待发邮件，返回（成功数，失败次数）。
 
-    每封邮件单独加行锁、发送、提交：已标记为已发的邮件不会因后面的邮件出错而回滚。
+    每封邮件单独加行锁（FOR UPDATE SKIP LOCKED）、发送、提交：已标记为已发的邮件不会因后面的
+    邮件出错而回滚，worker 与网页同时补发时同一封不会发两次。
     发送成功到提交之间进程崩溃，该封下次会重发一次（至少一次语义的唯一窗口）；
     提交之后绝不重发。会提交调用方会话里尚未提交的事务。
     失败时记下次数与错误，邮件留在 pending 下次再试；created_at（入队或重新排队的时刻）距 now
     已满 max_age 时标记为 failed。给管理员的告警发送失败时另记一条 ERROR 日志（含标题，不含密码）。
-    now 缺省为当前时间（每日任务传入它的时钟）。
+    now 缺省为当前时间（每日任务传入它的时钟）。kinds 不为 None 时只处理这些类型的邮件。
     """
     moment = now if now is not None else datetime.now(UTC)
     s.commit()
-    ids = list(s.scalars(select(Outbox.id).where(Outbox.status == "pending").order_by(Outbox.id)))
+    query = select(Outbox.id).where(Outbox.status == "pending").order_by(Outbox.id)
+    if kinds is not None:
+        query = query.where(Outbox.kind.in_(kinds))
+    ids = list(s.scalars(query))
     s.commit()
     sent = failed = 0
     for outbox_id in ids:
@@ -93,24 +120,29 @@ def send_pending(
         if row is None:  # 已被别的进程处理或正被处理
             s.commit()
             continue
-        try:
-            sender.send(row.to_addr, row.subject, row.body_html, row.body_text)
-        except Exception as exc:
-            row.attempts += 1
-            row.last_error = _describe_error(exc)
-            if moment - row.created_at >= max_age:
-                row.status = "failed"
-            if row.kind == "admin":
-                _log.error("管理员告警邮件没有发出：%s（%s）", row.subject, row.last_error)
-            failed += 1
-        else:
-            row.attempts += 1
-            row.status = "sent"
-            row.sent_at = moment
-            row.last_error = None
+        if _deliver(s, sender, row, moment, max_age):
             sent += 1
-        s.commit()
+        else:
+            failed += 1
     return sent, failed
+
+
+def send_one(s: Session, sender: Sender, outbox_id: int, now: datetime) -> bool:
+    """立即发送指定的一封邮件，发出返回 True。
+
+    用 FOR UPDATE SKIP LOCKED 取这一行：只有仍是 pending 且没被别的进程锁住才发送，
+    否则返回 False 且不发送。发送失败记次数与错误、仍留在 pending（超过 48 小时同样转 failed），
+    返回 False。记账方式与 send_pending 相同，会提交会话里的事务。
+    """
+    row = s.scalars(
+        select(Outbox)
+        .where(Outbox.id == outbox_id, Outbox.status == "pending")
+        .with_for_update(skip_locked=True)
+    ).one_or_none()
+    if row is None:
+        s.commit()
+        return False
+    return _deliver(s, sender, row, now, MAX_PENDING_AGE)
 
 
 def requeue_failed(s: Session, outbox_id: int | None, now: datetime) -> list[Outbox]:

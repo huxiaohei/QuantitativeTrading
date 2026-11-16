@@ -135,6 +135,11 @@ def _environment() -> Environment:
     )
 
 
+def render_html(template: str, **fields: object) -> str:
+    """用邮件模板环境（自动转义）渲染一份 HTML，供其他邮件模块复用。"""
+    return _environment().get_template(template).render(**fields)
+
+
 def _money(value: float) -> str:
     return f"{value:,.2f}"
 

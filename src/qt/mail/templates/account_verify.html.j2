@@ -1,0 +1,7 @@
+{% extends "base.html.j2" %}
+{% block content %}
+<p>{{ intro }}</p>
+<p><a href="{{ link }}">{{ link }}</a></p>
+<p>链接 {{ hours }} 小时内有效，只能使用一次。</p>
+<p>如果不是你本人操作，忽略即可。</p>
+{% endblock %}
