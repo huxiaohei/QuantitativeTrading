@@ -177,11 +177,23 @@ def _is_int(annotation: object) -> bool:
     return annotation is int
 
 
-def _int_params(route: APIRoute) -> set[str]:
-    """路由处理函数里类型为整数的参数（路径、查询或表单里的编号）。"""
+# 名字像编号的参数：无论标注成什么类型都算编号（防止把编号声明成 str 绕过本表）
+_ID_NAMES = frozenset({"sub", "signal", "entry"})
+
+
+def _looks_like_id(name: str) -> bool:
+    return name in _ID_NAMES or name.endswith("id")
+
+
+def _id_params(route: APIRoute) -> set[str]:
+    """路由里的编号参数：类型为整数的（路径、查询或表单），以及路径、查询里名字像编号的。"""
     hints = get_type_hints(route.endpoint, include_extras=True)
     names = inspect.signature(route.endpoint).parameters
-    return {name for name in names if _is_int(hints.get(name))}
+    found = {name for name in names if _is_int(hints.get(name))}
+    for param in (*route.dependant.path_params, *route.dependant.query_params):
+        if _looks_like_id(param.name) or _looks_like_id(param.alias):
+            found.add(param.name)
+    return found
 
 
 def _url(path: str, params: dict[str, int]) -> str:
@@ -232,16 +244,26 @@ def test_every_route_is_registered_and_classified(web_deps: WebDeps) -> None:
 
 
 def test_every_id_parameter_is_in_an_isolation_table(web_deps: WebDeps) -> None:
-    """路由里每个整数参数都必须登记在 USER_IDS / ADMIN_IDS；公开路由不得接受编号。"""
+    """路由里每个编号参数都必须登记在 USER_IDS / ADMIN_IDS；公开路由不得接受编号。"""
     access: dict[Key, Access] = {(r.method, r.path): r.access for r in ROUTES}
     found: dict[Access, dict[Key, set[str]]] = {"public": {}, "user": {}, "admin": {}}
     for key, route in _app_routes(create_app(web_deps)).items():
-        params = _int_params(route)
+        params = _id_params(route)
         if params:
             found[access[key]][key] = params
     assert found["public"] == {}
     assert found["user"] == {k: set(v) for k, v in USER_IDS.items()}
     assert found["admin"] == {k: set(v) for k, v in ADMIN_IDS.items()}
+
+
+def test_id_detection_flags_id_names_of_any_type() -> None:
+    """名字像编号的路径、查询参数即使标注成 str 也会被认出来；普通参数不会。"""
+
+    def endpoint(item_id: str, sub: str = "", signal: str = "", msg: str = "") -> None:
+        del item_id, sub, signal, msg
+
+    probe = APIRoute("/probe/{item_id}", endpoint, methods=["GET"])
+    assert _id_params(probe) == {"item_id", "sub", "signal"}
 
 
 # ---- 3：未登录 ----
@@ -357,6 +379,7 @@ class Pair:
     app: FastAPI
     engine: Engine
     a: TestClient
+    b: TestClient
     b_id: int
     a_ids: dict[IdKind, int]
     b_ids: dict[IdKind, int]
@@ -428,7 +451,7 @@ def pair(
     with TestClient(app, base_url=BASE) as client_a, TestClient(app, base_url=BASE) as client_b:
         assert login_as(client_b, B_EMAIL).status_code == 303  # 乙有一个有效会话
         assert login_as(client_a, "a@example.com").status_code == 303
-        yield Pair(app, db_engine, client_a, b.id, a_ids, b_ids, a_void_target)
+        yield Pair(app, db_engine, client_a, client_b, b.id, a_ids, b_ids, a_void_target)
 
 
 def _send(client: TestClient, method: str, url: str) -> httpx.Response:
@@ -500,6 +523,11 @@ def test_pages_never_show_other_users_data(pair: Pair) -> None:
         for name, kind in params.items():
             urls.append(_url(path, {name: pair.a_ids[kind]}))
     assert len(urls) >= 20
+    # 对照：乙看自己的手动账页面能看到自己的邮箱和特征金额，证明下面"看不到"的检查不是空转
+    own = pair.b.get("/manual")
+    assert own.status_code == 200
+    assert B_EMAIL in own.text
+    assert any(marker in own.text for marker in B_MARKER_TEXTS)
     for url in urls:
         resp = pair.a.get(url)
         assert resp.status_code in (200, 404), (url, resp.status_code)
