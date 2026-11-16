@@ -37,7 +37,7 @@ from qt.runtime import (
     SetupError,
 )
 from qt.runtime import now as runtime_now
-from qt.service import accounts, manual_ops
+from qt.service import accounts, manual_ops, rules
 from qt.service.actor import CLI
 from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
 from qt.service.manual_book import CorporateAction
@@ -81,31 +81,7 @@ BookOption = Annotated[
     str, typer.Option("--book", help="账本：manual（手动账）或 system（系统账）")
 ]
 
-_PARAM_LABELS: dict[str, str] = {
-    "strategy.min_dividend_yield": "最低股息率",
-    "strategy.max_price_position": "最高价格位置",
-    "strategy.lookback_days": "回看天数（全站统一）",
-    "strategy.min_dividend_years": "最少连续分红年数",
-    "strategy.exclude_dividend_cut": "排除削减分红的股票",
-    "strategy.min_roe_avg3": "三年平均净资产收益率下限",
-    "strategy.max_payout_ratio": "分红率上限",
-    "strategy.min_profit_yoy": "净利润同比下限",
-    "strategy.max_debt_ratio": "资产负债率上限",
-    "strategy.take_profit_mode": "止盈方式",
-    "strategy.take_profit_fixed": "固定止盈比例",
-    "strategy.trailing_activate": "移动止盈启动涨幅",
-    "strategy.trailing_drawdown": "移动止盈回撤比例",
-    "strategy.stop_loss": "止损比例",
-    "strategy.time_stop_days": "持有天数上限",
-    "strategy.fundamental_profit_yoy": "基本面卖出的净利润同比线",
-    "risk.max_position_pct": "单只仓位上限",
-    "risk.max_positions": "最多持仓只数",
-    "risk.max_industry_pct": "单一行业仓位上限",
-    "risk.warn_drawdown": "回撤预警线",
-    "risk.pause_drawdown": "回撤暂停线",
-    "risk.pause_days": "暂停买入的交易日数",
-    "risk.cooldown_days": "止损后的冷却交易日数",
-}
+_PARAM_LABELS: dict[str, str] = {p.key: p.label for p in rules.PARAMS}
 _SUB_STATUS = {"active": "生效中", "paused": "已暂停", "closed": "已关闭"}
 _USER_STATUS = {"active": "正常", "disabled": "停用"}
 _KIND_LABELS = {
@@ -300,7 +276,7 @@ def _open_sub(s: Session, user: User) -> Subscription:
 
 def _shown_sub(s: Session, user: User) -> Subscription:
     """查看用：优先未关闭的订阅，否则最近一个（已关闭的订阅仍可查看）。"""
-    sub = repo.get_open_subscription(s, user.id) or repo.get_latest_subscription(s, user.id)
+    sub = rules.shown_subscription(s, user.id)
     if sub is None:
         raise NotFoundError(f"{user.email} 还没有订阅")
     return sub
@@ -398,28 +374,6 @@ def user_weekly(
 # ---------- 订阅 ----------
 
 
-def _start_day(
-    text: str | None, calendar: TradingCalendar, default: date, backdate_limit_days: int
-) -> date:
-    """订阅起始日：缺省取 default；自选的必须是交易日，不晚于 default，不早于回溯上限。"""
-    if text is None:
-        return default
-    day = _parse_day(text)
-    if not calendar.is_trading_day(day):
-        raise ValidationError(f"起始日 {day} 不是交易日")
-    if day > default:
-        raise ValidationError(f"起始日不能晚于下一个交易日 {default}")
-    try:
-        earliest = calendar.offset(_today(), -backdate_limit_days)
-    except ValueError:
-        earliest = calendar.first_day
-    if day < earliest:
-        raise ValidationError(
-            f"起始日 {day} 太早：最早只能选 {earliest}（{backdate_limit_days} 个交易日之前）"
-        )
-    return day
-
-
 @sub_app.command("create")
 def sub_create(
     ctx: typer.Context,
@@ -444,32 +398,14 @@ def sub_create(
         upcoming = calendar.between(_today() + timedelta(days=1), _FAR_FUTURE)
         if not upcoming:
             raise ValidationError("交易日历还没有覆盖到下一个交易日，请先运行 qt data update")
-        first = _start_day(start, calendar, upcoming[0], cli.cfg().service.backdate_limit_days)
+        first = rules.resolve_start_day(
+            start, calendar, upcoming[0], cli.cfg().service.backdate_limit_days, today=_today()
+        )
         sub = accounts.create_subscription(s, user.id, cli.cfg(), cash, first, overrides, actor=CLI)
         label = "下一个交易日" if first == upcoming[0] else "自选起始日，运行时会补算"
         _emit(f"已为 {user.email} 创建订阅 {sub.id}：本金 {money(cash)}，起始日 {first}（{label}）")
         if overrides:
             _emit("参数覆盖：" + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items()))
-
-
-def _next_unprocessed_day(s: Session, sub: Subscription, calendar: TradingCalendar) -> date:
-    """订阅两本账下一个要处理的交易日（较早的那本）；从没推进过为起始日。
-
-    改参数之后，每日运行从这一天起使用新参数（系统账、手动账一致），已推进过的日子不变。
-    """
-    starts: list[date] = []
-    for kind in ("system", "manual"):
-        book = repo.get_book_of_kind(s, sub.user_id, sub.id, kind)
-        if book.processed_through is None:
-            starts.append(sub.start_day)
-            continue
-        try:
-            starts.append(calendar.offset(book.processed_through, 1))
-        except ValueError as exc:
-            raise ValidationError(
-                "交易日历还没有覆盖到下一次运行的日期，请先运行 qt data update"
-            ) from exc
-    return min(starts)
 
 
 @sub_app.command("set")
@@ -482,7 +418,7 @@ def sub_set(ctx: typer.Context, email: Email, set_: SetOption = None) -> None:
         user = _user(s, email)
         sub = _open_sub(s, user)
         cfg = cli.cfg()
-        effective = _next_unprocessed_day(s, sub, cli.calendar())
+        effective = rules.next_effective_day(s, sub, cli.calendar())
         accounts.update_params(s, user.id, sub.id, cfg, overrides, effective, actor=CLI)
         _emit(
             f"已修改 {user.email} 的参数："

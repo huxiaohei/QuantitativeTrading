@@ -129,6 +129,15 @@ def set_weekly_mail(s: Session, user_id: int, enabled: bool, *, actor: Actor) ->
     return user
 
 
+def set_abandon_mail(s: Session, user_id: int, enabled: bool, *, actor: Actor) -> User:
+    """开关使用者的信号放弃提醒邮件，并写审计日志。"""
+    user = repo.get_user(s, user_id)
+    user.abandon_mail = enabled
+    s.flush()
+    repo.add_audit(s, user_id, "user.abandon_mail", f"user:{user_id}", {"enabled": enabled}, actor)
+    return user
+
+
 def create_subscription(
     s: Session,
     user_id: int,

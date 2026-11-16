@@ -60,6 +60,12 @@ def get_latest_subscription(s: Session, user_id: int) -> Subscription | None:
     return s.scalars(stmt.order_by(Subscription.id.desc())).first()
 
 
+def list_subscriptions(s: Session, user_id: int) -> list[Subscription]:
+    """该使用者的全部订阅（含已关闭的），按创建时间倒序。"""
+    stmt = select(Subscription).where(Subscription.user_id == user_id)
+    return list(s.scalars(stmt.order_by(Subscription.created_at.desc(), Subscription.id.desc())))
+
+
 def get_book(s: Session, user_id: int, book_id: int) -> Book:
     """取该使用者名下的账本。"""
     book = s.get(Book, book_id)
