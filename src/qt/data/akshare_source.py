@@ -19,6 +19,7 @@ from qt.data.akshare_convert import (
     classify_industry,
     normalize_bars,
     normalize_csindex,
+    normalize_daily_snapshot,
     normalize_dividends,
     normalize_financials,
     normalize_securities,
@@ -168,6 +169,15 @@ class AkshareSource:
             return empty_frame(Table.BARS)
         events = self._call(lambda: ak.stock_zh_a_daily(symbol=code, adjust="hfq-factor"))
         return normalize_bars(symbol, raw, events)
+
+    def daily_snapshot(self) -> pd.DataFrame:
+        """新浪全市场行情（约 5500 只，约 20 秒）。
+
+        只尝试一次、不重试（新浪可能限流重复的批量请求），仍有墙钟时限；
+        失败的异常原样抛出，由调用方退回逐只请求。
+        """
+        raw = call_with_retry(ak.stock_zh_a_spot, 1, self._pause, timeout_seconds=self._timeout)
+        return normalize_daily_snapshot(raw)
 
     def dividends(self, symbol: str) -> pd.DataFrame:
         raw = self._call(lambda: ak.stock_history_dividend_detail(symbol=symbol, indicator="分红"))

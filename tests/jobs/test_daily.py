@@ -27,7 +27,13 @@ from qt.service.accounts import close_subscription, pause_subscription, subscrip
 from qt.service.manual_book import Market
 from qt.service.manual_ops import ManualDayResult, record_holding, record_trade
 from qt.service.market import StoreMarket
-from tests.fakes import TRADING_SYMBOLS, FakeSource, make_industries, make_securities
+from tests.fakes import (
+    TRADING_SYMBOLS,
+    FakeSource,
+    make_industries,
+    make_securities,
+    snapshot_from_bars,
+)
 from tests.jobs.conftest import (
     ADMIN,
     CFG,
@@ -745,3 +751,89 @@ def test_catch_up_check_failure_keeps_download_failures_in_detail(env: Env, db: 
     assert run is not None and run.stage == "check"
     assert "600003" in run.detail["download_failed"]
     assert processed_through(db, sub, "system") is None
+
+
+# ---------- 批量行情 ----------
+
+
+def _truncate_bars(store: ParquetStore, day: date) -> None:
+    """库里每只股票的日线只留 day 之前的。"""
+    for symbol in sorted(set(store.read(Table.SECURITIES)["symbol"])):
+        own = store.read(Table.BARS, symbols=[symbol])
+        store.write(Table.BARS, own[own["day"] < pd.Timestamp(day)].reset_index(drop=True), symbol)
+
+
+def test_nightly_update_uses_bulk_snapshot_and_records_it(env: Env, db: Session) -> None:
+    days = env.days
+    day = days[DAY]
+    subscribe(db, "a@example.com", day)
+    full = env.store.read(Table.BARS)
+    source = mirror_source(env.store)
+    source.snapshot = snapshot_from_bars(full, day, days[DAY - 1])
+    _truncate_bars(env.store, day)
+    env.source = source
+    assert run_day(env.ctx, day, True, True) == "done"
+    assert [args for name, args in source.calls if name == "bars"] == []
+    stored = env.store.read(Table.BARS, start=day, end=day).reset_index(drop=True)
+    expected = full[full["day"] == pd.Timestamp(day)].reset_index(drop=True)
+    pd.testing.assert_frame_equal(stored, expected, check_exact=True)
+    run = daily_run(db, day)
+    assert run is not None
+    assert run.detail["bulk"] == {"used": True, "bars": 4, "per_symbol": 0, "reason": ""}
+
+
+def test_nightly_update_records_why_bulk_was_not_used(env: Env, db: Session) -> None:
+    day = env.days[DAY]
+    subscribe(db, "a@example.com", day)
+    source = mirror_source(env.store)  # 不模拟批量行情
+    _truncate_bars(env.store, day)
+    env.source = source
+    assert run_day(env.ctx, day, True, True) == "done"
+    run = daily_run(db, day)
+    assert run is not None
+    bulk = run.detail["bulk"]
+    assert (bulk["used"], bulk["bars"], bulk["per_symbol"]) == (False, 0, 4)
+    assert "批量行情获取失败" in bulk["reason"]
+
+
+def test_holding_suspended_in_snapshot_is_rechecked_and_treated_as_suspended(
+    env: Env, db: Session
+) -> None:
+    days = env.days
+    day = days[DAY]
+    sub, source = _holding_whose_bar_is_missing(env, db, failures=0, source_has_bar=False)
+    everything = pd.concat(
+        [source.bars(s, days[0], day) for s in [*TRADING_SYMBOLS, "600005"]], ignore_index=True
+    )
+    source.calls.clear()
+    snapshot = snapshot_from_bars(everything, day, days[DAY - 1])
+    prev_close = float(
+        everything[
+            (everything["symbol"] == "600001") & (everything["day"] == pd.Timestamp(days[DAY - 1]))
+        ]["close"].iloc[0]
+    )
+    suspended = pd.DataFrame(
+        {
+            "symbol": pd.Series(["600001"], dtype="str"),
+            **{c: pd.Series([0.0], dtype="float64") for c in ("open", "high", "low", "close")},
+            "prev_close": pd.Series([prev_close], dtype="float64"),
+            "volume": pd.Series([0.0], dtype="float64"),
+            "amount": pd.Series([0.0], dtype="float64"),
+        }
+    )
+    source.snapshot = pd.concat([snapshot, suspended], ignore_index=True)
+    _truncate_bars(env.store, day)
+    assert run_day(env.ctx, day, True, True) == "done"
+    assert processed_through(db, sub, "manual") == day
+    # 更新阶段没有逐只请求；持仓缺当日日线，由行情检查再请求一次，数据源回答没有 → 停牌
+    assert [args[0] for name, args in source.calls if name == "bars"] == ["600001"]
+    run = daily_run(db, day)
+    assert run is not None
+    assert run.detail["bulk"]["used"] is True and run.detail["bulk"]["bars"] == 4
+    assert run.detail["download_failed"] == {}
+    assert run.detail["bars_retried"] == {
+        "symbols": ["600001"],
+        "still_missing": ["600001"],
+        "failed": {},
+    }
+    assert not [m for m in env.sender.sent if m.to_addr == ADMIN]

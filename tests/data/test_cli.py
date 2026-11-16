@@ -21,6 +21,7 @@ from tests.fakes import (
     make_industries,
     make_securities,
     populate_store,
+    snapshot_from_bars,
     weekdays,
 )
 
@@ -261,3 +262,148 @@ def test_data_check_reports_old_schema_file(tmp_path: Path) -> None:
     assert isinstance(result.exception, SystemExit)
     assert "bars" in result.output and "adj_factor" in result.output
     assert "删除该目录后重新运行 qt data update" in result.output
+
+
+# ---------------------------------------------------------------- 批量行情
+
+
+NEXT_DAY = date(2024, 1, 15)
+SNAP_NOW = datetime(2024, 1, 12, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+def _varied_bars(symbol: str, base: float) -> pd.DataFrame:
+    bars = make_bars(symbol, DAYS, [round(base + 0.01 * i, 2) for i in range(len(DAYS))])
+    bars["high"] = bars["close"] + 0.05
+    bars["volume"] = pd.Series([1000.0 + i for i in range(len(DAYS))], dtype="float64")
+    bars["adj_factor"] = pd.Series([1.5] * len(DAYS), dtype="float64")
+    return bars
+
+
+def _snapshot_world(
+    tmp_path: Path, n: int = 5, adj_on_last_day: float | None = None
+) -> tuple[FakeSource, pd.DataFrame]:
+    """库里日线到 1-11，数据源有到 1-12 的逐只日线与 1-12 的批量行情。"""
+    syms = [f"60000{i}" for i in range(n)]
+    market = pd.concat([_varied_bars(s, 10.0 + i) for i, s in enumerate(syms)], ignore_index=True)
+    if adj_on_last_day is not None:  # 逐只接口在 1-12 给出不同的复权因子
+        last = (market["symbol"] == "600001") & (market["day"] == pd.Timestamp(DAYS[-1]))
+        market.loc[last, "adj_factor"] = adj_on_last_day
+    trade_days = make_trade_days([*DAYS, NEXT_DAY])
+    secs = make_securities([(s, "sh_main", LISTED, None) for s in syms])
+    store = ParquetStore(tmp_path)
+    store.write(Table.TRADE_DAYS, trade_days)
+    store.write(Table.SECURITIES, secs)
+    old = market[market["day"] < pd.Timestamp(DAYS[-1])]
+    populate_store(store, bars=[g.reset_index(drop=True) for _, g in old.groupby("symbol")])
+    source = FakeSource(
+        trade_days=trade_days,
+        securities=secs,
+        bars=market,
+        industries=make_industries([(s, "制造业", False) for s in syms]),
+    )
+    snapshot = snapshot_from_bars(market, DAYS[-1], DAYS[-2])
+    source.snapshot = snapshot
+    return source, snapshot
+
+
+def _files(root: Path) -> dict[str, tuple[int, int]]:
+    return {
+        str(p.relative_to(root)): (p.stat().st_mtime_ns, p.stat().st_size)
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def _check(
+    monkeypatch: pytest.MonkeyPatch, source: DataSource, data_dir: Path, *extra: str
+) -> tuple[int, str]:
+    _patch(monkeypatch, source)
+    monkeypatch.setattr(qt.cli, "_now", lambda: SNAP_NOW)
+    result = CliRunner().invoke(
+        qt.cli.app, ["data", "check-snapshot", "--data-dir", str(data_dir), *extra]
+    )
+    return result.exit_code, result.output
+
+
+def test_cli_update_reports_bulk_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source, _ = _snapshot_world(tmp_path)
+    _patch(monkeypatch, source)
+    monkeypatch.setattr(qt.cli, "_now", lambda: SNAP_NOW)
+    result = CliRunner().invoke(qt.cli.app, ["data", "update", "--data-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "日线批量行情：已启用，批量写入 5 只，逐只请求 0 只" in result.output
+    assert [c for c in source.calls if c[0] == "bars"] == []
+
+
+def test_cli_update_reports_bulk_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    code, output = _run_cli(monkeypatch, _cli_source(), tmp_path)
+    assert code == 0, output
+    assert "日线批量行情：未启用" in output
+
+
+def test_check_snapshot_reports_match_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, _ = _snapshot_world(tmp_path)
+    before = _files(tmp_path)
+    code, output = _check(monkeypatch, source, tmp_path)
+    assert code == 0, output
+    assert "核对 5 只" in output and "不一致 0 只" in output
+    assert "昨收与库里 2024-01-11 的收盘价相符 5/5" in output
+    assert _files(tmp_path) == before
+    assert sorted(str(a[0]) for n, a in source.calls if n == "bars") == [
+        f"60000{i}" for i in range(5)
+    ]
+    assert [n for n, _ in source.calls].count("daily_snapshot") == 1
+
+
+def test_check_snapshot_sample_option_limits_requests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, _ = _snapshot_world(tmp_path)
+    code, output = _check(monkeypatch, source, tmp_path, "--sample", "2")
+    assert code == 0, output
+    assert "核对 2 只" in output
+    assert len([n for n, _ in source.calls if n == "bars"]) == 2
+
+
+def test_check_snapshot_difference_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, snapshot = _snapshot_world(tmp_path)
+    snapshot.loc[snapshot["symbol"] == "600002", "high"] = 99.0
+    before = _files(tmp_path)
+    code, output = _check(monkeypatch, source, tmp_path)
+    assert code == 1
+    assert "600002" in output and "high" in output
+    assert "不一致 1 只" in output
+    assert _files(tmp_path) == before
+
+
+def test_check_snapshot_adj_factor_change_with_matching_prev_close_is_a_difference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, _ = _snapshot_world(tmp_path, adj_on_last_day=1.6)
+    code, output = _check(monkeypatch, source, tmp_path)
+    assert code == 1
+    assert "600001" in output and "复权因子" in output
+
+
+def test_check_snapshot_ex_rights_symbol_is_reported_not_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, snapshot = _snapshot_world(tmp_path)
+    snapshot.loc[snapshot["symbol"] == "600003", "prev_close"] = 1.0
+    code, output = _check(monkeypatch, source, tmp_path)
+    assert code == 0, output
+    assert "当天除权（昨收对不上，批量路径会改走逐只请求）1 只" in output
+
+
+def test_check_snapshot_failure_is_a_chinese_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, _ = _snapshot_world(tmp_path)
+    source.snapshot = None
+    code, output = _check(monkeypatch, source, tmp_path)
+    assert code == 1
+    assert "批量行情获取失败" in output

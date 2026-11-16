@@ -15,6 +15,13 @@ class DataSource(Protocol):
 
     def bars(self, symbol: str, start: date, end: date) -> pd.DataFrame: ...
 
+    def daily_snapshot(self) -> pd.DataFrame:
+        """全市场最新一个交易日的批量行情，列见 schema.SNAPSHOT_SCHEMA；没有日期列。
+
+        只请求一次、失败不重试（避免加重限流）；失败抛异常，调用方退回逐只请求。
+        """
+        ...
+
     def dividends(self, symbol: str) -> pd.DataFrame: ...
 
     def financials(self, symbol: str) -> pd.DataFrame: ...

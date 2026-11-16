@@ -1,11 +1,12 @@
 """增量更新与数据完整性检查。"""
 
 import logging
+import math
 import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, NamedTuple, Protocol, cast, runtime_checkable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -14,7 +15,7 @@ from qt.calendar import TradingCalendar
 from qt.config import AppConfig
 from qt.data.akshare_convert import build_industries
 from qt.data.delist import finalize_securities
-from qt.data.schema import Table
+from qt.data.schema import Table, validate_snapshot
 from qt.data.source import DataSource
 from qt.data.store import ParquetStore
 
@@ -42,6 +43,12 @@ _DELIST_MARGIN_DAYS = 90
 # A 股收盘时间（上海时间）
 _MARKET_TZ = ZoneInfo("Asia/Shanghai")
 _MARKET_CLOSE = time(16, 0)
+# 批量行情只在 as_of 收盘之后、下一个交易日这个时刻之前代表 as_of 当天
+_NEXT_DAY_CUTOFF = time(9, 0)
+# 批量行情的昨收与库里前一交易日收盘价相差不超过此值，才算同一天、当天未除权
+SNAPSHOT_TOLERANCE = 0.005
+# 可比对的股票里昨收对得上的最低比例；低于此值说明批量行情不是 as_of 那天的，整晚改走逐只请求
+SNAPSHOT_MIN_MATCH = 0.9
 
 ProgressFn = Callable[[str, int, int], None]
 # 进度回调的默认间隔（只）
@@ -124,6 +131,17 @@ class UpdateReport:
     failed: Mapping[str, str]
     problems: Sequence[str] = ()
     download_failed: Mapping[str, str] = field(default_factory=dict[str, str])
+    bulk_used: bool = False  # 本次是否用了批量行情
+    bulk_bars: int = 0  # 由批量行情写入的日线只数
+    per_symbol_bars: int = 0  # 逐只请求日线的股票数
+    bulk_reason: str = ""  # 没有用批量行情的原因（用了则为空）
+
+
+def format_bulk(used: bool, bars: int, per_symbol: int, reason: str) -> str:
+    """批量行情使用情况的一行中文说明（命令行与 qt admin runs 共用）。"""
+    if used:
+        return f"日线批量行情：已启用，批量写入 {bars} 只，逐只请求 {per_symbol} 只"
+    return f"日线批量行情：未启用（{reason}），逐只请求 {per_symbol} 只"
 
 
 def count_no_bars(failed: Mapping[str, str]) -> int:
@@ -169,6 +187,175 @@ def latest_closed_day(now: datetime, calendar: TradingCalendar) -> date:
     if calendar.is_trading_day(today) and local.time() >= _MARKET_CLOSE:
         return today
     return latest_trading_day(calendar, today - timedelta(days=1))
+
+
+def snapshot_window_problem(now: datetime, as_of: date, calendar: TradingCalendar) -> str | None:
+    """批量行情此刻能否代表 as_of 当天：返回不能的原因，None 表示能。
+
+    要求 as_of 是 now 时最近一个已收盘的交易日，且 now 在 as_of 收盘之后、下一个交易日 09:00 之前。
+    交易日历里没有 as_of 之后的交易日时无法确定时段，也不能用。now 必须带时区。
+    """
+    if now.tzinfo is None:
+        raise ValueError("now 必须是带时区的时间")
+    local = now.astimezone(_MARKET_TZ)
+    closed = latest_closed_day(now, calendar)
+    if closed != as_of:
+        return (
+            f"数据截止日 {as_of} 不是 {local:%Y-%m-%d %H:%M} 时最近一个已收盘的交易日（{closed}）"
+        )
+    try:
+        following = calendar.offset(as_of, 1)
+    except ValueError:
+        return f"交易日历里没有 {as_of} 之后的交易日，无法确定批量行情的有效时段"
+    if local >= datetime.combine(following, _NEXT_DAY_CUTOFF, tzinfo=_MARKET_TZ):
+        return f"当前时间 {local:%Y-%m-%d %H:%M} 已到下一个交易日 {following} 的 09:00"
+    return None
+
+
+class Quote(NamedTuple):
+    """批量行情里一只股票的一行。"""
+
+    open: float
+    high: float
+    low: float
+    close: float
+    prev_close: float
+    volume: float
+    amount: float
+
+
+def snapshot_quotes(snapshot: pd.DataFrame) -> dict[str, Quote]:
+    """批量行情 → {代码: Quote}；列不符抛 SchemaError，重复出现的代码全部丢弃。"""
+    validate_snapshot(snapshot)
+    unique = snapshot.drop_duplicates("symbol", keep=False)
+    columns = [unique[c].tolist() for c in ("open", "high", "low", "close", "prev_close")]
+    columns += [unique[c].tolist() for c in ("volume", "amount")]
+    return {
+        str(symbol): Quote(*(float(v) for v in values))
+        for symbol, *values in zip(unique["symbol"].tolist(), *columns, strict=True)
+    }
+
+
+def prev_close_agrees(quote: Quote, stored_close: float) -> bool:
+    """批量行情的昨收与库里前一交易日收盘价相差不超过 SNAPSHOT_TOLERANCE。"""
+    return abs(quote.prev_close - stored_close) <= SNAPSHOT_TOLERANCE
+
+
+def prev_close_matches(
+    quotes: Mapping[str, Quote], stored_closes: Mapping[str, float]
+) -> tuple[int, int]:
+    """库里有前一交易日收盘价、且批量行情里有成交（成交量 > 0）的股票中，昨收对得上的只数与总数。"""
+    compared = [
+        prev_close_agrees(quotes[s], close)
+        for s, close in stored_closes.items()
+        if s in quotes and quotes[s].volume > 0
+    ]
+    return sum(compared), len(compared)
+
+
+def _usable(quote: Quote) -> bool:
+    """有成交、价格为正（另要求最高、最低、成交额都是有限数，否则不可信）。"""
+    finite = all(math.isfinite(v) for v in (quote.high, quote.low, quote.amount))
+    return quote.open > 0 and quote.close > 0 and quote.volume > 0 and finite
+
+
+@dataclass(frozen=True)
+class _Bulk:
+    """本次运行可用的批量行情：as_of 当天的行情与库里前一交易日的 (收盘价, 复权因子)。
+
+    prev_bars 只含库里最后一根日线正好是 prev 的股票。
+    """
+
+    as_of: date
+    prev: date
+    quotes: Mapping[str, Quote]
+    prev_bars: Mapping[str, tuple[float, float]]
+
+    def suspended(self, symbol: str) -> bool:
+        """批量行情里有它但没有成交（成交量为 0）。"""
+        quote = self.quotes.get(symbol)
+        return quote is not None and quote.volume == 0
+
+    def bar(self, symbol: str) -> pd.DataFrame | None:
+        """可信时返回 as_of 当天的日线（复权因子沿用前一根），否则 None（改走逐只请求）。"""
+        quote = self.quotes.get(symbol)
+        stored = self.prev_bars.get(symbol)
+        if quote is None or stored is None or not _usable(quote):
+            return None
+        close, adj_factor = stored
+        if not prev_close_agrees(quote, close):
+            return None  # 当天除权（昨收参考价被调整）或数据不对
+        return pd.DataFrame(
+            {
+                "symbol": pd.Series([symbol], dtype="str"),
+                "day": pd.Series([pd.Timestamp(self.as_of)], dtype="datetime64[ns]"),
+                "open": pd.Series([quote.open], dtype="float64"),
+                "high": pd.Series([quote.high], dtype="float64"),
+                "low": pd.Series([quote.low], dtype="float64"),
+                "close": pd.Series([quote.close], dtype="float64"),
+                "volume": pd.Series([quote.volume], dtype="float64"),
+                "amount": pd.Series([quote.amount], dtype="float64"),
+                "adj_factor": pd.Series([adj_factor], dtype="float64"),
+            }
+        )
+
+
+@dataclass
+class _BarStats:
+    """日线来源计数：批量写入的只数与逐只请求的只数。"""
+
+    bulk: int = 0
+    per_symbol: int = 0
+
+
+def _prepare_bulk(
+    source: DataSource,
+    store: ParquetStore,
+    cfg: AppConfig,
+    as_of: date,
+    now: datetime | None,
+    universe: Sequence[str],
+    wanted: Sequence[str],
+) -> tuple[_Bulk | None, str]:
+    """决定本次是否用批量行情；返回 (_Bulk, "") 或 (None, 不用的原因)。
+
+    批量行情最多请求一次、失败不重试。整体闸门：配置开启、调用方给了当前时间且在有效时段内、
+    请求成功、可比对的股票里昨收对得上的比例不低于 SNAPSHOT_MIN_MATCH。
+    没有任何要处理的股票停在前一交易日时不请求。
+    """
+    if not cfg.data.bulk_bars:
+        return None, "配置 data.bulk_bars 为假"
+    if now is None:
+        return None, "调用方没有提供当前时间"
+    calendar = load_calendar(store)
+    problem = snapshot_window_problem(now, as_of, calendar)
+    if problem is not None:
+        return None, problem
+    prev = calendar.offset(as_of, -1)
+    window = store.read(Table.BARS, start=prev, end=as_of)
+    done = set(window.loc[window["day"] == pd.Timestamp(as_of), "symbol"].tolist())
+    before = window[window["day"] == pd.Timestamp(prev)]
+    members = set(universe)
+    prev_bars = {
+        str(s): (float(c), float(a))
+        for s, c, a in zip(before["symbol"], before["close"], before["adj_factor"], strict=True)
+        if s in members and s not in done
+    }
+    if not any(s in prev_bars for s in wanted):
+        return None, f"没有股票的日线停在前一个交易日 {prev}，不需要批量行情"
+    try:
+        quotes = snapshot_quotes(source.daily_snapshot())
+    except Exception as exc:  # 只请求一次：限流、超时、格式变化都退回逐只请求
+        return None, f"批量行情获取失败：{type(exc).__name__}: {exc}"
+    matched, total = prev_close_matches(quotes, {s: c for s, (c, _) in prev_bars.items()})
+    if total == 0:
+        return None, f"批量行情里没有可比对昨收的股票（库里 {prev} 有日线且当天有成交的为 0 只）"
+    if matched / total < SNAPSHOT_MIN_MATCH:
+        return None, (
+            f"批量行情的昨收与库里 {prev} 收盘价相符的只有 {matched}/{total}"
+            f"（{matched / total:.1%}），低于 {SNAPSHOT_MIN_MATCH:.0%}，可能不是 {as_of} 的数据"
+        )
+    return _Bulk(as_of, prev, quotes, prev_bars), ""
 
 
 def _shared[T](name: str, fn: Callable[[], T]) -> T:
@@ -398,14 +585,31 @@ def _update_bars(
     delisted: bool,
     as_of: date,
     latest: date,
+    bulk: _Bulk | None = None,
+    stats: _BarStats | None = None,
 ) -> bool:
-    """更新一只股票的日线（不存 as_of 之后的行）；有新行写入返回 True。"""
+    """更新一只股票的日线（不存 as_of 之后的行）；有新行写入返回 True。
+
+    bulk 不为空且库里最后一根日线正好是前一交易日时先看批量行情：停牌（有它但没有成交）则不写、
+    不请求；可信则写入 as_of 的日线；其余情形照旧逐只请求。stats 记录日线的来源。
+    """
     first_start = _years_before(cfg.backtest.in_sample_start, _LOOKBACK_YEARS)
     last = store.last_day(Table.BARS, symbol)
     if delisted and last is not None and (as_of - last).days > _LONG_DEAD_DAYS:
         return False  # 早已退市，不会再有新日线
     if last is not None and last >= latest:
         return False
+    if bulk is not None and last == bulk.prev:
+        if bulk.suspended(symbol):
+            return False  # 停牌：不写日线，也不逐只请求
+        bar = bulk.bar(symbol)
+        if bar is not None:
+            store.append(Table.BARS, bar, symbol)
+            if stats is not None:
+                stats.bulk += 1
+            return True
+    if stats is not None:
+        stats.per_symbol += 1
     start = first_start if last is None else last + timedelta(days=1)
     df = source.bars(symbol, start, as_of)
     df = df[df["day"] <= pd.Timestamp(as_of)]
@@ -468,6 +672,7 @@ def update_all(
     progress: ProgressFn | None = None,
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     refresh_trade_days: bool = True,
+    now: datetime | None = None,
 ) -> UpdateReport:
     """更新全部数据。
 
@@ -479,6 +684,8 @@ def update_all(
     失败时抛 NetworkOutageError 中止（已退市且取不到日线的不算）。运行结束时（包括被中断或中止）
     统一定稿全部退市证券的 delist_date；定稿本身出错时记日志，不掩盖原来的异常。
     progress(阶段, 已处理数, 总数) 每处理 progress_every 只调用一次。
+    now 是调用方的当前时间（带时区；本函数不读系统时钟）。给出时按 _prepare_bulk 的规则尝试用一次
+    批量行情写 as_of 当天的日线，对不上的股票照旧逐只请求；不给（None）则全部逐只请求。
     """
     if isinstance(source, AsOfAware):
         source.set_as_of(as_of)
@@ -499,7 +706,15 @@ def update_all(
 
     updated = skipped = 0
     guard = _OutageGuard(cfg.data.max_consecutive_failures, "日线")
+    stats = _BarStats()
     try:
+        try:
+            bulk, bulk_reason = _prepare_bulk(
+                source, store, cfg, as_of, now, list(in_universe.index), wanted
+            )
+        except Exception as exc:  # 本地数据读不出等：退回逐只请求，不影响本次更新
+            _log.exception("准备批量行情出错，改走逐只请求")
+            bulk, bulk_reason = None, f"准备批量行情出错：{type(exc).__name__}: {exc}"
         problems = problems + _refresh_industries(
             source,
             store,
@@ -520,7 +735,9 @@ def update_all(
                 if delisted and delist < window_start:
                     skipped += 1  # 退市早于下载起点，窗口内不可能有日线
                 else:
-                    changed = _update_bars(source, store, cfg, symbol, delisted, as_of, latest)
+                    changed = _update_bars(
+                        source, store, cfg, symbol, delisted, as_of, latest, bulk, stats
+                    )
                     _update_fundamentals(source, store, cfg, symbol, as_of)
                     updated, skipped = (updated + 1, skipped) if changed else (updated, skipped + 1)
                 guard.ok()
@@ -553,6 +770,10 @@ def update_all(
         failed=failed,
         problems=problems,
         download_failed=download_failed,
+        bulk_used=bulk is not None,
+        bulk_bars=stats.bulk,
+        per_symbol_bars=stats.per_symbol,
+        bulk_reason=bulk_reason,
     )
 
 

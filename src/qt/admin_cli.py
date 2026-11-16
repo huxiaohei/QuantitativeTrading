@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from qt.backtest.state import load_state
 from qt.calendar import TradingCalendar
 from qt.data.schema import SchemaError
-from qt.data.update import DataIntegrityError
+from qt.data.update import DataIntegrityError, format_bulk
 from qt.db import admin_repo, repo
 from qt.db.engine import session_scope
 from qt.db.models import Book, LedgerEntry, Signal, Subscription, User
@@ -1063,6 +1063,17 @@ def _reason_lines(detail: dict[str, Any]) -> list[str]:
     if failed:
         lines.append(f"下载失败 {len(failed)} 只（已沿用本地数据）：")
         lines.extend(f"  {symbol}：{message}" for symbol, message in failed.items())
+    bulk = detail.get("bulk")
+    if isinstance(bulk, dict):
+        info = cast("dict[str, Any]", bulk)
+        lines.append(
+            format_bulk(
+                bool(info.get("used")),
+                int(info.get("bars") or 0),
+                int(info.get("per_symbol") or 0),
+                str(info.get("reason") or ""),
+            )
+        )
     retried = detail.get("bars_retried")
     if retried:
         lines.append(f"缺当日日线、已再下载一次：{_json_text(retried)}")

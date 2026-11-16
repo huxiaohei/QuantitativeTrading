@@ -199,6 +199,8 @@ class FakeSource:
     """实现 DataSource 的假数据源；未提供的表返回空表。
 
     calls 记录 (方法名, 参数)；fail_symbols 中的股票在按股票取数时抛 RuntimeError。
+    snapshot 为批量行情（列见 qt.data.schema.SNAPSHOT_SCHEMA）；为 None 时 daily_snapshot()
+    抛 NotImplementedError，更新按"批量行情不可用"处理，退回逐只请求。
     """
 
     def __init__(self, **tables: pd.DataFrame) -> None:
@@ -209,6 +211,7 @@ class FakeSource:
         self._tables = tables
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.fail_symbols: set[str] = set()
+        self.snapshot: pd.DataFrame | None = None
 
     def _get(self, table: Table) -> pd.DataFrame:
         return self._tables.get(table.value, empty_frame(table))
@@ -229,6 +232,12 @@ class FakeSource:
         self.calls.append(("bars", (symbol, start, end)))
         self._check(symbol)
         return _by_range(_by_symbol(self._get(Table.BARS), symbol), "day", start, end)
+
+    def daily_snapshot(self) -> pd.DataFrame:
+        self.calls.append(("daily_snapshot", ()))
+        if self.snapshot is None:
+            raise NotImplementedError("假数据源没有模拟批量行情")
+        return self.snapshot
 
     def dividends(self, symbol: str) -> pd.DataFrame:
         self.calls.append(("dividends", (symbol,)))
@@ -252,6 +261,32 @@ class FakeSource:
         self.calls.append(("benchmark", (code, start, end)))
         df = self._get(Table.BENCHMARKS)
         return _by_range(df[df["code"] == code].reset_index(drop=True), "day", start, end)
+
+
+def snapshot_from_bars(bars: pd.DataFrame, day: date, prev_day: date) -> pd.DataFrame:
+    """由日线表构造 day 当天的批量行情。
+
+    开高低收、成交量、成交额取 day 的日线，昨收取 prev_day 的收盘价。
+
+    prev_day 没有日线的股票昨收为 0（与新浪对新股的表示相同）。
+    """
+    today = bars[bars["day"] == pd.Timestamp(day)].reset_index(drop=True)
+    before = bars[bars["day"] == pd.Timestamp(prev_day)]
+    prev_close = dict(zip(before["symbol"], before["close"], strict=True))
+    return pd.DataFrame(
+        {
+            "symbol": pd.Series(today["symbol"].tolist(), dtype="str"),
+            "open": today["open"].astype("float64"),
+            "high": today["high"].astype("float64"),
+            "low": today["low"].astype("float64"),
+            "close": today["close"].astype("float64"),
+            "prev_close": pd.Series(
+                [float(prev_close.get(s, 0.0)) for s in today["symbol"]], dtype="float64"
+            ),
+            "volume": today["volume"].astype("float64"),
+            "amount": today["amount"].astype("float64"),
+        }
+    )
 
 
 def weekdays(start: date, n: int) -> list[date]:

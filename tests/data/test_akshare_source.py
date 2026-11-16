@@ -15,6 +15,7 @@ from qt.data.akshare_convert import (
     fiscal_year_of,
     normalize_bars,
     normalize_csindex,
+    normalize_daily_snapshot,
     normalize_dividends,
     normalize_financials,
     normalize_securities,
@@ -26,9 +27,15 @@ from qt.data.akshare_convert import (
     period_label,
     statutory_deadline,
 )
-from qt.data.akshare_source import RequestTimeoutError, call_with_deadline, call_with_retry
+from qt.data.akshare_source import (
+    AkshareSource,
+    RequestTimeoutError,
+    call_with_deadline,
+    call_with_retry,
+)
 from qt.data.delist import UNKNOWN_DELIST_DATE
-from qt.data.schema import SCHEMAS, Table, validate
+from qt.data.schema import SCHEMAS, SNAPSHOT_SCHEMA, Table, validate
+from tests.fakes import default_app_config
 
 
 def _events(rows: list[tuple[str, str]]) -> pd.DataFrame:
@@ -615,3 +622,111 @@ def test_deadline_passes_through_results_and_errors() -> None:
 
     with pytest.raises(ConnectionError, match="断线"):
         call_with_deadline(boom, 1.0)
+
+
+# ---------------------------------------------------------------- 批量行情
+
+
+def _spot(rows: list[tuple[object, ...]]) -> pd.DataFrame:
+    """新浪 stock_zh_a_spot 的原始表（列取自 2026-11-16 的实测）。"""
+    cols = ["代码", "名称", "最新价", "涨跌额", "涨跌幅", "买入", "卖出", "昨收", "今开", "最高"]
+    cols += ["最低", "成交量", "成交额", "时间戳"]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def test_normalize_daily_snapshot_maps_columns_and_strips_prefix() -> None:
+    raw = _spot(
+        [
+            (
+                "sh600000",
+                "浦发银行",
+                10.5,
+                0.1,
+                0.96,
+                10.49,
+                10.5,
+                10.4,
+                10.41,
+                10.6,
+                10.3,
+                12345600.0,
+                129876543.21,
+                "15:00:00",
+            ),
+            (
+                "sz000001",
+                "平安银行",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                11.2,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                "15:00:00",
+            ),
+            (
+                "bj920000",
+                "北交所",
+                "8.8",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                "8.8",
+                "8.7",
+                "8.9",
+                "8.6",
+                "1000",
+                "8800",
+                "15:00:00",
+            ),
+        ]
+    )
+    out = normalize_daily_snapshot(raw)
+    assert list(out.columns) == list(SNAPSHOT_SCHEMA)
+    assert [str(t) for t in out.dtypes[1:]] == ["float64"] * 7
+    assert out["symbol"].tolist() == ["600000", "000001", "920000"]
+    first = out.iloc[0]
+    assert (first["open"], first["high"], first["low"], first["close"]) == (10.41, 10.6, 10.3, 10.5)
+    assert (first["prev_close"], first["volume"], first["amount"]) == (
+        10.4,
+        12345600.0,
+        129876543.21,
+    )
+    assert out.iloc[1]["volume"] == 0.0 and out.iloc[1]["prev_close"] == 11.2  # 停牌
+    assert out.iloc[2]["close"] == 8.8
+
+
+def test_normalize_daily_snapshot_drops_duplicates_and_bad_codes() -> None:
+    row = ("sh600000", "甲", 10.0, 0, 0, 0, 0, 9.9, 9.95, 10.1, 9.9, 100.0, 1000.0, "15:00:00")
+    other = ("sh600001", "乙", 5.0, 0, 0, 0, 0, 4.9, 4.95, 5.1, 4.9, 100.0, 500.0, "15:00:00")
+    bad = ("xx", "丙", 5.0, 0, 0, 0, 0, 4.9, 4.95, 5.1, 4.9, 100.0, 500.0, "15:00:00")
+    out = normalize_daily_snapshot(_spot([row, other, row, bad]))
+    assert out["symbol"].tolist() == ["600001"]  # 重复的代码无法判断哪行可信，全部丢弃
+
+
+def test_normalize_daily_snapshot_rejects_missing_columns() -> None:
+    raw = _spot([]).drop(columns=["昨收"])
+    with pytest.raises(ValueError, match="昨收"):
+        normalize_daily_snapshot(raw)
+
+
+def test_daily_snapshot_is_attempted_once_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    def throttled() -> pd.DataFrame:
+        calls.append(1)
+        raise ConnectionError("模拟被限流")
+
+    monkeypatch.setattr("akshare.stock_zh_a_spot", throttled)
+    cfg = default_app_config()
+    data = cfg.data.model_copy(update={"request_pause_seconds": 0.0, "retries": 3})
+    source = AkshareSource(data, cfg.universe.boards, cfg.backtest.data_start)
+    with pytest.raises(ConnectionError):
+        source.daily_snapshot()
+    assert len(calls) == 1

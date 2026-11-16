@@ -68,6 +68,20 @@ SCHEMAS: dict[Table, dict[str, str]] = {
     Table.BENCHMARKS: {"code": "str", "day": DATE, "close": "float64"},
 }
 
+# 批量行情（DataSource.daily_snapshot）的列：某一天全市场每只股票一行，不入库。
+# symbol 为 6 位代码；prev_close 是交易所给出的昨收参考价（除权当天会被调整）；
+# 停牌股票 open/high/low/close/volume/amount 都是 0。单位与 BARS 相同（股、元）。
+SNAPSHOT_SCHEMA: dict[str, str] = {
+    "symbol": "str",
+    "open": "float64",
+    "high": "float64",
+    "low": "float64",
+    "close": "float64",
+    "prev_close": "float64",
+    "volume": "float64",
+    "amount": "float64",
+}
+
 # 按股票分文件存储的表及其主键
 PRIMARY_KEYS: dict[Table, list[str]] = {
     Table.TRADE_DAYS: ["day"],
@@ -94,17 +108,25 @@ def _dtype_ok(series: pd.Series, expected: str) -> bool:
     return str(series.dtype) == expected
 
 
-def validate(table: Table, df: pd.DataFrame) -> None:
-    """校验列集合与类型，缺列、多列、类型不符抛 SchemaError。"""
-    schema = SCHEMAS[table]
+def _validate(name: str, schema: dict[str, str], df: pd.DataFrame) -> None:
     cols = [str(c) for c in df.columns]
     missing = [c for c in schema if c not in cols]
     extra = [c for c in cols if c not in schema]
     if missing:
-        raise SchemaError(f"{table.value} 缺少列：{missing}")
+        raise SchemaError(f"{name} 缺少列：{missing}")
     if extra:
-        raise SchemaError(f"{table.value} 多出列：{extra}")
+        raise SchemaError(f"{name} 多出列：{extra}")
     for col, expected in schema.items():
         series: pd.Series = df[col]
         if not _dtype_ok(series, expected):
-            raise SchemaError(f"{table.value}.{col} 类型应为 {expected}，实际为 {series.dtype}")
+            raise SchemaError(f"{name}.{col} 类型应为 {expected}，实际为 {series.dtype}")
+
+
+def validate(table: Table, df: pd.DataFrame) -> None:
+    """校验列集合与类型，缺列、多列、类型不符抛 SchemaError。"""
+    _validate(table.value, SCHEMAS[table], df)
+
+
+def validate_snapshot(df: pd.DataFrame) -> None:
+    """按 SNAPSHOT_SCHEMA 校验批量行情，不符抛 SchemaError。"""
+    _validate("daily_snapshot", SNAPSHOT_SCHEMA, df)

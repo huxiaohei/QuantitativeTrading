@@ -39,6 +39,7 @@ def test_default_config_matches_spec() -> None:
     assert cfg.data.retries == 3
     assert cfg.data.industries_refresh_days == 30
     assert cfg.data.min_industry_coverage == 0.9
+    assert cfg.data.bulk_bars is True
     assert cfg.service.run_time == "18:00"
     assert cfg.service.run_deadline == "08:30"
     assert cfg.service.signal_valid_days == 3
@@ -100,6 +101,7 @@ def test_empty_or_non_mapping_yaml_rejected_with_chinese_message(tmp_path: Path)
         ("backtest", "buy_order_valid_days", 0),
         ("data", "retries", 0),
         ("data", "min_industry_coverage", 1.5),
+        ("data", "bulk_bars", "maybe"),
         ("universe", "boards", []),
     ],
 )
@@ -109,6 +111,11 @@ def test_out_of_range_values_rejected(
     path = _write_modified(tmp_path, section, key, value)
     with pytest.raises(ValidationError):
         load_config(path)
+
+
+def test_bulk_bars_can_be_turned_off(tmp_path: Path) -> None:
+    path = _write_modified(tmp_path, "data", "bulk_bars", False)
+    assert load_config(path).data.bulk_bars is False
 
 
 def test_zero_cooldown_allowed(tmp_path: Path) -> None:

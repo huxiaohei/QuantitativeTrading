@@ -127,6 +127,7 @@ class DataConfig(_Frozen):
     industries_refresh_days: NonNegativeInt
     min_industry_coverage: Share
     max_securities_shrink: Rate
+    bulk_bars: bool  # 每晚日线是否先用一次批量行情（见 docs/data-gaps.md）
 
 
 class ServiceConfig(_Frozen):

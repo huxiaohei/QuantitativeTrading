@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import random
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
@@ -16,6 +17,7 @@ from qt.config import AppConfig, load_config
 from qt.data.akshare_source import AkshareSource
 from qt.data.check import ANOMALY_FILE, KIND_LABELS, scan_history
 from qt.data.schema import SchemaError, Table
+from qt.data.snapshot_check import check_snapshot
 from qt.data.source import DataSource
 from qt.data.store import ParquetStore
 from qt.data.update import (
@@ -28,6 +30,7 @@ from qt.data.update import (
     check_integrity,
     count_delist_missing,
     count_no_bars,
+    format_bulk,
     latest_closed_day,
     load_calendar,
     update_all,
@@ -93,10 +96,19 @@ def run_update(
             store.write(Table.TRADE_DAYS, source.trade_days())
         except Exception as exc:
             raise SharedTableError(f"trade_days 更新失败：{type(exc).__name__}: {exc}") from exc
-        as_of = latest_closed_day(_now(), load_calendar(store))
+        current = _now()
+        as_of = latest_closed_day(current, load_calendar(store))
         typer.echo(f"数据截止日（最近一个已收盘交易日）：{as_of}")
         report = update_all(
-            source, store, cfg, as_of, symbols, progress, progress_every, refresh_trade_days=False
+            source,
+            store,
+            cfg,
+            as_of,
+            symbols,
+            progress,
+            progress_every,
+            refresh_trade_days=False,
+            now=current,
         )
     except SharedTableError as exc:
         typer.echo(f"共享表更新失败：{exc}")
@@ -118,6 +130,9 @@ def run_update(
         f"更新完成：更新 {report.updated} 只，跳过 {report.skipped} 只，"
         f"失败 {len(report.failed)} 只（其中已退市且无日线 {count_no_bars(report.failed)} 只，"
         f"退市日期缺失被丢弃 {count_delist_missing(report.failed)} 只）；失败明细见 {failures}"
+    )
+    typer.echo(
+        format_bulk(report.bulk_used, report.bulk_bars, report.per_symbol_bars, report.bulk_reason)
     )
 
     problems = [*report.problems, *check_integrity(store, load_calendar(store), as_of, symbols)]
@@ -174,6 +189,36 @@ def check(
 ) -> None:
     """对已存储的全部历史日线做完整性扫描（价格不为正、最高低于最低、复权因子、异常跳变）。"""
     code = run_check(data_dir)
+    if code != 0:
+        raise typer.Exit(code=code)
+
+
+def run_check_snapshot(config: Path, data_dir: Path, sample: int, seed: int | None) -> int:
+    """取一次批量行情与抽样股票的逐只日线逐项核对，返回退出码（有不一致或无法核对时为 1）。"""
+    cfg = _load(config)
+    if cfg is None:
+        return 1
+    try:
+        result = check_snapshot(
+            make_source(cfg), ParquetStore(data_dir), _now(), sample, random.Random(seed)
+        )
+    except (DataIntegrityError, SchemaError, ValueError) as exc:
+        typer.echo(f"无法核对：{exc}")
+        return 1
+    for line in result.lines:
+        typer.echo(line)
+    return 0 if result.ok else 1
+
+
+@data_app.command("check-snapshot")
+def check_snapshot_command(
+    sample: Annotated[int, typer.Option(min=1, help="抽样核对的股票数")] = 30,
+    seed: Annotated[int | None, typer.Option(help="抽样的随机种子，默认每次不同")] = None,
+    config: Annotated[Path, typer.Option(help="配置文件路径")] = Path("config/default.yaml"),
+    data_dir: Annotated[Path, typer.Option(help="数据目录")] = Path("data"),
+) -> None:
+    """只读核对：批量行情与逐只接口同一天的日线是否逐项相同、复权因子是否与沿用值一致。"""
+    code = run_check_snapshot(config, data_dir, sample, seed)
     if code != 0:
         raise typer.Exit(code=code)
 

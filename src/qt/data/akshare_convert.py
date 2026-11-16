@@ -9,7 +9,7 @@ from typing import Any, cast
 import pandas as pd
 
 from qt.data.delist import UNKNOWN_DELIST_DATE
-from qt.data.schema import SCHEMAS, Table, empty_frame, validate
+from qt.data.schema import SCHEMAS, SNAPSHOT_SCHEMA, Table, empty_frame, validate, validate_snapshot
 
 # 证监会行业分类标准（2012）在巨潮表里的分类标准名称
 CSRC_STANDARD = "证监会行业分类标准（2012）"
@@ -214,6 +214,41 @@ def normalize_bars(symbol: str, raw: pd.DataFrame, factor_events: pd.DataFrame) 
     out = out.dropna(subset=["day", "close"]).drop_duplicates("day", keep="last")
     out = out.reset_index(drop=True)
     validate(Table.BARS, out)
+    return out
+
+
+# ---------------------------------------------------------------- 批量行情
+
+# 新浪 stock_zh_a_spot 的列 → 批量行情的列；成交量（股）、成交额（元）与逐只日线单位相同
+_SPOT_COLUMNS = {
+    "今开": "open",
+    "最高": "high",
+    "最低": "low",
+    "最新价": "close",
+    "昨收": "prev_close",
+    "成交量": "volume",
+    "成交额": "amount",
+}
+
+
+def normalize_daily_snapshot(raw: pd.DataFrame) -> pd.DataFrame:
+    """新浪全市场行情（stock_zh_a_spot）→ 批量行情（列见 SNAPSHOT_SCHEMA）。
+
+    代码带交易所前缀（sh600000、sz000001、bj920000），只保留后 6 位；去掉前缀后不是 6 位数字的行
+    丢弃。同一代码出现多次时无法判断哪一行可信，全部丢弃（该股票当晚改走逐只请求）。
+    收盘后“最新价”即当天收盘价。缺列抛 ValueError。
+    """
+    missing = [c for c in ["代码", *_SPOT_COLUMNS] if c not in raw.columns]
+    if missing:
+        raise ValueError(f"批量行情缺少列：{missing}")
+    codes = as_type(raw["代码"], "str").str.strip().str[-6:]
+    data: dict[str, pd.Series] = {"symbol": as_type(codes, "str").reset_index(drop=True)}
+    for source_col, col in _SPOT_COLUMNS.items():
+        data[col] = to_numbers(raw[source_col]).reset_index(drop=True)
+    out = pd.DataFrame(data)[list(SNAPSHOT_SCHEMA)]
+    out = out[out["symbol"].str.fullmatch(r"\d{6}")]
+    out = out.drop_duplicates("symbol", keep=False).reset_index(drop=True)
+    validate_snapshot(out)
     return out
 
 

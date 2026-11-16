@@ -9,7 +9,7 @@
 import logging
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -27,6 +27,7 @@ from qt.data.update import (
     DataIntegrityError,
     SharedTableError,
     check_integrity,
+    format_bulk,
     latest_closed_day,
     load_calendar,
     refresh_bars,
@@ -237,25 +238,46 @@ def _progress(stage: str, done: int, total: int) -> None:
 
 @dataclass(frozen=True)
 class Downloaded:
-    """本次数据更新的目标日与逐只下载失败（symbol -> 错误信息）。"""
+    """本次数据更新的目标日、逐只下载失败（symbol -> 错误信息）与批量行情的使用情况。
+
+    bulk 记入 daily_runs.detail["bulk"]：used（是否用了批量行情）、bars（批量写入只数）、
+    per_symbol（逐只请求日线的只数）、reason（没用的原因）。
+    """
 
     as_of: date
     failed: Mapping[str, str]
+    bulk: Mapping[str, Any] = field(default_factory=dict[str, Any])
 
 
 def _update_data(ctx: RunContext, as_of: date) -> tuple[list[str], Downloaded]:
-    """增量更新到 as_of（交易日历须已刷新），返回 (需要视为数据问题的描述, 下载失败)。"""
+    """增量更新到 as_of（交易日历须已刷新），返回 (需要视为数据问题的描述, 下载失败)。
+
+    当前时间取 ctx.now()，由 update_all 判断能否用批量行情。
+    """
     report = update_all(
-        ctx.source, ctx.store, ctx.cfg, as_of, progress=_progress, refresh_trade_days=False
+        ctx.source,
+        ctx.store,
+        ctx.cfg,
+        as_of,
+        progress=_progress,
+        refresh_trade_days=False,
+        now=ctx.now(),
     )
     _log.info(
-        "数据更新完成：更新 %d 只，跳过 %d 只，失败 %d 只（其中下载出错 %d 只）",
+        "数据更新完成：更新 %d 只，跳过 %d 只，失败 %d 只（其中下载出错 %d 只）；%s",
         report.updated,
         report.skipped,
         len(report.failed),
         len(report.download_failed),
+        format_bulk(report.bulk_used, report.bulk_bars, report.per_symbol_bars, report.bulk_reason),
     )
-    return list(report.problems), Downloaded(as_of, dict(report.download_failed))
+    bulk = {
+        "used": report.bulk_used,
+        "bars": report.bulk_bars,
+        "per_symbol": report.per_symbol_bars,
+        "reason": report.bulk_reason,
+    }
+    return list(report.problems), Downloaded(as_of, dict(report.download_failed), bulk)
 
 
 def _update_target(ctx: RunContext, day: date) -> date:
@@ -274,6 +296,8 @@ def _note_download_failures(ctx: RunContext, run: "_Run", downloaded: Downloaded
     """下载失败的股票记入 detail；有失败时告警管理员（按更新目标日去重，补跑多天只告警一次）。"""
     failed = dict(sorted(downloaded.failed.items()))
     run.detail["download_failed"] = failed
+    if downloaded.bulk:
+        run.detail["bulk"] = dict(downloaded.bulk)
     if not failed:
         return
     lines = [f"{symbol}：{message}" for symbol, message in failed.items()]

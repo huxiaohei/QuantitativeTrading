@@ -73,6 +73,9 @@ class TimedSource:
     def bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
         return self._timed("bars", lambda: self._inner.bars(symbol, start, end))
 
+    def daily_snapshot(self) -> pd.DataFrame:
+        return self._timed("daily_snapshot", self._inner.daily_snapshot)
+
     def dividends(self, symbol: str) -> pd.DataFrame:
         return self._timed("dividends", lambda: self._inner.dividends(symbol))
 

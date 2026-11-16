@@ -696,6 +696,34 @@ def test_runs_command_prints_problems_and_download_failures_in_full(
     assert "600100" in r.stdout and "连接被重置" in r.stdout
 
 
+def test_runs_command_prints_bulk_bars_on_one_line(
+    world: World, db: Session, invoke: Invoke
+) -> None:
+    started = datetime(2026, 11, 13, 18, 0, tzinfo=SH)
+    for day, bulk in (
+        (date(2026, 11, 13), {"used": True, "bars": 3000, "per_symbol": 12, "reason": ""}),
+        (
+            date(2026, 11, 16),
+            {"used": False, "bars": 0, "per_symbol": 3487, "reason": "批量行情获取失败：超时"},
+        ),
+    ):
+        db.add(
+            DailyRun(
+                trade_day=day,
+                status="done",
+                stage="done",
+                started_at=started,
+                finished_at=started,
+                detail={"bulk": bulk},
+            )
+        )
+    db.commit()
+    r = invoke("admin", "runs")
+    assert r.exit_code == 0, r.stdout
+    assert "日线批量行情：已启用，批量写入 3000 只，逐只请求 12 只" in r.stdout
+    assert "日线批量行情：未启用（批量行情获取失败：超时），逐只请求 3487 只" in r.stdout
+
+
 def test_runs_command_shows_outbox_counts(world: World, db: Session, invoke: Invoke) -> None:
     _mail(db, "k1", "pending")
     _mail(db, "k2", "pending")
