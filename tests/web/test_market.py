@@ -3,7 +3,7 @@
 import threading
 import time
 from collections.abc import Collection
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -12,6 +12,9 @@ from sqlalchemy.orm import Session
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig, load_config
 from qt.data.store import ParquetStore
+from qt.db import admin_repo
+from qt.db.models import DailyRun
+from qt.jobs.daily import FINISHED
 from qt.service.accounts import create_subscription, create_user
 from qt.service.actor import CLI
 from qt.service.manual_ops import manual_state, record_holding
@@ -206,3 +209,18 @@ def test_empty_symbol_set_builds_an_empty_panel(world: World) -> None:
     assert "600001" in market.known_symbols()
     with pytest.raises(KeyError):
         market.last_close(world.today, "600001")
+
+
+def test_cache_version_counts_done_with_errors_as_finished(db: Session) -> None:
+    """缓存版本与补跑用同一个"已完成"集合：有使用者出错的那天也算完成。"""
+    moment = datetime(2026, 11, 16, 19, 0, tzinfo=UTC)
+    assert admin_repo.latest_done_day(db) is None
+    for day, status in (
+        (date(2026, 11, 12), "done"),
+        (date(2026, 11, 13), "done_with_errors"),
+        (date(2026, 11, 16), "data_failed"),
+    ):
+        db.add(DailyRun(trade_day=day, status=status, stage="x", started_at=moment, detail={}))
+    db.flush()
+    assert admin_repo.latest_done_day(db) == date(2026, 11, 13)
+    assert set(FINISHED) == {"done", "done_with_errors"}

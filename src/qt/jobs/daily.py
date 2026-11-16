@@ -35,7 +35,14 @@ from qt.data.update import (
     update_all,
 )
 from qt.db import admin_repo, repo
-from qt.db.models import DailyRun, Outbox, Subscription
+from qt.db.models import (
+    RUN_DONE,
+    RUN_DONE_WITH_ERRORS,
+    RUN_FINISHED,
+    DailyRun,
+    Outbox,
+    Subscription,
+)
 from qt.features import FeaturePanel, build_panel
 from qt.jobs.mails import (
     alert_admin,
@@ -57,9 +64,9 @@ _log = logging.getLogger(__name__)
 MARKET_TZ = ZoneInfo("Asia/Shanghai")
 RUNNING = "running"
 DATA_FAILED = "data_failed"
-DONE = "done"
-DONE_WITH_ERRORS = "done_with_errors"
-FINISHED = (DONE, DONE_WITH_ERRORS)
+DONE = RUN_DONE
+DONE_WITH_ERRORS = RUN_DONE_WITH_ERRORS
+FINISHED = RUN_FINISHED
 _MAX_ERROR_CHARS = 500
 _LOOKBACK_SLACK_DAYS = 5  # 跟踪记录回看窗口 = 补记上限 + 这几天
 _MAX_PREVIOUS_RUNS = 20  # daily_runs.detail 里保留的历次运行记录条数

@@ -313,6 +313,12 @@ class Outbox(Base):
     created_at: Mapped[datetime] = _created_at()
 
 
+# 每日运行的"已完成"状态（唯一定义）：补跑不再重跑这些日子，网页行情缓存也按它换版本
+RUN_DONE = "done"
+RUN_DONE_WITH_ERRORS = "done_with_errors"
+RUN_FINISHED = (RUN_DONE, RUN_DONE_WITH_ERRORS)
+
+
 class DailyRun(Base):
     """每日运行记录，以交易日为主键。"""
 
@@ -320,7 +326,7 @@ class DailyRun(Base):
     __table_args__ = (
         _one_of(
             "status",
-            ("running", "data_failed", "done", "done_with_errors"),
+            ("running", "data_failed", *RUN_FINISHED),
             "ck_daily_runs_status",
         ),
     )

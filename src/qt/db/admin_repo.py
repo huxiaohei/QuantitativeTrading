@@ -5,7 +5,7 @@ from datetime import date
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from qt.db.models import DailyRun, Followup, Invite, Outbox, Subscription, User
+from qt.db.models import RUN_FINISHED, DailyRun, Followup, Invite, Outbox, Subscription, User
 
 
 def find_user_by_email(s: Session, email: str) -> User | None:
@@ -84,6 +84,9 @@ def subscription_status_by_user(s: Session) -> dict[int, str]:
 
 
 def latest_done_day(s: Session) -> date | None:
-    """最近一次状态为 done 的每日运行的交易日；还没有则为 None。"""
-    stmt = select(func.max(DailyRun.trade_day)).where(DailyRun.status == "done")
+    """最近一次已完成的每日运行的交易日；还没有则为 None。
+
+    "已完成"是 done 与 done_with_errors，与补跑的判断用同一个定义（RUN_FINISHED）。
+    """
+    stmt = select(func.max(DailyRun.trade_day)).where(DailyRun.status.in_(RUN_FINISHED))
     return s.scalar(stmt)
