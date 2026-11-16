@@ -1,6 +1,8 @@
 """每日运行记录的展示（全站共用，不属于某个使用者）。"""
 
 import json
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, cast
@@ -13,6 +15,7 @@ from qt.db.models import DailyRun
 from qt.service.views.base import RUN_STATUS_LABELS
 
 _DATA_FAILED = "data_failed"
+_TYPE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
 
 @dataclass(frozen=True)
@@ -69,8 +72,43 @@ def _json_text(value: object) -> str:
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
-def reason_lines(detail: dict[str, Any]) -> list[str]:
-    """从每日运行的 detail 里取出失败原因与异常明细。"""
+def _error_type(error: object) -> str:
+    """异常文字（"类型: 消息"）里的类型名；认不出时给一个固定说法。"""
+    head = str(error).split(":", 1)[0].strip()
+    return head if _TYPE_NAME.match(head) else "未知错误"
+
+
+def _recheck_type(text: object) -> str:
+    """ "订阅 3：类型: 消息" -> "订阅 3：类型"（去掉可能带账本内容的消息）。"""
+    head, sep, rest = str(text).partition("：")
+    return f"{head}：{_error_type(rest)}" if sep else _error_type(text)
+
+
+def _per_user_lines(
+    items: list[dict[str, Any]], what: str, emails: Mapping[int, str] | None
+) -> list[str]:
+    """使用者处理出错的各行。emails 给出时（网页管理页）只写邮箱与异常类型，
+
+    不写异常消息（消息里可能有账本内容；完整文字在 worker 日志与告警邮件里）。
+    """
+    lines: list[str] = []
+    for item in items:
+        if emails is None:
+            who, error = item.get("user_id"), item.get("error")
+        else:
+            user_id = item.get("user_id")
+            who = emails.get(user_id, f"#{user_id}") if isinstance(user_id, int) else "未知"
+            error = _error_type(item.get("error"))
+        lines.append(f"使用者 {who}（订阅 {item.get('subscription_id')}）{what}：{error}")
+    return lines
+
+
+def reason_lines(detail: dict[str, Any], *, emails: Mapping[int, str] | None = None) -> list[str]:
+    """从每日运行的 detail 里取出失败原因与异常明细。
+
+    emails（使用者编号 -> 邮箱）给出时，使用者处理出错只显示邮箱与异常类型（网页管理页用）；
+    不给时显示完整的异常文字（命令行用）。
+    """
     lines: list[str] = []
     error = detail.get("error")
     if error:
@@ -96,11 +134,8 @@ def reason_lines(detail: dict[str, Any]) -> list[str]:
     retried = detail.get("bars_retried")
     if retried:
         lines.append(f"缺当日日线、已再下载一次：{_json_text(retried)}")
-    for item in cast("list[dict[str, Any]]", detail.get("user_errors") or []):
-        lines.append(
-            f"使用者 {item.get('user_id')}（订阅 {item.get('subscription_id')}）处理出错："
-            f"{item.get('error')}"
-        )
+    user_errors = cast("list[dict[str, Any]]", detail.get("user_errors") or [])
+    lines.extend(_per_user_lines(user_errors, "处理出错", emails))
     labels = {
         "followups_error": "跟踪记录回填出错",
         "mail_error": "邮件发送出错",
@@ -110,6 +145,14 @@ def reason_lines(detail: dict[str, Any]) -> list[str]:
     }
     for key, label in labels.items():
         value = detail.get(key)
+        if key == "weekly_errors" and emails is not None and isinstance(value, list):
+            lines.extend(_per_user_lines(cast("list[dict[str, Any]]", value), "周报出错", emails))
+            continue
+        if key == "recheck_errors" and emails is not None and isinstance(value, list):
+            lines.append(
+                f"{label}：" + "；".join(_recheck_type(v) for v in cast("list[Any]", value))
+            )
+            continue
         if value:
             lines.append(f"{label}：{value if isinstance(value, str) else _json_text(value)}")
     mail = detail.get("mail")
@@ -119,9 +162,13 @@ def reason_lines(detail: dict[str, Any]) -> list[str]:
     return lines
 
 
-def recent_runs(s: Session, limit: int) -> RunsView:
-    """最近 limit 个交易日的每日运行（管理员看的运行记录），附发件箱待发与失败数。"""
+def recent_runs(s: Session, limit: int, *, hide_error_messages: bool = False) -> RunsView:
+    """最近 limit 个交易日的每日运行（管理员看的运行记录），附发件箱待发与失败数。
+
+    hide_error_messages 为真（网页管理页）时，使用者处理出错只显示邮箱与异常类型。
+    """
     counts = admin_repo.count_outbox_by_status(s)
+    emails = {u.id: u.email for u in admin_repo.list_users(s)} if hide_error_messages else None
     runs = [
         RunDetail(
             day=run.trade_day,
@@ -131,7 +178,7 @@ def recent_runs(s: Session, limit: int) -> RunsView:
             started_at=run.started_at,
             finished_at=run.finished_at,
             data_ok=run.status != _DATA_FAILED,
-            reasons=reason_lines(run.detail),
+            reasons=reason_lines(run.detail, emails=emails),
         )
         for run in admin_repo.list_recent_runs(s, limit)
     ]

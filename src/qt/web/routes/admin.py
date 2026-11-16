@@ -184,9 +184,14 @@ def users_enable(
 # ---- 运行记录与重试 ----
 
 
+def _can_retry(deps: WebDeps, s: Session) -> bool:
+    return reruns.has_unfinished_day(s, deps.calendar(), deps.now(), deps.cfg.service.run_time)
+
+
 def _runs_page(
     request: Request,
     found: Current,
+    deps: WebDeps,
     s: Session,
     *,
     flash: str | None = None,
@@ -196,8 +201,10 @@ def _runs_page(
     context: dict[str, object] = {
         "active": "admin",
         "section": "runs",
-        "view": views.recent_runs(s, RUNS_SHOWN),
+        "view": views.recent_runs(s, RUNS_SHOWN, hide_error_messages=True),
         "rerun": reruns.status_text(reruns.latest(s)),
+        "rerun_pending": reruns.has_pending(s),
+        "can_retry": _can_retry(deps, s),
         "flash": flash,
         "error": error,
     }
@@ -206,15 +213,15 @@ def _runs_page(
 
 @route(router, "GET", "/admin/runs", "admin")
 def runs_page(
-    request: Request, found: CurrentUser, s: DbSession, msg: str | None = None
+    request: Request, found: CurrentUser, deps: Deps, s: DbSession, msg: str | None = None
 ) -> Response:
-    return _runs_page(request, found, s, flash=FLASH_MESSAGES.get(msg or ""))
+    return _runs_page(request, found, deps, s, flash=FLASH_MESSAGES.get(msg or ""))
 
 
 @route(router, "POST", "/admin/runs/retry", "admin")
 def runs_retry(request: Request, found: CurrentUser, deps: Deps, s: DbSession) -> Response:
-    if not reruns.has_unfinished_day(s, deps.calendar(), deps.now(), deps.cfg.service.run_time):
-        return _runs_page(request, found, s, error=NOTHING_TO_RETRY, status_code=422)
+    if not _can_retry(deps, s):
+        return _runs_page(request, found, deps, s, error=NOTHING_TO_RETRY, status_code=422)
     reruns.request(s, found.user.id, deps.now())
     return _redirect("/admin/runs", "retry_requested")
 

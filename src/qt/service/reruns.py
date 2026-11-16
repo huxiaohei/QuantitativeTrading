@@ -52,6 +52,11 @@ def request(s: Session, admin_id: int, now: datetime) -> RerunRequest:
     return row
 
 
+def has_pending(s: Session) -> bool:
+    """是否有还没处理完的重试请求（worker 正在处理或等待处理）。"""
+    return _oldest_pending(s) is not None
+
+
 def take_pending(s: Session) -> RerunRequest | None:
     """最早的一条未处理请求；没有返回 None。不改状态，处理完要调用 finish。"""
     return _oldest_pending(s)

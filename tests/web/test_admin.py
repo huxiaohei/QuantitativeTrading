@@ -2,7 +2,7 @@
 
 import re
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx2 as httpx
@@ -192,6 +192,25 @@ def test_users_page_lists_only_account_facts(
     user = make_user(USER)
     make_user("fresh@example.com", verified=False)
     sub = accounts.create_subscription(db, user.id, CFG, float(MARKER), MONDAY, actor=CLI)
+    # 使用者处理出错的异常文字里带着账本内容：管理页只显示异常类型与邮箱
+    failure = {
+        "user_id": user.id,
+        "subscription_id": sub.id,
+        "error": f"LedgerInconsistentError: 现金 {MARKER} 与流水对不上",
+    }
+    db.add(
+        DailyRun(
+            trade_day=FRIDAY,
+            status="done_with_errors",
+            stage="done",
+            started_at=datetime(2026, 11, 13, 19, 0, tzinfo=UTC),
+            detail={
+                "user_errors": [failure],
+                "weekly_errors": [failure],
+                "recheck_errors": [f"订阅 {sub.id}：{failure['error']}"],
+            },
+        )
+    )
     db.commit()
     assert sub.initial_cash == float(MARKER)
     pages = [client.get(p).text for p in ("/admin/users", "/admin/runs", "/admin/invites")]
@@ -200,6 +219,11 @@ def test_users_page_lists_only_account_facts(
     users = pages[0]
     assert USER in users and "fresh@example.com" in users
     assert "生效中" in users and "未验证" in users
+    runs = pages[1]
+    assert f"使用者 {USER}（订阅 {sub.id}）处理出错：LedgerInconsistentError" in runs
+    assert f"使用者 {USER}（订阅 {sub.id}）周报出错：LedgerInconsistentError" in runs
+    assert f"基本面复核出错：订阅 {sub.id}：LedgerInconsistentError" in runs
+    assert "与流水对不上" not in runs
 
 
 # ---- 运行记录与重试 ----
@@ -245,6 +269,23 @@ def test_runs_page_shows_failure_reason_outbox_and_retry_state(
     assert len(list(db.scalars(select(RerunRequest)))) == 1
     audit = db.scalars(select(AuditLog).where(AuditLog.action == "rerun_request")).one()
     assert audit.channel == "web" and audit.actor_user_id == admin_id
+
+
+def test_retry_button_only_when_something_is_unfinished(
+    client: TestClient, make_user: MakeUser, db: Session, clock: Clock
+) -> None:
+    admin_id = _admin(client, make_user)
+    page = client.get("/admin/runs").text
+    assert "没有未完成的交易日" in page and 'action="/admin/runs/retry"' not in page
+    clock.advance(timedelta(hours=10))  # 19:00，周一已到运行时间、还没有运行记录
+    accounts.create_subscription(db, admin_id, CFG, 1000.0, MONDAY, actor=CLI)
+    db.commit()
+    page = client.get("/admin/runs").text
+    assert 'action="/admin/runs/retry"' in page and "没有未完成的交易日" not in page
+    assert _post(client, "/admin/runs/retry").status_code == 303
+    page = client.get("/admin/runs").text
+    assert "已请求，worker 正在处理或等待处理" in page
+    assert 'action="/admin/runs/retry"' not in page
 
 
 def test_retry_with_nothing_unfinished_is_422(

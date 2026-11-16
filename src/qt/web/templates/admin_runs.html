@@ -9,10 +9,16 @@
   <h2>立即重试</h2>
   <p>有交易日没有跑完时（例如数据异常），可以请求 worker 马上再补跑一次，不用等下一个节拍。</p>
   <p>最近一次请求：{{ rerun }}</p>
+  {% if rerun_pending %}
+  <p>已请求，worker 正在处理或等待处理</p>
+  {% elif can_retry %}
   <form method="post" action="/admin/runs/retry" class="inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit" class="primary">立即重试</button>
   </form>
+  {% else %}
+  <p>没有未完成的交易日</p>
+  {% endif %}
 </section>
 <section class="card">
   <h2>发件箱</h2>
