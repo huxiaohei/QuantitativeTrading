@@ -472,3 +472,20 @@ def test_logout(client: TestClient, make_user: MakeUser, db_engine: Engine) -> N
     after = client.get("/overview", follow_redirects=False)
     assert after.status_code == 303
     assert after.headers["location"] == "/login?next=%2Foverview"
+
+
+def test_logout_after_session_extension_clears_cookie(
+    client: TestClient, make_user: MakeUser, clock: Clock
+) -> None:
+    make_user("foo@example.com")
+    login_as(client, "foo@example.com")
+    page = client.get("/overview")
+    clock.advance(timedelta(minutes=6))  # 本次请求会顺延会话，中间件会想刷新 Cookie
+    resp = client.post("/logout", data={"csrf": csrf_of(page)}, follow_redirects=False)
+    assert resp.status_code == 303
+    session_cookies = [
+        h for h in resp.headers.get_list("set-cookie") if h.startswith("__Host-qt_session=")
+    ]
+    assert len(session_cookies) == 1, session_cookies
+    assert "max-age=0" in session_cookies[0].lower()
+    assert client.get("/overview", follow_redirects=False).status_code == 303

@@ -85,8 +85,14 @@ class SecurityMiddleware:
                                 secure=deps.secure,
                             ),
                         )
+                    # 响应自己已经设置了会话 Cookie（登录、退出、以后的改密码等）时以它为准，
+                    # 不再追加顺延：浏览器按顺序处理，后一条会把清掉的旧令牌又写回去
                     refresh = getattr(state, "refresh_session", None)
-                    if isinstance(refresh, str):
+                    prefix = deps.session_cookie + "="
+                    sets_session = any(
+                        value.startswith(prefix) for value in headers.getlist("set-cookie")
+                    )
+                    if isinstance(refresh, str) and not sets_session:
                         headers.append("Set-Cookie", refresh)
             await send(message)
 
