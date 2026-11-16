@@ -72,6 +72,9 @@ services:
       DATABASE_URL: postgresql+psycopg://qt:${POSTGRES_PASSWORD:-qt}@db:5432/qt
       QT_DATA_DIR: /app/data
       MAIL_FILE_DIR: /app/mail_out
+      # .env 里的 HTTP_PROXY / HTTPS_PROXY 会传进容器；回环地址和数据库不应走代理
+      NO_PROXY: 127.0.0.1,localhost,db
+      no_proxy: 127.0.0.1,localhost,db
     volumes:
       # 行情数据只读：网页不写数据
       - ${QT_DATA_DIR:-./data}:/app/data:ro
@@ -81,12 +84,12 @@ services:
     command: ["qt", "web", "--host", "0.0.0.0", "--port", "8000"]
     mem_limit: 1500m
     healthcheck:
-      # 镜像里没有 curl，用 Python 请求 /healthz
+      # 镜像里没有 curl，用 Python 请求 /healthz；空 ProxyHandler 让请求不受 HTTP_PROXY 影响
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+        - "import urllib.request as r; r.build_opener(r.ProxyHandler({})).open('http://127.0.0.1:8000/healthz', timeout=3)"
       interval: 30s
       timeout: 5s
       retries: 3

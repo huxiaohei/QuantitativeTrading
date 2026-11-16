@@ -67,6 +67,10 @@ docker compose ps        # db healthy，migrate Exited (0)，worker、web、prox
 
 第一次会构建镜像并申请证书，需要几分钟。之后用浏览器打开 `https://<你的域名>/login`，应看到登录页。
 
+如果 `proxy` 启动后立刻退出，首先检查 `.env` 里是否设置了 `QT_SITE`：站点地址为空时 Caddy 的报错不好懂。
+检查网页是否可访问时不要用 `curl -I`（HEAD 请求，`/login` 会返回 405），改用
+`curl -s -o /dev/null -w '%{http_code}' https://<你的域名>/login`，或请求 `/healthz`。
+
 注意：必须带 `--profile public`，否则不会启动 `proxy`。`docker compose up -d`（不带档位）不会启动 `proxy`。
 
 ## 5. 第一个管理员与邀请码

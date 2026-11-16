@@ -60,3 +60,12 @@ def test_caddyfile_不含域名常量且不开访问日志() -> None:
     assert "{$QT_SITE}" in text
     code = [ln.strip() for ln in text.splitlines() if not ln.strip().startswith("#")]
     assert not any(ln.startswith("log") for ln in code)
+
+
+def test_web_健康检查不走代理且NO_PROXY含回环地址() -> None:
+    web = _service("web")
+    health = cast(dict[str, object], web["healthcheck"])
+    assert "ProxyHandler" in " ".join(_list(health["test"]))
+    env = cast(dict[str, object], web["environment"])
+    for key in ("NO_PROXY", "no_proxy"):
+        assert "127.0.0.1" in str(env[key]).split(",")
