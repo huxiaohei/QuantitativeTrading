@@ -363,7 +363,8 @@ def _prepare_bulk(
 
     批量行情最多请求一次、失败不重试。整体闸门：配置开启、调用方给了当前时间且在有效时段内、
     请求成功；可比对的股票（库里最后一根是前一交易日、批量行情里有它）中没有成交的不超过
-    SNAPSHOT_MAX_NO_TRADE；有成交的可比对股票不少于本次要更新的在市股票的 SNAPSHOT_MIN_COVERAGE；
+    SNAPSHOT_MAX_NO_TRADE；有成交的可比对股票不少于本次要更新、还没有 as_of 日线的
+    在市股票的 SNAPSHOT_MIN_COVERAGE；
     其中昨收对得上的比例不低于 SNAPSHOT_MIN_MATCH。没有任何要处理的股票停在前一交易日时不请求。
     """
     if not cfg.data.bulk_bars:
@@ -401,11 +402,11 @@ def _prepare_bulk(
             "批量行情可能被清零或不完整"
         )
     matched, total = prev_close_matches(quotes, {s: c for s, (c, _) in prev_bars.items()})
-    needed = SNAPSHOT_MIN_COVERAGE * len(listed_wanted)
-    if total == 0 or total < needed:
+    pending = sum(1 for s in listed_wanted if s not in done)
+    if total == 0 or total < SNAPSHOT_MIN_COVERAGE * pending:
         return None, (
-            f"有成交的可比对股票只有 {total} 只，不到本次要更新的在市股票"
-            f" {len(listed_wanted)} 只的 {SNAPSHOT_MIN_COVERAGE:.0%}，样本太小"
+            f"有成交的可比对股票只有 {total} 只，不到还没有 {as_of} 日线的在市股票"
+            f" {pending} 只的 {SNAPSHOT_MIN_COVERAGE:.0%}，样本太小"
         )
     if matched / total < SNAPSHOT_MIN_MATCH:
         return None, (

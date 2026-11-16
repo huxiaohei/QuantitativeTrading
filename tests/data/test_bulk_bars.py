@@ -517,6 +517,20 @@ def test_small_comparable_sample_falls_back(tmp_path: Path) -> None:
     assert sorted(_bars_symbols(source)) == _symbols(10)
 
 
+def test_resumed_night_still_uses_snapshot_for_the_rest(tmp_path: Path) -> None:
+    market = _market(10)
+    store = _store(tmp_path, market)
+    for symbol in _symbols(10)[4:]:  # 6 只已经有 as_of 的日线（中断后续跑）：不计入分母
+        own = market[market["symbol"] == symbol]
+        store.write(Table.BARS, own.reset_index(drop=True), symbol)
+    source = _source(market, _snapshot(market))
+    report = _run(source, store)
+    assert report.bulk_used
+    assert _bars_symbols(source) == []
+    latest = store.read(Table.BARS, start=AS_OF, end=AS_OF)
+    assert sorted(latest["symbol"].tolist()) == _symbols(10)
+
+
 def test_all_zero_pre_open_snapshot_falls_back(tmp_path: Path) -> None:
     market = _market(5)
     store = _store(tmp_path, market)
