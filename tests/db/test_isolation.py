@@ -17,6 +17,7 @@ from qt.service.accounts import (
     resume_subscription,
     update_params,
 )
+from qt.service.actor import CLI
 from qt.service.errors import NotFoundError
 
 CFG: AppConfig = load_config(Path(__file__).resolve().parents[2] / "config" / "default.yaml")
@@ -24,10 +25,10 @@ DAY = date(2026, 11, 16)
 
 
 def test_repo_functions_refuse_other_users_rows(db: Session) -> None:
-    user_a = create_user(db, "a@example.com")
-    user_b = create_user(db, "b@example.com")
-    sub_a = create_subscription(db, user_a.id, CFG, 1e5, DAY)
-    create_subscription(db, user_b.id, CFG, 1e5, DAY)
+    user_a = create_user(db, "a@example.com", actor=CLI)
+    user_b = create_user(db, "b@example.com", actor=CLI)
+    sub_a = create_subscription(db, user_a.id, CFG, 1e5, DAY, actor=CLI)
+    create_subscription(db, user_b.id, CFG, 1e5, DAY, actor=CLI)
     with pytest.raises(NotFoundError):
         repo.get_subscription(db, user_b.id, sub_a.id)
     with pytest.raises(NotFoundError):
@@ -35,21 +36,21 @@ def test_repo_functions_refuse_other_users_rows(db: Session) -> None:
     with pytest.raises(NotFoundError):
         repo.list_param_changes(db, user_b.id, sub_a.id)
     with pytest.raises(NotFoundError):
-        update_params(db, user_b.id, sub_a.id, CFG, {"strategy.stop_loss": 0.1}, DAY)
+        update_params(db, user_b.id, sub_a.id, CFG, {"strategy.stop_loss": 0.1}, DAY, actor=CLI)
     with pytest.raises(NotFoundError):
-        pause_subscription(db, user_b.id, sub_a.id)
+        pause_subscription(db, user_b.id, sub_a.id, actor=CLI)
     with pytest.raises(NotFoundError):
-        resume_subscription(db, user_b.id, sub_a.id)
+        resume_subscription(db, user_b.id, sub_a.id, actor=CLI)
     with pytest.raises(NotFoundError):
-        close_subscription(db, user_b.id, sub_a.id)
+        close_subscription(db, user_b.id, sub_a.id, actor=CLI)
     # 数据没有被动过
     assert repo.get_subscription(db, user_a.id, sub_a.id).status == "active"
 
 
 def test_get_book_refuses_other_users_book(db: Session) -> None:
-    user_a = create_user(db, "a@example.com")
-    user_b = create_user(db, "b@example.com")
-    sub_a = create_subscription(db, user_a.id, CFG, 1e5, DAY)
+    user_a = create_user(db, "a@example.com", actor=CLI)
+    user_b = create_user(db, "b@example.com", actor=CLI)
+    sub_a = create_subscription(db, user_a.id, CFG, 1e5, DAY, actor=CLI)
     book = repo.list_books(db, user_a.id, sub_a.id)[0]
     assert repo.get_book(db, user_a.id, book.id).id == book.id
     with pytest.raises(NotFoundError):
@@ -59,9 +60,9 @@ def test_get_book_refuses_other_users_book(db: Session) -> None:
 
 
 def test_book_listings_refuse_other_users_book(db: Session) -> None:
-    user_a = create_user(db, "a@example.com")
-    user_b = create_user(db, "b@example.com")
-    sub_a = create_subscription(db, user_a.id, CFG, 1e5, DAY)
+    user_a = create_user(db, "a@example.com", actor=CLI)
+    user_b = create_user(db, "b@example.com", actor=CLI)
+    sub_a = create_subscription(db, user_a.id, CFG, 1e5, DAY, actor=CLI)
     book = repo.list_books(db, user_a.id, sub_a.id)[0]
     listings = (
         repo.list_ledger_entries,
@@ -78,11 +79,11 @@ def test_book_listings_refuse_other_users_book(db: Session) -> None:
 
 
 def test_admin_repo_lists_across_users(db: Session) -> None:
-    user_a = create_user(db, "a@example.com")
-    user_b = create_user(db, "b@example.com")
-    create_subscription(db, user_a.id, CFG, 1e5, DAY)
-    sub_b = create_subscription(db, user_b.id, CFG, 1e5, DAY)
-    pause_subscription(db, user_b.id, sub_b.id)
+    user_a = create_user(db, "a@example.com", actor=CLI)
+    user_b = create_user(db, "b@example.com", actor=CLI)
+    create_subscription(db, user_a.id, CFG, 1e5, DAY, actor=CLI)
+    sub_b = create_subscription(db, user_b.id, CFG, 1e5, DAY, actor=CLI)
+    pause_subscription(db, user_b.id, sub_b.id, actor=CLI)
     assert {s.user_id for s in admin_repo.list_active_subscriptions(db)} == {user_a.id}
     assert {u.email for u in admin_repo.list_users(db)} == {"a@example.com", "b@example.com"}
     found = admin_repo.find_user_by_email(db, "A@Example.com")

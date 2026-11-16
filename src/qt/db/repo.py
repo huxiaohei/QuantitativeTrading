@@ -26,6 +26,7 @@ from qt.db.models import (
     Trade,
     User,
 )
+from qt.service.actor import Actor
 from qt.service.errors import NotFoundError
 
 
@@ -198,10 +199,21 @@ def list_param_changes(s: Session, user_id: int, subscription_id: int) -> list[P
 
 
 def add_audit(
-    s: Session, user_id: int, action: str, target: str, detail: Mapping[str, Any]
+    s: Session,
+    user_id: int,
+    action: str,
+    target: str,
+    detail: Mapping[str, Any],
+    actor: Actor,
 ) -> AuditLog:
-    """写一条审计日志，user_id 为操作者。"""
-    entry = AuditLog(actor_user_id=user_id, action=action, target=target, detail=dict(detail))
+    """写一条审计日志：user_id 是被操作的使用者（记入 detail），actor 记录操作人与渠道。"""
+    entry = AuditLog(
+        actor_user_id=actor.user_id,
+        channel=actor.channel,
+        action=action,
+        target=target,
+        detail={**detail, "user_id": user_id},
+    )
     s.add(entry)
     s.flush()
     return entry

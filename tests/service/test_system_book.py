@@ -39,6 +39,7 @@ from qt.service.accounts import (
     subscription_config,
     update_params,
 )
+from qt.service.actor import CLI
 from qt.service.errors import ValidationError
 from qt.service.signals import SignalStatus, mark_signal, record_rejection
 from qt.service.system_book import advance_system_book
@@ -113,8 +114,8 @@ def variant(tmp_path_factory: pytest.TempPathFactory) -> Market:
 def _subscribe(
     db: Session, start: date, overrides: dict[str, object] | None = None
 ) -> Subscription:
-    user = create_user(db, "sys@example.com")
-    return create_subscription(db, user.id, CFG, CASH, start, overrides)
+    user = create_user(db, "sys@example.com", actor=CLI)
+    return create_subscription(db, user.id, CFG, CASH, start, overrides, actor=CLI)
 
 
 def _system_book(db: Session, sub: Subscription) -> Book:
@@ -350,7 +351,7 @@ def test_param_change_takes_effect_from_next_advance_without_resetting_book(
     ret = pos.ret(plain.panel.last_close(next_day, "600002"))
     assert -0.15 < ret <= -0.10  # 默认止损线 15% 不触发，10% 触发
 
-    update_params(db, sub.user_id, sub.id, CFG, {"strategy.stop_loss": 0.10}, next_day)
+    update_params(db, sub.user_id, sub.id, CFG, {"strategy.stop_loss": 0.10}, next_day, actor=CLI)
     db.commit()
     _advance(db, sub, plain, [next_day])
 

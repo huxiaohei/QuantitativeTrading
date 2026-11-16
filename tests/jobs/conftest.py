@@ -20,6 +20,7 @@ from qt.db import repo
 from qt.db.models import DailyRun, Signal, Subscription
 from qt.jobs.daily import RunContext
 from qt.service.accounts import create_subscription, create_user
+from qt.service.actor import CLI
 from tests.fakes import FakeSource, populate_trading_store
 
 CFG: AppConfig = load_config(Path(__file__).resolve().parents[2] / "config" / "default.yaml")
@@ -124,8 +125,8 @@ def subscribe(
     start: date,
     overrides: dict[str, object] | None = None,
 ) -> Subscription:
-    user = create_user(db, email)
-    sub = create_subscription(db, user.id, CFG, CASH, start, overrides)
+    user = create_user(db, email, actor=CLI)
+    sub = create_subscription(db, user.id, CFG, CASH, start, overrides, actor=CLI)
     db.commit()
     return sub
 

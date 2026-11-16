@@ -18,6 +18,7 @@ from qt.backtest.sweep import override
 from qt.config import AppConfig, RiskConfig, StrategyConfig
 from qt.db import admin_repo, repo
 from qt.db.models import Book, ParamChange, Subscription, User
+from qt.service.actor import Actor
 from qt.service.errors import ValidationError
 
 STRATEGY_NAME = "high_dividend_low_position"
@@ -99,7 +100,7 @@ def _valid_email(address: str) -> bool:
     return len(labels) >= 2 and all(labels)
 
 
-def create_user(s: Session, email: str, is_admin: bool = False) -> User:
+def create_user(s: Session, email: str, is_admin: bool = False, *, actor: Actor) -> User:
     """注册使用者；邮箱转小写，重复或格式不对时抛 ValidationError。
 
     邮箱之后会作为收件人，也会被打印进给使用者的命令里，所以格式在这里严格检查。
@@ -115,16 +116,16 @@ def create_user(s: Session, email: str, is_admin: bool = False) -> User:
             s.add(user)
     except IntegrityError as exc:
         raise ValidationError("该邮箱已注册") from exc
-    repo.add_audit(s, user.id, "user.create", f"user:{user.id}", {"is_admin": is_admin})
+    repo.add_audit(s, user.id, "user.create", f"user:{user.id}", {"is_admin": is_admin}, actor)
     return user
 
 
-def set_weekly_mail(s: Session, user_id: int, enabled: bool) -> User:
+def set_weekly_mail(s: Session, user_id: int, enabled: bool, *, actor: Actor) -> User:
     """开关使用者的周报邮件，并写审计日志。"""
     user = repo.get_user(s, user_id)
     user.weekly_mail = enabled
     s.flush()
-    repo.add_audit(s, user_id, "user.weekly_mail", f"user:{user_id}", {"enabled": enabled})
+    repo.add_audit(s, user_id, "user.weekly_mail", f"user:{user_id}", {"enabled": enabled}, actor)
     return user
 
 
@@ -135,6 +136,8 @@ def create_subscription(
     initial_cash: float,
     start_day: date,
     overrides: Mapping[str, object] | None = None,
+    *,
+    actor: Actor,
 ) -> Subscription:
     """为使用者建立订阅，同时建立系统账与手动账。每人同时只能有一个未关闭的订阅。"""
     user = repo.get_user(s, user_id)
@@ -166,6 +169,7 @@ def create_subscription(
         "subscription.create",
         f"subscription:{sub.id}",
         {"initial_cash": initial_cash, "start_day": start_day.isoformat(), "params": sub.params},
+        actor,
     )
     return sub
 
@@ -177,6 +181,8 @@ def update_params(
     cfg: AppConfig,
     overrides: Mapping[str, object],
     effective_day: date,
+    *,
+    actor: Actor,
 ) -> Subscription:
     """修改订阅参数，保留修改前后的完整快照；账本与历史不动。"""
     sub = repo.get_subscription(s, user_id, subscription_id)
@@ -209,12 +215,19 @@ def update_params(
             },
             "effective_day": effective_day.isoformat(),
         },
+        actor,
     )
     return sub
 
 
 def _transition(
-    s: Session, user_id: int, subscription_id: int, allowed: tuple[str, ...], to: str, action: str
+    s: Session,
+    user_id: int,
+    subscription_id: int,
+    allowed: tuple[str, ...],
+    to: str,
+    action: str,
+    actor: Actor,
 ) -> None:
     sub = repo.get_subscription(s, user_id, subscription_id)
     if sub.status not in allowed:
@@ -223,19 +236,21 @@ def _transition(
     if to == "closed":
         sub.closed_at = _now()
     s.flush()
-    repo.add_audit(s, user_id, action, f"subscription:{sub.id}", {"to": to})
+    repo.add_audit(s, user_id, action, f"subscription:{sub.id}", {"to": to}, actor)
 
 
-def pause_subscription(s: Session, user_id: int, subscription_id: int) -> None:
+def pause_subscription(s: Session, user_id: int, subscription_id: int, *, actor: Actor) -> None:
     """暂停生效中的订阅。"""
-    _transition(s, user_id, subscription_id, ("active",), "paused", "subscription.pause")
+    _transition(s, user_id, subscription_id, ("active",), "paused", "subscription.pause", actor)
 
 
-def resume_subscription(s: Session, user_id: int, subscription_id: int) -> None:
+def resume_subscription(s: Session, user_id: int, subscription_id: int, *, actor: Actor) -> None:
     """恢复已暂停的订阅。"""
-    _transition(s, user_id, subscription_id, ("paused",), "active", "subscription.resume")
+    _transition(s, user_id, subscription_id, ("paused",), "active", "subscription.resume", actor)
 
 
-def close_subscription(s: Session, user_id: int, subscription_id: int) -> None:
+def close_subscription(s: Session, user_id: int, subscription_id: int, *, actor: Actor) -> None:
     """关闭订阅（不可恢复）；账本与历史保留。"""
-    _transition(s, user_id, subscription_id, ("active", "paused"), "closed", "subscription.close")
+    _transition(
+        s, user_id, subscription_id, ("active", "paused"), "closed", "subscription.close", actor
+    )

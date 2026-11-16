@@ -23,6 +23,7 @@ from qt.db.models import Rejection as RejectionRow
 from qt.features import build_panel
 from qt.models import Side
 from qt.service.accounts import create_subscription, create_user, update_params
+from qt.service.actor import CLI
 from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
 from qt.service.manual_ops import (
     ManualDayResult,
@@ -108,8 +109,8 @@ def _subscribe(
     overrides: dict[str, object] | None = None,
     email: str = "manual@example.com",
 ) -> Subscription:
-    user = create_user(db, email)
-    sub = create_subscription(db, user.id, CFG, CASH, w.days[S], overrides)
+    user = create_user(db, email, actor=CLI)
+    sub = create_subscription(db, user.id, CFG, CASH, w.days[S], overrides, actor=CLI)
     db.commit()
     return sub
 
@@ -150,6 +151,7 @@ def _holding(
         w.days[today - 30],
         cost,
         shares,
+        actor=CLI,
     )
     db.commit()
     return entry
@@ -181,6 +183,7 @@ def _trade(
         price,
         shares,
         fees,
+        actor=CLI,
     )
     db.commit()
     return entry
@@ -267,6 +270,7 @@ def test_explicit_fees_are_kept_and_cash_entries_recorded(db: Session, plain: Wo
         "deposit",
         plain.days[S],
         5000.0,
+        actor=CLI,
     )
     assert dep.kind == "deposit" and dep.price == 5000.0 and dep.symbol is None
     state = manual_state(
@@ -337,6 +341,7 @@ def test_deposit_repairs_inconsistent_ledger(db: Session, plain: World) -> None:
         "deposit",
         plain.days[S],
         5_000.0,
+        actor=CLI,
     )
     db.commit()
     state = manual_state(
@@ -466,6 +471,7 @@ def test_void_and_rerecord_keeps_signal_link_and_cooldown(db: Session, plain: Wo
         plain.cfg,
         plain.days[S + 1],
         wrong.id,
+        actor=CLI,
     )
     db.commit()
     # 更正后重新录入：仍关联原信号（信号保持已执行，不再改状态）
@@ -496,6 +502,7 @@ def test_voided_sell_does_not_link_stale_signal_after_bound(db: Session, plain: 
         plain.cfg,
         plain.days[S + 1],
         linked.id,
+        actor=CLI,
     )
     db.commit()
     bound = plain.calendar.offset(plain.days[S + 1], CFG.service.signal_valid_days)
@@ -523,6 +530,7 @@ def test_void_and_rerecord_buy_keeps_signal_link(db: Session, plain: World) -> N
         plain.cfg,
         plain.days[S + 1],
         wrong.id,
+        actor=CLI,
     )
     db.commit()
     fixed = _trade(db, sub, plain, Side.BUY, "600001", S + 1, 10.0, 800)
@@ -703,7 +711,15 @@ def test_void_entry_appends_void_and_rewrites_state(db: Session, plain: World) -
     book = _manual_book(db, sub)
     [cash_before] = db.scalars(select(BookDay.cash).where(BookDay.book_id == book.id))
     v = void_entry(
-        db, sub.user_id, sub.id, plain.market, plain.calendar, plain.cfg, plain.days[S], buy.id
+        db,
+        sub.user_id,
+        sub.id,
+        plain.market,
+        plain.calendar,
+        plain.cfg,
+        plain.days[S],
+        buy.id,
+        actor=CLI,
     )
     db.commit()
     assert v.kind == "void" and v.voids_entry_id == buy.id
@@ -714,7 +730,15 @@ def test_void_entry_appends_void_and_rewrites_state(db: Session, plain: World) -
     assert len(entries) == 2  # 原记录保留
     with pytest.raises(ValidationError, match="已作废"):
         void_entry(
-            db, sub.user_id, sub.id, plain.market, plain.calendar, plain.cfg, plain.days[S], buy.id
+            db,
+            sub.user_id,
+            sub.id,
+            plain.market,
+            plain.calendar,
+            plain.cfg,
+            plain.days[S],
+            buy.id,
+            actor=CLI,
         )
 
 
@@ -766,14 +790,16 @@ def test_other_user_cannot_record_or_void(db: Session, plain: World) -> None:
     other_id = other_sub.user_id
     m, cal, cfg, today = plain.market, plain.calendar, plain.cfg, plain.days[S]
     with pytest.raises(NotFoundError):
-        record_trade(db, other_id, sub.id, m, cal, cfg, today, Side.BUY, "600001", today, 10, 100)
+        record_trade(
+            db, other_id, sub.id, m, cal, cfg, today, Side.BUY, "600001", today, 10, 100, actor=CLI
+        )
     with pytest.raises(NotFoundError):
-        void_entry(db, other_id, sub.id, m, cal, cfg, today, entry.id)
+        void_entry(db, other_id, sub.id, m, cal, cfg, today, entry.id, actor=CLI)
     # 用自己的订阅也不能作废别人的流水
     with pytest.raises(NotFoundError):
-        void_entry(db, other_id, other_sub.id, m, cal, cfg, today, entry.id)
+        void_entry(db, other_id, other_sub.id, m, cal, cfg, today, entry.id, actor=CLI)
     with pytest.raises(NotFoundError):
-        record_cash(db, other_id, sub.id, m, cal, cfg, today, "deposit", today, 100.0)
+        record_cash(db, other_id, sub.id, m, cal, cfg, today, "deposit", today, 100.0, actor=CLI)
     with pytest.raises(NotFoundError):
         manual_state(db, other_id, sub.id, m, cal, cfg, today)
 
@@ -789,7 +815,7 @@ def _risk_events(db: Session, sub: Subscription) -> list[tuple[date, str]]:
 def _change(
     db: Session, sub: Subscription, w: World, overrides: dict[str, object], day: int
 ) -> None:
-    update_params(db, sub.user_id, sub.id, CFG, overrides, w.days[day])
+    update_params(db, sub.user_id, sub.id, CFG, overrides, w.days[day], actor=CLI)
     db.commit()
 
 
@@ -862,6 +888,7 @@ def test_entry_and_nightly_advance_lock_the_manual_book(
         "deposit",
         plain.days[S],
         1_000.0,
+        actor=CLI,
     )
     assert _book_is_locked(db_engine, book_id)  # 录入的事务提交前，每晚推进拿不到这本账
     db.commit()

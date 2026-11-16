@@ -34,6 +34,7 @@ from qt.features import FeaturePanel
 from qt.models import BuyCandidate, ExitReason, Order, Side
 from qt.risk import RiskManager
 from qt.service.accounts import STRATEGY_NAME, risk_schedule, subscription_config
+from qt.service.actor import Actor
 from qt.service.errors import LedgerInconsistentError, ValidationError
 from qt.service.manual_book import (
     Entry,
@@ -460,6 +461,8 @@ def record_trade(
     price: float,
     shares: float,
     fees: float | None = None,
+    *,
+    actor: Actor,
 ) -> LedgerEntry:
     """录入一笔买入或卖出成交。费用不填时按全站费用规则估算并标为估算值。
 
@@ -537,6 +540,7 @@ def record_trade(
             "fees_estimated": estimated,
             "signal_id": row.signal_id,
         },
+        actor,
     )
     return row
 
@@ -553,6 +557,8 @@ def record_holding(
     buy_day: date,
     cost_price: float,
     shares: float,
+    *,
+    actor: Actor,
 ) -> LedgerEntry:
     """录入一笔已有持仓（转入，标记为自主买入）：不扣现金，从今天起（含）第一个交易日进入净值。"""
     b = _writable_book(s, user_id, subscription_id, cfg)
@@ -608,6 +614,7 @@ def record_holding(
             "cost_price": cost_price,
             "shares": shares,
         },
+        actor,
     )
     return row
 
@@ -623,6 +630,8 @@ def record_cash(
     kind: Literal["deposit", "withdraw"],
     day: date,
     amount: float,
+    *,
+    actor: Actor,
 ) -> LedgerEntry:
     """录入入金或出金；金额记在流水的 price 上。"""
     b = _writable_book(s, user_id, subscription_id, cfg)
@@ -667,6 +676,7 @@ def record_cash(
         f"manual.{kind}",
         f"ledger_entry:{row.id}",
         {"day": day.isoformat(), "amount": amount},
+        actor,
     )
     return row
 
@@ -680,6 +690,8 @@ def void_entry(
     cfg: AppConfig,
     today: date,
     entry_id: int,
+    *,
+    actor: Actor,
 ) -> LedgerEntry:
     """作废一条流水：追加一条作废记录，原记录保留。关联信号的状态不回退（已执行是终态）。"""
     b = _writable_book(s, user_id, subscription_id, cfg)
@@ -725,6 +737,7 @@ def void_entry(
         "manual.void_entry",
         f"ledger_entry:{row.id}",
         {"voids_entry_id": target.id, "kind": target.kind},
+        actor,
     )
     return row
 

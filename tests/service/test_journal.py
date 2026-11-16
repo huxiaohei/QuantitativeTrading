@@ -18,6 +18,7 @@ from qt.db.models import Book, Followup, Signal, Subscription, Trade
 from qt.db.models import Rejection as RejectionRow
 from qt.features import build_panel
 from qt.service.accounts import create_subscription, create_user
+from qt.service.actor import CLI
 from qt.service.journal import fill_followups, open_followups
 from qt.service.market import StoreMarket
 from tests.fakes import (
@@ -85,8 +86,10 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> World:
 
 
 def _book(db: Session, email: str = "j@example.com") -> Book:
-    user = create_user(db, email)
-    sub: Subscription = create_subscription(db, user.id, CFG, 100_000.0, date(2024, 1, 2))
+    user = create_user(db, email, actor=CLI)
+    sub: Subscription = create_subscription(
+        db, user.id, CFG, 100_000.0, date(2024, 1, 2), actor=CLI
+    )
     db.commit()
     return repo.get_book_of_kind(db, sub.user_id, sub.id, "manual")
 

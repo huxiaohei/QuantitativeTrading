@@ -38,6 +38,7 @@ from qt.runtime import (
 )
 from qt.runtime import now as runtime_now
 from qt.service import accounts, manual_ops
+from qt.service.actor import CLI
 from qt.service.errors import LedgerInconsistentError, NotFoundError, ValidationError
 from qt.service.manual_book import CorporateAction
 from qt.service.market import StoreMarket
@@ -352,7 +353,7 @@ def user_add(
 ) -> None:
     """创建使用者。"""
     with _unit(ctx) as (_cli, s):
-        user = accounts.create_user(s, email, is_admin=admin)
+        user = accounts.create_user(s, email, is_admin=admin, actor=CLI)
         _emit(f"已创建使用者 {user.email}{'（管理员）' if user.is_admin else ''}")
 
 
@@ -390,7 +391,7 @@ def user_weekly(
         if on is None:
             raise ValidationError("请用 --on 或 --off 指定周报开关")
         user = _user(s, email)
-        accounts.set_weekly_mail(s, user.id, on)
+        accounts.set_weekly_mail(s, user.id, on, actor=CLI)
         _emit(f"已{'开启' if on else '关闭'} {user.email} 的周报邮件")
 
 
@@ -444,7 +445,7 @@ def sub_create(
         if not upcoming:
             raise ValidationError("交易日历还没有覆盖到下一个交易日，请先运行 qt data update")
         first = _start_day(start, calendar, upcoming[0], cli.cfg().service.backdate_limit_days)
-        sub = accounts.create_subscription(s, user.id, cli.cfg(), cash, first, overrides)
+        sub = accounts.create_subscription(s, user.id, cli.cfg(), cash, first, overrides, actor=CLI)
         label = "下一个交易日" if first == upcoming[0] else "自选起始日，运行时会补算"
         _emit(f"已为 {user.email} 创建订阅 {sub.id}：本金 {money(cash)}，起始日 {first}（{label}）")
         if overrides:
@@ -482,7 +483,7 @@ def sub_set(ctx: typer.Context, email: Email, set_: SetOption = None) -> None:
         sub = _open_sub(s, user)
         cfg = cli.cfg()
         effective = _next_unprocessed_day(s, sub, cli.calendar())
-        accounts.update_params(s, user.id, sub.id, cfg, overrides, effective)
+        accounts.update_params(s, user.id, sub.id, cfg, overrides, effective, actor=CLI)
         _emit(
             f"已修改 {user.email} 的参数："
             + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items())
@@ -530,7 +531,7 @@ def sub_pause(ctx: typer.Context, email: Email) -> None:
     """暂停订阅（不再出新信号）。"""
     with _unit(ctx) as (_cli, s):
         user = _user(s, email)
-        accounts.pause_subscription(s, user.id, _open_sub(s, user).id)
+        accounts.pause_subscription(s, user.id, _open_sub(s, user).id, actor=CLI)
         _emit(f"已暂停 {user.email} 的订阅")
 
 
@@ -539,7 +540,7 @@ def sub_resume(ctx: typer.Context, email: Email) -> None:
     """恢复已暂停的订阅。"""
     with _unit(ctx) as (_cli, s):
         user = _user(s, email)
-        accounts.resume_subscription(s, user.id, _open_sub(s, user).id)
+        accounts.resume_subscription(s, user.id, _open_sub(s, user).id, actor=CLI)
         _emit(f"已恢复 {user.email} 的订阅")
 
 
@@ -548,7 +549,7 @@ def sub_close(ctx: typer.Context, email: Email) -> None:
     """关闭订阅（不可恢复；账本与历史保留，仍可查看）。"""
     with _unit(ctx) as (_cli, s):
         user = _user(s, email)
-        accounts.close_subscription(s, user.id, _open_sub(s, user).id)
+        accounts.close_subscription(s, user.id, _open_sub(s, user).id, actor=CLI)
         _emit(f"已关闭 {user.email} 的订阅，账本与历史保留")
 
 
@@ -587,6 +588,7 @@ def _record_trade(
             price,
             shares,
             fees,
+            actor=CLI,
         )
         label = "买入" if side is Side.BUY else "卖出"
         estimated = "（估算）" if entry.fees_estimated else ""
@@ -670,6 +672,7 @@ def holding_add(
             _parse_day(bought),
             cost,
             shares,
+            actor=CLI,
         )
         _emit(
             f"已录入已有持仓：{code} {shares:,.0f} 股，成本价 {money(cost)}，"
@@ -694,7 +697,17 @@ def _record_cash(
         cash_day = _day_or_default(day, calendar)
         market = _market(cli, calendar, today)
         entry = manual_ops.record_cash(
-            s, user.id, sub.id, market, calendar, cli.cfg(), today, kind, cash_day, amount
+            s,
+            user.id,
+            sub.id,
+            market,
+            calendar,
+            cli.cfg(),
+            today,
+            kind,
+            cash_day,
+            amount,
+            actor=CLI,
         )
         label = "入金" if kind == "deposit" else "出金"
         _emit(f"已录入{label} {money(amount)}，日期 {cash_day}（流水 {entry.id}）")
@@ -748,7 +761,7 @@ def entry_void(
         today = _today()
         market = _market(cli, calendar, today)
         row = manual_ops.void_entry(
-            s, user.id, sub.id, market, calendar, cli.cfg(), today, entry_id
+            s, user.id, sub.id, market, calendar, cli.cfg(), today, entry_id, actor=CLI
         )
         _emit(f"已作废流水 {entry_id}（新增作废记录 {row.id}）")
 

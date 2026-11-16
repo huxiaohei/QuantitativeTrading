@@ -24,6 +24,7 @@ from qt.mail.render import HoldingView, WeeklyView, render_weekly
 from qt.mail.send import Sender
 from qt.models import Side
 from qt.service.accounts import close_subscription, pause_subscription, subscription_config
+from qt.service.actor import CLI
 from qt.service.manual_book import Market
 from qt.service.manual_ops import ManualDayResult, record_holding, record_trade
 from qt.service.market import StoreMarket
@@ -355,7 +356,18 @@ def test_fundamentals_rechecked_for_holdings_and_candidates_before_signals(
     panel = build_panel(env.store, env.calendar, CFG, days[0], day)
     market = StoreMarket(env.store, panel, CFG)
     record_holding(
-        db, sub.user_id, sub.id, market, env.calendar, CFG, day, "600001", days[DAY - 5], 10.0, 1000
+        db,
+        sub.user_id,
+        sub.id,
+        market,
+        env.calendar,
+        CFG,
+        day,
+        "600001",
+        days[DAY - 5],
+        10.0,
+        1000,
+        actor=CLI,
     )
     db.commit()
     # 数据源里 600004 的 2020 财年分红已削减（本地文件还是旧的）
@@ -412,8 +424,8 @@ def test_paused_and_closed_subscriptions_are_skipped(env: Env, db: Session) -> N
     active = subscribe(db, "a@example.com", day)
     paused = subscribe(db, "b@example.com", day)
     closed = subscribe(db, "c@example.com", day)
-    pause_subscription(db, paused.user_id, paused.id)
-    close_subscription(db, closed.user_id, closed.id)
+    pause_subscription(db, paused.user_id, paused.id, actor=CLI)
+    close_subscription(db, closed.user_id, closed.id, actor=CLI)
     db.commit()
     assert run_day(env.ctx, day, True, False) == "done"
     assert processed_through(db, active, "manual") == day
@@ -530,7 +542,18 @@ def _holding_whose_bar_is_missing(
     panel = build_panel(env.store, env.calendar, CFG, days[0], day)
     market = StoreMarket(env.store, panel, CFG)
     record_holding(
-        db, sub.user_id, sub.id, market, env.calendar, CFG, day, "600001", days[DAY - 5], 10.0, 1000
+        db,
+        sub.user_id,
+        sub.id,
+        market,
+        env.calendar,
+        CFG,
+        day,
+        "600001",
+        days[DAY - 5],
+        10.0,
+        1000,
+        actor=CLI,
     )
     db.commit()
     full = env.store.read(Table.BARS)
@@ -644,6 +667,7 @@ def test_risk_event_from_backdated_entry_is_mailed_next_night(env: Env, db: Sess
         days[DAY + 1],
         10.5,
         3000,
+        actor=CLI,
     )
     db.commit()
     assert run_day(env.ctx, days[DAY + 2], True, False) == "done"

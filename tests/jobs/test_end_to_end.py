@@ -19,6 +19,7 @@ from qt.features import build_panel
 from qt.jobs.daily import catch_up
 from qt.models import Side
 from qt.service.accounts import create_subscription, create_user, subscription_config
+from qt.service.actor import CLI
 from qt.service.manual_ops import manual_state, record_trade
 from qt.service.market import StoreMarket
 from tests.jobs.conftest import CFG, DAY, Env, evening
@@ -31,8 +32,8 @@ CASH_B = 230000.0  # 与甲不同，股数与金额才能区分两人的邮件
 def _subscribe(
     db: Session, email: str, start: date, cash: float, overrides: dict[str, object] | None = None
 ) -> Subscription:
-    user = create_user(db, email)
-    sub = create_subscription(db, user.id, CFG, cash, start, overrides)
+    user = create_user(db, email, actor=CLI)
+    sub = create_subscription(db, user.id, CFG, cash, start, overrides, actor=CLI)
     db.commit()
     return sub
 
@@ -69,7 +70,7 @@ def _record_open_buys(env: Env, db: Session, sub: Subscription, yesterday: date,
             continue
         price = _close(env.store, sig.symbol, day)
         args = (db, sub.user_id, sub.id, market, env.calendar, cfg, day)
-        record_trade(*args, Side.BUY, sig.symbol, day, price, sig.shares)
+        record_trade(*args, Side.BUY, sig.symbol, day, price, sig.shares, actor=CLI)
         done += 1
     db.commit()
     return done

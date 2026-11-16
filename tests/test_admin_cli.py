@@ -37,6 +37,7 @@ from qt.features import build_panel
 from qt.runtime import Runtime
 from qt.service import accounts
 from qt.service.accounts import create_subscription, create_user
+from qt.service.actor import CLI, Actor
 from qt.service.errors import ValidationError
 from qt.service.manual_ops import advance_manual_book
 from qt.service.market import StoreMarket
@@ -96,8 +97,8 @@ def invoke() -> Invoke:
 
 
 def _subscribe(db: Session, w: World, email: str = EMAIL, start: int = S) -> Subscription:
-    user = create_user(db, email)
-    sub = create_subscription(db, user.id, CFG, CASH, w.days[start])
+    user = create_user(db, email, actor=CLI)
+    sub = create_subscription(db, user.id, CFG, CASH, w.days[start], actor=CLI)
     db.commit()
     return sub
 
@@ -952,9 +953,14 @@ def test_failure_after_rows_were_flushed_rolls_everything_back(
     real = repo.add_audit
 
     def flush_then_fail(
-        s: Session, user_id: int, action: str, target: str, detail: Mapping[str, Any]
+        s: Session,
+        user_id: int,
+        action: str,
+        target: str,
+        detail: Mapping[str, Any],
+        actor: Actor,
     ) -> AuditLog:
-        real(s, user_id, action, target, detail)  # 流水与审计已 flush 进事务
+        real(s, user_id, action, target, detail, actor)  # 流水与审计已 flush 进事务
         raise ValidationError("模拟的后续失败")
 
     monkeypatch.setattr(repo, "add_audit", flush_then_fail)
@@ -1015,7 +1021,7 @@ def test_sub_create_accepts_a_past_trading_day_within_the_limit(
         user = db.scalars(select(User).where(User.email == EMAIL)).one()
         sub = repo.get_open_subscription(db, user.id)
         assert sub is not None
-        accounts.close_subscription(db, user.id, sub.id)
+        accounts.close_subscription(db, user.id, sub.id, actor=CLI)
         db.commit()
 
 
