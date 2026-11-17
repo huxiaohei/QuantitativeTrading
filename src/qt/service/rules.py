@@ -4,7 +4,7 @@
 """
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Literal
 
 from sqlalchemy.orm import Session
@@ -249,8 +249,15 @@ def next_effective_day(s: Session, sub: Subscription, calendar: TradingCalendar)
     return min(starts)
 
 
-def default_start_day(calendar: TradingCalendar, today: date) -> date:
-    """订阅起始日的缺省值：今天之后第一个交易日；日历没有覆盖到时抛 ValidationError。"""
+def default_start_day(calendar: TradingCalendar, at: datetime, run_time: str) -> date:
+    """订阅起始日的缺省值：第一次每日运行所在的交易日。
+
+    at（上海时间）是交易日且还没到每日运行时刻 run_time（"HH:MM"）时就是当天，当晚第一次运行；
+    否则是之后第一个交易日。日历没有覆盖到时抛 ValidationError。
+    """
+    today = at.date()
+    if calendar.is_trading_day(today) and at.time() < time.fromisoformat(run_time):
+        return today
     upcoming = calendar.between(today + timedelta(days=1), date.max)
     if not upcoming:
         raise ValidationError("交易日历还没有覆盖到下一个交易日，请先运行 qt data update")
@@ -278,7 +285,7 @@ def resolve_start_day(
     if not calendar.is_trading_day(day):
         raise ValidationError(f"起始日 {day} 不是交易日")
     if day > default:
-        raise ValidationError(f"起始日不能晚于下一个交易日 {default}")
+        raise ValidationError(f"起始日不能晚于 {default}")
     try:
         earliest = calendar.offset(today or now().date(), -backdate_limit_days)
     except ValueError:

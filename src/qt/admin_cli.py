@@ -349,17 +349,17 @@ def sub_create(
         ),
     ] = None,
 ) -> None:
-    """创建订阅（同时建立系统账与手动账），起始日缺省为下一个交易日。"""
+    """创建订阅（同时建立系统账与手动账），起始日缺省为第一次每日运行所在的交易日。"""
     with _unit(ctx) as (cli, s):
         overrides = _parse_overrides(set_)
         user = _user(s, email)
         calendar = cli.calendar()
-        upcoming = rules.default_start_day(calendar, _today())
+        upcoming = rules.default_start_day(calendar, now(), cli.cfg().service.run_time)
         first = rules.resolve_start_day(
             start, calendar, upcoming, cli.cfg().service.backdate_limit_days, today=_today()
         )
         sub = accounts.create_subscription(s, user.id, cli.cfg(), cash, first, overrides, actor=CLI)
-        label = "下一个交易日" if first == upcoming else "自选起始日，运行时会补算"
+        label = "第一次每日运行的交易日" if first == upcoming else "自选起始日，运行时会补算"
         _emit(f"已为 {user.email} 创建订阅 {sub.id}：本金 {money(cash)}，起始日 {first}（{label}）")
         if overrides:
             _emit("参数覆盖：" + "，".join(f"{k}={_json_text(v)}" for k, v in overrides.items()))

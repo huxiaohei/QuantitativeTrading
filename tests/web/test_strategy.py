@@ -24,7 +24,7 @@ from tests.web.conftest import BASE, CFG, Clock, MakeUser, csrf_of, login_as, ma
 
 # 2026-11-16（周一，今天）起的工作日
 DAYS = [d for d in (date(2026, 11, 16) + timedelta(days=i) for i in range(60)) if d.weekday() < 5]
-TOMORROW = DAYS[1]
+START_DAY = DAYS[0]  # 测试时钟在周一的每日运行时刻之前：缺省起始日就是当天
 NOTE = "修改参数后没有对应的回测结果可看"
 _HIDDEN = re.compile(r'<input type="hidden" name="([^"]+)" value="([^"]*)">')
 STOP_LOSS = "strategy.stop_loss"
@@ -89,14 +89,14 @@ def test_create_subscription_redirects_and_shows_result(
 ) -> None:
     user_id = _login(client, make_user)
     form = client.get("/strategy/new")
-    assert form.status_code == 200 and "起始资金" in form.text and str(TOMORROW) in form.text
+    assert form.status_code == 200 and "起始资金" in form.text and str(START_DAY) in form.text
     resp = _create(client)
     assert resp.status_code == 303 and resp.headers["location"].startswith("/strategy")
     page = client.get(resp.headers["location"])
-    assert "100,000.00" in page.text and str(TOMORROW) in page.text and "生效中" in page.text
+    assert "100,000.00" in page.text and str(START_DAY) in page.text and "生效中" in page.text
     assert "订阅已创建" in page.text
     sub = repo.get_open_subscription(db, user_id)
-    assert sub is not None and sub.initial_cash == 100000 and sub.start_day == TOMORROW
+    assert sub is not None and sub.initial_cash == 100000 and sub.start_day == START_DAY
     audit = db.scalars(select(AuditLog).where(AuditLog.action == "subscription.create")).one()
     assert audit.channel == "web" and audit.actor_user_id == user_id
 
@@ -144,13 +144,13 @@ def test_params_confirm_then_apply(client: TestClient, make_user: MakeUser, db: 
     _create(client)
     resp = _post(client, "/strategy/params", {STOP_LOSS: "17.5"})
     assert resp.status_code == 200
-    assert str(TOMORROW) in resp.text and NOTE in resp.text and "止损比例" in resp.text
+    assert str(START_DAY) in resp.text and NOTE in resp.text and "止损比例" in resp.text
     assert db.scalars(select(ParamChange)).all() == []  # 确认之前不写库
 
     confirmed = _post(client, "/strategy/params", _hidden(resp))
     assert confirmed.status_code == 303 and confirmed.headers["location"].startswith("/strategy")
     change = db.scalars(select(ParamChange)).one()
-    assert change.effective_day == TOMORROW and change.new["strategy"]["stop_loss"] == 0.175
+    assert change.effective_day == START_DAY and change.new["strategy"]["stop_loss"] == 0.175
     audit = db.scalars(select(AuditLog).where(AuditLog.action == "subscription.update_params"))
     row = audit.one()
     assert row.channel == "web" and row.actor_user_id == user_id

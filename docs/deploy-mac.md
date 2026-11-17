@@ -86,15 +86,15 @@ docker compose up -d                             # 数据备好后再起 worker
 docker compose run --rm worker qt admin user add --email you@example.com --admin
 
 # 创建订阅：起始资金 150000，使用默认参数；也可以用 --set 改参数，如 --set strategy.stop_loss=0.10
-# （起始日缺省为下一个交易日；想立刻试运行见下文 --start）
+# （起始日缺省为第一次每日运行所在的交易日：交易日 18:00 前创建的是当天，否则是下一个交易日；想立刻试运行见下文 --start）
 docker compose run --rm worker qt admin sub create --email you@example.com --cash 150000
 
 # 查看订阅与参数
 docker compose run --rm worker qt admin sub show --email you@example.com
 ```
 
-**第一批信号什么时候来：** 订阅缺省的起始日是创建当天之后的第一个交易日，所以今天创建的订阅，要等那个交易日 18:00 之后的运行才会出信号和邮件；
-现在立刻 `qt run-day` 不会有任何信号、也没有邮件（订阅还没开始）。每人同时只有一个生效的订阅。
+**第一批信号什么时候来：** 订阅缺省的起始日是第一次每日运行所在的交易日：交易日 18:00 之前创建的是当天，当晚 18:00 的运行就会处理；
+18:00 之后或非交易日创建的是下一个交易日，在那之前 `qt run-day` 不会有任何信号、也没有邮件（订阅还没开始）。每人同时只有一个生效的订阅。
 
 **想马上把整条链路走通（试运行）：** 创建订阅时用 `--start` 指定起始日，选**最近一个已收盘的交易日**
 （交易日 15:00 收盘后是当天，否则是上一个交易日）：

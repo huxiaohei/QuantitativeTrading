@@ -260,7 +260,9 @@ def _new_page(
 ) -> Response:
     default_day: str | None = None
     try:
-        default_day = str(rules.default_start_day(deps.calendar(), deps.now().date()))
+        default_day = str(
+            rules.default_start_day(deps.calendar(), deps.now(), deps.cfg.service.run_time)
+        )
     except ValidationError as exc:
         error = error or str(exc)
     context: dict[str, object] = {
@@ -305,10 +307,11 @@ def new_submit(
         cash = parse_money(initial_cash, "initial_cash")
     except FormError as exc:
         return failed({exc.field: exc.message})
-    today = deps.now().date()
+    at = deps.now()
+    today = at.date()
     calendar = deps.calendar()
     try:
-        default = rules.default_start_day(calendar, today)
+        default = rules.default_start_day(calendar, at, deps.cfg.service.run_time)
     except ValidationError as exc:
         return failed(error=str(exc))
     try:

@@ -12,7 +12,7 @@
     </label>
     <label>起始日（可不填）
       <input type="text" name="start_day" value="{{ start }}" placeholder="{{ default_day or 'YYYY-MM-DD' }}" inputmode="numeric">
-      <span class="hint">不填则从下一个交易日{% if default_day %}（{{ default_day }}）{% endif %}开始；也可以填过去的交易日（最早为 {{ limit_days }} 个交易日之前），运行时逐日补算，格式 YYYY-MM-DD。</span>
+      <span class="hint">不填则从 {{ default_day or '下一个交易日' }} 开始：交易日 {{ run_time }} 之前创建的当晚第一次运行，之后创建的从下一个交易日开始；也可以填过去的交易日（最早为 {{ limit_days }} 个交易日之前），运行时逐日补算，格式 YYYY-MM-DD。</span>
       {% if errors.get("start_day") %}<span class="field-error" role="alert">{{ errors.get("start_day") }}</span>{% endif %}
     </label>
     <button type="submit" class="primary">创建</button>

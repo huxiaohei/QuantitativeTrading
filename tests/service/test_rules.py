@@ -1,6 +1,6 @@
 """命令行与网页共用的规则：生效日、起始日、订阅查看口径、参数说明、放弃提醒开关。"""
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import get_args
 
@@ -147,12 +147,21 @@ def test_set_abandon_mail_switches_flag_and_audits(db: Session) -> None:
     assert row.detail == {"enabled": False, "user_id": user.id}
 
 
-def test_default_start_day_is_next_trading_day_and_needs_calendar_coverage() -> None:
+def test_default_start_day_is_the_day_of_the_first_daily_run() -> None:
     calendar = TradingCalendar([date(2026, 11, 13), date(2026, 11, 16)])
-    assert rules.default_start_day(calendar, date(2026, 11, 13)) == date(2026, 11, 16)
-    assert rules.default_start_day(calendar, date(2026, 11, 14)) == date(2026, 11, 16)
+
+    def default(text: str) -> date:
+        return rules.default_start_day(calendar, datetime.fromisoformat(text), "18:00")
+
+    # 交易日、还没到每日运行时刻：当天，当晚第一次运行
+    assert default("2026-11-13T00:00:00") == date(2026, 11, 13)
+    assert default("2026-11-13T17:59:59") == date(2026, 11, 13)
+    # 到了运行时刻之后、非交易日：之后第一个交易日
+    assert default("2026-11-13T18:00:00") == date(2026, 11, 16)
+    assert default("2026-11-14T10:00:00") == date(2026, 11, 16)
+    assert default("2026-11-16T09:00:00") == date(2026, 11, 16)
     with pytest.raises(ValidationError, match="交易日历还没有覆盖"):
-        rules.default_start_day(calendar, date(2026, 11, 16))
+        default("2026-11-16T18:00:00")
 
 
 def test_site_wide_params_are_exactly_those_the_service_refuses_to_override(db: Session) -> None:

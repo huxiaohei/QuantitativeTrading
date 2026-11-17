@@ -125,7 +125,7 @@ def _ledger(db: Session, sub: Subscription) -> list[LedgerEntry]:
 def test_user_and_subscription_lifecycle_via_cli(
     world: World, db: Session, invoke: Invoke, set_now: SetNow
 ) -> None:
-    set_now(world.days[262])  # 周三晚；下一个交易日是 days[263]
+    set_now(world.days[262], 20)  # 周三晚，已过每日运行时刻；下一个交易日是 days[263]
     assert invoke("admin", "user", "add", "--email", "A@X.com").exit_code == 0
     r = invoke("admin", "user", "list")
     assert r.exit_code == 0 and "a@x.com" in r.stdout and "无订阅" in r.stdout
@@ -1004,15 +1004,24 @@ def _start_of(db: Session) -> date:
 def test_sub_create_start_defaults_to_next_trading_day(
     world: World, db: Session, invoke: Invoke, set_now: SetNow
 ) -> None:
-    set_now(world.days[262])
+    set_now(world.days[262], 20)  # 已过每日运行时刻
     assert _create_with_start(invoke).exit_code == 0
     assert _start_of(db) == world.days[263]
+
+
+def test_sub_create_before_run_time_starts_the_same_day(
+    world: World, db: Session, invoke: Invoke, set_now: SetNow
+) -> None:
+    set_now(world.days[262], 17)  # 交易日、还没到每日运行时刻：当晚第一次运行
+    r = _create_with_start(invoke)
+    assert r.exit_code == 0 and "第一次每日运行的交易日" in r.stdout
+    assert _start_of(db) == world.days[262]
 
 
 def test_sub_create_accepts_a_past_trading_day_within_the_limit(
     world: World, db: Session, invoke: Invoke, set_now: SetNow
 ) -> None:
-    set_now(world.days[262])
+    set_now(world.days[262], 20)
     limit = CFG.service.backdate_limit_days
     for earliest in (world.days[262 - limit], world.days[263]):  # 回溯上限当天、以及默认的次日
         r = _create_with_start(invoke, "--start", str(earliest))
@@ -1028,7 +1037,7 @@ def test_sub_create_accepts_a_past_trading_day_within_the_limit(
 def test_sub_create_rejects_bad_start_days(
     world: World, db: Session, invoke: Invoke, set_now: SetNow
 ) -> None:
-    set_now(world.days[262])
+    set_now(world.days[262], 20)
     limit = CFG.service.backdate_limit_days
     saturday = world.days[262] + timedelta(days=3)
     cases = {
