@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% from "_tables.html" import entries_table %}
+{% block title %}查看使用者 · 管理 · 量化信号{% endblock %}
+{% block content %}
+<h1>管理</h1>
+{% include "_admin_nav.html" %}
+<p class="notice">正在查看 {{ target.email }}{% if target.note %}（{{ target.note }}）{% endif %} 的{{ tabs[tab] }}（只读）。这不是你自己的账本；每次查看都会记入操作日志。<a href="/admin/users">返回使用者列表</a></p>
+<nav class="subnav" aria-label="查看导航">
+  {% for key, label in tabs.items() %}
+  <a href="/admin/users/{{ target.id }}/{{ key }}"{% if key == tab %} aria-current="page"{% endif %}>{{ label }}</a>
+  {% endfor %}
+</nav>
+{% if tab == "manual" %}
+  {% if page is none %}
+  <section class="card"><p>这位使用者还没有订阅。</p></section>
+  {% elif page.error %}
+  <section class="card">
+    <p class="error" role="alert">手动账的流水现在互相对不上，暂时算不出净值和持仓：{{ page.error }}</p>
+  </section>
+  <section class="card"><h2>流水</h2>{{ entries_table(page.entries) }}</section>
+  {% else %}
+  {% with summary = page.summary, sub = page.subscription %}{% include "_admin_book_summary.html" %}{% endwith %}
+  <section class="card"><h2>持仓</h2>{% include "_holdings_live.html" %}</section>
+  <section class="card"><h2>流水</h2>{{ entries_table(page.entries) }}</section>
+  {% endif %}
+{% elif tab == "system" %}
+  {% if view is none %}
+  <section class="card"><p>这位使用者还没有订阅。</p></section>
+  {% elif view.summary is none %}
+  <section class="card"><p>系统账尚未推进过（每日运行之后才有数据）。</p></section>
+  {% else %}
+  {% with summary = view.summary, sub = view.subscription %}{% include "_admin_book_summary.html" %}{% endwith %}
+  <section class="card"><h2>持仓</h2>{% include "_holdings_live.html" %}</section>
+  <section class="card"><h2>流水</h2>{{ entries_table(view.entries) }}</section>
+  {% endif %}
+{% else %}
+  {% if current is none %}
+  <section class="card"><p>这位使用者还没有订阅。</p></section>
+  {% else %}
+  <section class="card">
+    <h2>订阅 #{{ current.id }}</h2>
+    <div class="table-wrap">
+    <table>
+      <tbody>
+        <tr><th>状态</th><td>{{ current.status_label }}</td></tr>
+        <tr><th>起始资金</th><td class="num">{{ current.initial_cash | money }}</td></tr>
+        <tr><th>起始日</th><td>{{ current.start_day }}</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <h2>参数</h2>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>参数</th><th>说明</th><th class="num">当前值</th><th class="num">默认值</th></tr></thead>
+      <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ row.info.label }}</td>
+        <td class="desc">{{ row.info.description }}</td>
+        <td class="num">{{ row.current }}</td>
+        <td class="num">{{ row.default }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+  {% endif %}
+  {% if history %}
+  <section class="card">
+    <h2>其他订阅</h2>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>编号</th><th>状态</th><th class="num">起始资金</th><th>起始日</th><th>关闭于</th></tr></thead>
+      <tbody>
+      {% for item in history %}
+      <tr>
+        <td>#{{ item.id }}</td>
+        <td>{{ item.status_label }}</td>
+        <td class="num">{{ item.initial_cash | money }}</td>
+        <td>{{ item.start_day }}</td>
+        <td>{% if item.closed_at %}{{ item.closed_at.date() }}{% else %}-{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+  {% endif %}
+{% endif %}
+{% endblock %}

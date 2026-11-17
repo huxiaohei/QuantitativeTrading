@@ -1,7 +1,12 @@
 """管理员页面：邀请码（生成、作废、改备注、删除）、使用者启停与备注、运行记录、立即重试、失败邮件重新排队。
 
-路由全部是 access="admin"，非管理员一律 404。本模块只解析表单、调用服务、显示服务给出的中文原因；
-页面里只有账号层面的信息，不读取、不显示任何使用者的账本、现金、持仓、信号或日志内容（设计 6.7）。
+路由全部是 access="admin"，非管理员一律 404。本模块只解析表单、调用服务、显示服务给出的中文原因。
+
+邀请码、使用者列表、运行记录这些页面只有账号层面的信息。管理员另可以只读查看某个使用者的手动账、
+系统账和策略参数（/admin/users/{user_id}/manual、system、strategy；2026-11-17 起，
+使用条款第八节已写明）：
+这些路由只有 GET，不提供任何替使用者录入、作废、改参数的入口；每次打开页面记一条审计日志。
+使用者的信号、日志、总览不在其中。
 """
 
 from typing import Annotated, Literal
@@ -12,13 +17,16 @@ from fastapi.responses import RedirectResponse, Response
 from sqlalchemy.orm import Session
 
 from qt.db import admin_repo, repo
+from qt.db.models import User
 from qt.mail import outbox
-from qt.service import auth, reruns, views
+from qt.service import accounts, auth, reruns, views
 from qt.service.actor import web_actor
 from qt.service.errors import AuthError
 from qt.service.views import admin as admin_views
 from qt.web.app import route
 from qt.web.deps import FLASH_MESSAGES, Current, CurrentUser, DbSession, Deps, WebDeps, render
+from qt.web.routes.common import live_context, stock_names
+from qt.web.routes.strategy import param_rows
 
 router = APIRouter()
 
@@ -334,6 +342,134 @@ def users_note_save(
             request, found, target.id, target.email, note, error=str(exc), status_code=422
         )
     return _redirect("/admin/users", "user_note_saved")
+
+
+# ---- 只读查看某个使用者的手动账、系统账、策略 ----
+
+_VIEW_TABS = {"manual": "手动账", "system": "系统账", "strategy": "策略"}
+
+
+def _view_base(target: User, tab: str) -> dict[str, object]:
+    """查看页共用的模板数据。target 只来自网址里的使用者编号，且本模块的路由都要求管理员。"""
+    return {
+        "active": "admin",
+        "section": "users",
+        "target": target,
+        "tab": tab,
+        "tabs": _VIEW_TABS,
+    }
+
+
+def _record_view(s: Session, found: Current, target: User, tab: str) -> None:
+    repo.add_audit(
+        s, target.id, "admin_view", f"user:{target.id}", {"page": tab}, web_actor(found.user.id)
+    )
+
+
+def _manual_of(deps: WebDeps, s: Session, target: User) -> views.ManualBookPage | None:
+    sub = views.resolve_subscription(s, target.id, None)
+    if sub is None:
+        return None
+    market = deps.market(deps.now().date(), views.book_symbols(s, target.id, sub.id))
+    return views.manual_page(
+        s,
+        target.id,
+        sub.id,
+        market,
+        deps.calendar(),
+        deps.cfg,
+        deps.now().date(),
+        names=stock_names(deps),
+    )
+
+
+def _system_of(deps: WebDeps, s: Session, target: User) -> views.SystemBookView | None:
+    sub = views.resolve_subscription(s, target.id, None)
+    if sub is None:
+        return None
+    market = deps.market(deps.now().date(), views.book_symbols(s, target.id, sub.id))
+    return views.system_book(s, target.id, sub.id, market, names=stock_names(deps))
+
+
+@route(router, "GET", "/admin/users/{user_id}/manual", "admin")
+def view_manual(
+    request: Request, user_id: int, found: CurrentUser, deps: Deps, s: DbSession
+) -> Response:
+    target = repo.get_user(s, user_id)
+    page = _manual_of(deps, s, target)
+    rows = [] if page is None else page.holdings
+    url = f"/admin/users/{target.id}/manual/holdings"
+    context = {
+        **_view_base(target, "manual"),
+        "page": page,
+        **live_context(deps, rows, url, levels=True),
+    }
+    _record_view(s, found, target, "manual")
+    return render(request, "admin_user_view.html", context, found=found)
+
+
+@route(router, "GET", "/admin/users/{user_id}/manual/holdings", "admin")
+def view_manual_holdings(
+    request: Request, user_id: int, found: CurrentUser, deps: Deps, s: DbSession
+) -> Response:
+    """查看页里手动账持仓表这一块，供交易时段定时替换（不另记审计日志）。"""
+    target = repo.get_user(s, user_id)
+    page = _manual_of(deps, s, target)
+    rows = [] if page is None else page.holdings
+    url = f"/admin/users/{target.id}/manual/holdings"
+    context = live_context(deps, rows, url, levels=True)
+    return render(request, "_holdings_live.html", context, found=found)
+
+
+@route(router, "GET", "/admin/users/{user_id}/system", "admin")
+def view_system(
+    request: Request, user_id: int, found: CurrentUser, deps: Deps, s: DbSession
+) -> Response:
+    target = repo.get_user(s, user_id)
+    view = _system_of(deps, s, target)
+    rows = [] if view is None else view.holdings
+    url = f"/admin/users/{target.id}/system/holdings"
+    context = {
+        **_view_base(target, "system"),
+        "view": view,
+        **live_context(deps, rows, url, levels=False),
+    }
+    _record_view(s, found, target, "system")
+    return render(request, "admin_user_view.html", context, found=found)
+
+
+@route(router, "GET", "/admin/users/{user_id}/system/holdings", "admin")
+def view_system_holdings(
+    request: Request, user_id: int, found: CurrentUser, deps: Deps, s: DbSession
+) -> Response:
+    """查看页里系统账持仓表这一块，供交易时段定时替换（不另记审计日志）。"""
+    target = repo.get_user(s, user_id)
+    view = _system_of(deps, s, target)
+    rows = [] if view is None else view.holdings
+    url = f"/admin/users/{target.id}/system/holdings"
+    context = live_context(deps, rows, url, levels=False)
+    return render(request, "_holdings_live.html", context, found=found)
+
+
+@route(router, "GET", "/admin/users/{user_id}/strategy", "admin")
+def view_strategy(
+    request: Request, user_id: int, found: CurrentUser, deps: Deps, s: DbSession
+) -> Response:
+    target = repo.get_user(s, user_id)
+    sub = views.resolve_subscription(s, target.id, None)
+    all_views = views.subscriptions(s, target.id)
+    current = next((v for v in all_views if sub is not None and v.id == sub.id), None)
+    rows = (
+        [] if sub is None else param_rows(deps, accounts.subscription_config(deps.cfg, sub), {}, {})
+    )
+    context = {
+        **_view_base(target, "strategy"),
+        "current": current,
+        "rows": rows,
+        "history": [v for v in all_views if current is None or v.id != current.id],
+    }
+    _record_view(s, found, target, "strategy")
+    return render(request, "admin_user_view.html", context, found=found)
 
 
 # ---- 运行记录与重试 ----

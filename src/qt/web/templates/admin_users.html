@@ -7,7 +7,7 @@
 {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
 <section class="card">
   <h2>使用者</h2>
-  <p class="muted">这里只显示账号信息，不显示任何人的账本、持仓、信号或日志。备注只有管理员能看到。</p>
+  <p class="muted">这里只显示账号信息。点“查看”可以只读查看某个人的手动账、系统账和策略（每次查看都会记入操作日志）；信号和日志不能查看。备注只有管理员能看到。</p>
   <div class="table-wrap">
   <table>
     <thead><tr><th>邮箱</th><th>状态</th><th>注册时间</th><th>邮箱验证</th><th>订阅</th><th></th></tr></thead>
@@ -20,6 +20,7 @@
       <td>{{ "已验证" if row.verified else "未验证" }}</td>
       <td>{{ row.subscription_label }}</td>
       <td>
+        <a href="/admin/users/{{ row.id }}/manual">查看</a>
         <a href="/admin/users/{{ row.id }}/note">改备注</a>
         {% if row.status == "active" and row.id != me %}
         <a href="/admin/users/{{ row.id }}/disable">停用</a>

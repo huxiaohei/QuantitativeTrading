@@ -106,6 +106,11 @@ EXPECTED: dict[Key, Access] = {
     ("POST", "/admin/users/{user_id}/disable"): "admin",
     ("POST", "/admin/users/{user_id}/enable"): "admin",
     ("GET", "/admin/users/{user_id}/note"): "admin",
+    ("GET", "/admin/users/{user_id}/manual"): "admin",
+    ("GET", "/admin/users/{user_id}/manual/holdings"): "admin",
+    ("GET", "/admin/users/{user_id}/system"): "admin",
+    ("GET", "/admin/users/{user_id}/system/holdings"): "admin",
+    ("GET", "/admin/users/{user_id}/strategy"): "admin",
     ("POST", "/admin/users/{user_id}/note"): "admin",
     ("GET", "/admin/runs"): "admin",
     ("POST", "/admin/runs/retry"): "admin",
@@ -136,6 +141,11 @@ ADMIN_IDS: dict[Key, dict[str, IdKind]] = {
     ("GET", "/admin/invites/{invite_id}/delete"): {"invite_id": "invite"},
     ("POST", "/admin/invites/{invite_id}/delete"): {"invite_id": "invite"},
     ("GET", "/admin/users/{user_id}/note"): {"user_id": "user"},
+    ("GET", "/admin/users/{user_id}/manual"): {"user_id": "user"},
+    ("GET", "/admin/users/{user_id}/manual/holdings"): {"user_id": "user"},
+    ("GET", "/admin/users/{user_id}/system"): {"user_id": "user"},
+    ("GET", "/admin/users/{user_id}/system/holdings"): {"user_id": "user"},
+    ("GET", "/admin/users/{user_id}/strategy"): {"user_id": "user"},
     ("POST", "/admin/users/{user_id}/note"): {"user_id": "user"},
 }
 

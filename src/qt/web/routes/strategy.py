@@ -162,7 +162,9 @@ def _collect(values: _Values, cfg: AppConfig) -> tuple[dict[str, object], dict[s
     return overrides, errors
 
 
-def _rows(deps: WebDeps, cfg: AppConfig, values: _Values, errors: dict[str, str]) -> list[ParamRow]:
+def param_rows(
+    deps: WebDeps, cfg: AppConfig, values: _Values, errors: dict[str, str]
+) -> list[ParamRow]:
     """参数表的行：values 是用户刚填的内容（没有则显示当前值）。"""
     return [
         ParamRow(
@@ -217,7 +219,9 @@ def _strategy_page(
     sub = _open_sub(s, found)
     all_views = views.subscriptions(s, found.user.id)
     current = next((v for v in all_views if sub is not None and v.id == sub.id), None)
-    rows = [] if sub is None else _rows(deps, accounts.subscription_config(deps.cfg, sub), {}, {})
+    rows = (
+        [] if sub is None else param_rows(deps, accounts.subscription_config(deps.cfg, sub), {}, {})
+    )
     context: dict[str, object] = {
         "active": "strategy",
         "flash": flash,
@@ -345,7 +349,7 @@ def _params_page(
     cfg = accounts.subscription_config(deps.cfg, sub)
     context: dict[str, object] = {
         "active": "strategy",
-        "rows": _rows(deps, cfg, values or {}, errors or {}),
+        "rows": param_rows(deps, cfg, values or {}, errors or {}),
         "error": error,
     }
     return render(request, "strategy_params.html", context, found=found, status_code=status_code)
