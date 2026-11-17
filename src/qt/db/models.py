@@ -61,6 +61,8 @@ class User(Base):
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     terms_version: Mapped[str | None] = mapped_column(String(32))
     terms_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 管理员写的备注（例如这是谁）；只在管理页显示，使用者自己看不到
+    note: Mapped[str] = mapped_column(String(200), server_default="")
     created_at: Mapped[datetime] = _created_at()
 
 

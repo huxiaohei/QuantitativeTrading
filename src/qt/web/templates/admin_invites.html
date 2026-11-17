@@ -37,6 +37,8 @@
           <button type="submit">作废</button>
         </form>
         {% endif %}
+        <a href="/admin/invites/{{ row.id }}/note">改备注</a>
+        <a href="/admin/invites/{{ row.id }}/delete">删除</a>
       </td>
     </tr>
     {% endfor %}

@@ -46,3 +46,18 @@ def test_0003_upgrade_adds_and_downgrade_removes_web_schema(db_engine: Engine) -
     finally:
         command.upgrade(config, "head")
     assert _web_schema(db_engine)[0] >= _NEW_TABLES
+
+
+def test_0004_adds_user_note_and_downgrade_removes_it(db_engine: Engine) -> None:
+    def columns() -> set[str]:
+        return {c["name"] for c in inspect(db_engine).get_columns("users")}
+
+    assert "note" in columns()
+    config = Config(str(_ROOT / "alembic.ini"))
+    config.attributes["url"] = resolve_test_db_url()
+    command.downgrade(config, "0003")
+    try:
+        assert "note" not in columns()
+    finally:
+        command.upgrade(config, "head")
+    assert "note" in columns()

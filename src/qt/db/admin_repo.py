@@ -6,6 +6,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from qt.db.models import RUN_FINISHED, DailyRun, Followup, Invite, Outbox, Subscription, User
+from qt.service.errors import NotFoundError
 
 
 def find_user_by_email(s: Session, email: str) -> User | None:
@@ -61,6 +62,14 @@ def count_outbox_by_status(s: Session) -> dict[str, int]:
     """发件箱里各状态（pending、sent、failed）的邮件数；没有的状态不在其中。"""
     stmt = select(Outbox.status, func.count()).group_by(Outbox.status)
     return {str(row[0]): int(row[1]) for row in s.execute(stmt)}
+
+
+def get_invite(s: Session, invite_id: int) -> Invite:
+    """按编号取邀请码；不存在抛 NotFoundError。"""
+    invite = s.get(Invite, invite_id)
+    if invite is None:
+        raise NotFoundError("邀请码不存在")
+    return invite
 
 
 def list_invites(s: Session) -> list[Invite]:

@@ -148,7 +148,199 @@ def test_revoke_unknown_invite_is_404(client: TestClient, make_user: MakeUser) -
     assert _post(client, "/admin/invites/999/revoke").status_code == 404
 
 
+def _invite(db: Session) -> Invite:
+    db.expire_all()
+    found = db.scalars(select(Invite)).one()
+    return found
+
+
+def _audit(db: Session, action: str) -> AuditLog:
+    return db.scalars(select(AuditLog).where(AuditLog.action == action)).one()
+
+
+def test_invite_note_can_be_changed_and_cleared(
+    client: TestClient, make_user: MakeUser, db: Session
+) -> None:
+    admin_id = _admin(client, make_user)
+    _create_invite(client, "曹靖伟")
+    invite_id = _invite(db).id
+    page = client.get("/admin/invites")
+    assert f'href="/admin/invites/{invite_id}/note"' in page.text
+    form = client.get(f"/admin/invites/{invite_id}/note")
+    assert form.status_code == 200 and 'value="曹靖伟"' in form.text and "（可用）" in form.text
+
+    resp = _post(client, f"/admin/invites/{invite_id}/note", {"note": "  张佳兴 "})
+    assert (
+        resp.status_code == 303
+        and resp.headers["location"] == "/admin/invites?msg=invite_note_saved"
+    )
+    assert _invite(db).note == "张佳兴"
+    shown = client.get("/admin/invites?msg=invite_note_saved").text
+    assert "邀请码的备注已保存" in shown and "张佳兴" in shown and "曹靖伟" not in shown
+    audit = _audit(db, "invite_note")
+    assert audit.actor_user_id == admin_id and audit.channel == "web"
+    assert audit.detail == {"old": "曹靖伟", "new": "张佳兴", "user_id": admin_id}
+
+    # 没有变化不再记日志；改成空就是去掉备注
+    assert _post(client, f"/admin/invites/{invite_id}/note", {"note": "张佳兴"}).status_code == 303
+    assert _post(client, f"/admin/invites/{invite_id}/note", {"note": ""}).status_code == 303
+    assert _invite(db).note == ""
+    assert len(list(db.scalars(select(AuditLog).where(AuditLog.action == "invite_note")))) == 2
+
+
+def test_invite_note_too_long_keeps_input_and_changes_nothing(
+    client: TestClient, make_user: MakeUser, db: Session
+) -> None:
+    _admin(client, make_user)
+    _create_invite(client, "原备注")
+    invite_id = _invite(db).id
+    resp = _post(client, f"/admin/invites/{invite_id}/note", {"note": "长" * 201})
+    assert resp.status_code == 422 and "备注不能超过 200 个字" in resp.text
+    assert "长" * 201 in resp.text
+    assert _invite(db).note == "原备注"
+    assert (
+        _post(client, f"/admin/invites/{invite_id}/note", {"note": "长" * 200}).status_code == 303
+    )
+
+
+def test_note_is_escaped(client: TestClient, make_user: MakeUser, db: Session) -> None:
+    _admin(client, make_user)
+    _create_invite(client)
+    invite_id = _invite(db).id
+    evil = '"><script>alert(1)</script>'
+    assert _post(client, f"/admin/invites/{invite_id}/note", {"note": evil}).status_code == 303
+    for path in (
+        "/admin/invites",
+        f"/admin/invites/{invite_id}/note",
+        f"/admin/invites/{invite_id}/delete",
+    ):
+        text = client.get(path).text
+        assert "<script>alert(1)" not in text and "&lt;script&gt;" in text
+
+
+def test_delete_usable_invite_needs_confirmation_and_kills_the_link(
+    client: TestClient, make_user: MakeUser, db: Session
+) -> None:
+    admin_id = _admin(client, make_user)
+    code = _create_invite(client, "刘晓茹")
+    invite_id = _invite(db).id
+    confirm = client.get(f"/admin/invites/{invite_id}/delete")
+    assert confirm.status_code == 200
+    assert "确认删除邀请码" in confirm.text and "刘晓茹" in confirm.text
+    assert "删除后它的注册链接立即失效" in confirm.text
+    assert db.scalars(select(Invite)).one().id == invite_id  # 打开确认页不会删除
+
+    resp = _post(client, f"/admin/invites/{invite_id}/delete")
+    assert (
+        resp.status_code == 303 and resp.headers["location"] == "/admin/invites?msg=invite_deleted"
+    )
+    db.expire_all()
+    assert list(db.scalars(select(Invite))) == []
+    page = client.get("/admin/invites?msg=invite_deleted").text
+    assert "邀请码已删除" in page and "刘晓茹" not in page and "还没有生成过邀请码" in page
+    guest = TestClient(client.app, base_url=BASE)
+    assert _register(guest, "new@example.com", code).status_code == 400
+    audit = _audit(db, "invite_delete")
+    assert audit.actor_user_id == admin_id and audit.target == f"invite:{invite_id}"
+    assert audit.detail == {
+        "note": "刘晓茹",
+        "state": "usable",
+        "used_by": None,
+        "user_id": admin_id,
+    }
+    # 再删一次：已经不存在
+    assert _post(client, f"/admin/invites/{invite_id}/delete").status_code == 404
+
+
+def test_delete_used_invite_keeps_the_registered_account(
+    client: TestClient, make_user: MakeUser, db: Session
+) -> None:
+    _admin(client, make_user)
+    code = _create_invite(client, "曹靖伟")
+    guest = TestClient(client.app, base_url=BASE)
+    assert _register(guest, "new@example.com", code).status_code == 303
+    invite_id = _invite(db).id
+    confirm = client.get(f"/admin/invites/{invite_id}/delete").text
+    assert "已被使用，删除不影响用它注册的账号" in confirm
+    assert _post(client, f"/admin/invites/{invite_id}/delete").status_code == 303
+    db.expire_all()
+    user = admin_repo.find_user_by_email(db, "new@example.com")
+    assert user is not None and user.status == "active"
+    audit = _audit(db, "invite_delete")
+    assert (audit.detail["note"], audit.detail["state"]) == ("曹靖伟", "used")
+    assert audit.detail["used_by"] == user.id
+
+
+def test_unknown_invite_note_and_delete_are_404(client: TestClient, make_user: MakeUser) -> None:
+    _admin(client, make_user)
+    for path in ("/admin/invites/999999/note", "/admin/invites/999999/delete"):
+        assert client.get(path).status_code == 404
+        assert _post(client, path, {"note": "x"}).status_code == 404
+
+
 # ---- 使用者 ----
+
+
+def test_user_note_starts_from_the_invite_note_and_can_be_changed(
+    client: TestClient, make_user: MakeUser, db: Session
+) -> None:
+    admin_id = _admin(client, make_user)
+    code = _create_invite(client, "曹靖伟")
+    guest = TestClient(client.app, base_url=BASE)
+    assert _register(guest, "sam@example.com", code).status_code == 303
+    user = admin_repo.find_user_by_email(db, "sam@example.com")
+    assert user is not None and user.note == "曹靖伟"
+    page = client.get("/admin/users").text
+    assert "sam@example.com（曹靖伟）" in page and f"{ADMIN}（管理员）" in page
+
+    form = client.get(f"/admin/users/{user.id}/note")
+    assert (
+        form.status_code == 200 and "sam@example.com" in form.text and 'value="曹靖伟"' in form.text
+    )
+    resp = _post(client, f"/admin/users/{user.id}/note", {"note": "张佳兴"})
+    assert (
+        resp.status_code == 303 and resp.headers["location"] == "/admin/users?msg=user_note_saved"
+    )
+    page = client.get("/admin/users?msg=user_note_saved").text
+    assert "使用者的备注已保存" in page and "sam@example.com（张佳兴）" in page
+    audit = _audit(db, "user_note")
+    assert audit.actor_user_id == admin_id and audit.target == f"user:{user.id}"
+    assert audit.detail["old"] == "曹靖伟" and audit.detail["new"] == "张佳兴"
+
+    # 管理员自己也可以有备注；去掉备注后恢复原样
+    assert _post(client, f"/admin/users/{admin_id}/note", {"note": "我"}).status_code == 303
+    assert f"{ADMIN}（管理员，我）" in client.get("/admin/users").text
+    assert _post(client, f"/admin/users/{user.id}/note", {"note": " "}).status_code == 303
+    page = client.get("/admin/users").text
+    assert "sam@example.com（" not in page and "sam@example.com" in page
+
+
+def test_user_note_too_long_and_unknown_user(
+    client: TestClient, make_user: MakeUser, db: Session
+) -> None:
+    _admin(client, make_user)
+    user = make_user(USER)
+    resp = _post(client, f"/admin/users/{user.id}/note", {"note": "长" * 201})
+    assert resp.status_code == 422 and "备注不能超过 200 个字" in resp.text
+    db.expire_all()
+    found = admin_repo.find_user_by_email(db, USER)
+    assert found is not None and found.note == ""
+    assert client.get("/admin/users/999999/note").status_code == 404
+    assert _post(client, "/admin/users/999999/note", {"note": "x"}).status_code == 404
+
+
+def test_user_cannot_see_own_note(client: TestClient, make_user: MakeUser, db: Session) -> None:
+    admin_id = _admin(client, make_user)
+    user = make_user(USER)
+    assert (
+        _post(client, f"/admin/users/{user.id}/note", {"note": "只给管理员看的话"}).status_code
+        == 303
+    )
+    other = TestClient(client.app, base_url=BASE)
+    assert login_as(other, USER).status_code == 303
+    for path in ("/overview", "/settings", "/strategy", "/signals", "/manual", "/journal"):
+        assert "只给管理员看的话" not in other.get(path).text
+    del admin_id
 
 
 def test_disable_user_kills_sessions_and_blocks_login(

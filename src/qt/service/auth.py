@@ -165,9 +165,7 @@ def create_invite(s: Session, admin_id: int, note: str, valid_days: int, now: da
 
 def revoke_invite(s: Session, admin_id: int, invite_id: int, now: datetime) -> Invite:
     """作废邀请码；已被使用的不能作废，已作废的重复作废无副作用。"""
-    invite = s.get(Invite, invite_id, with_for_update=True)
-    if invite is None:
-        raise NotFoundError("邀请码不存在")
+    invite = _lock_invite(s, invite_id)
     if invite.used_by is not None:
         raise AuthError("邀请码已被使用，不能作废")
     if invite.revoked_at is None:
@@ -175,6 +173,55 @@ def revoke_invite(s: Session, admin_id: int, invite_id: int, now: datetime) -> I
         s.flush()
         repo.add_audit(s, admin_id, "invite_revoke", f"invite:{invite.id}", {}, web_actor(admin_id))
     return invite
+
+
+NOTE_MAX_LENGTH = 200
+
+
+def clean_note(note: str) -> str:
+    """备注去掉首尾空白；超过 NOTE_MAX_LENGTH 个字的拒绝。"""
+    cleaned = note.strip()
+    if len(cleaned) > NOTE_MAX_LENGTH:
+        raise AuthError(f"备注不能超过 {NOTE_MAX_LENGTH} 个字")
+    return cleaned
+
+
+def _lock_invite(s: Session, invite_id: int) -> Invite:
+    invite = s.get(Invite, invite_id, with_for_update=True)
+    if invite is None:
+        raise NotFoundError("邀请码不存在")
+    return invite
+
+
+def set_invite_note(s: Session, admin_id: int, invite_id: int, note: str) -> Invite:
+    """管理员修改邀请码的备注（任何状态的邀请码都可以改；改成空就是去掉备注）。"""
+    cleaned = clean_note(note)
+    invite = _lock_invite(s, invite_id)
+    if invite.note != cleaned:
+        old = invite.note
+        invite.note = cleaned
+        s.flush()
+        repo.add_audit(
+            s,
+            admin_id,
+            "invite_note",
+            f"invite:{invite.id}",
+            {"old": old, "new": cleaned},
+            web_actor(admin_id),
+        )
+    return invite
+
+
+def delete_invite(s: Session, admin_id: int, invite_id: int, now: datetime) -> None:
+    """管理员删除一条邀请码记录（任何状态都可以删）。还没用掉的，删除后注册链接随之失效；
+
+    已使用的，删除不影响用它注册的账号。删除前的备注、状态、使用者编号记入审计日志。
+    """
+    invite = _lock_invite(s, invite_id)
+    detail = {"note": invite.note, "state": invite_state(invite, now), "used_by": invite.used_by}
+    s.delete(invite)
+    s.flush()
+    repo.add_audit(s, admin_id, "invite_delete", f"invite:{invite_id}", detail, web_actor(admin_id))
 
 
 def invite_state(invite: Invite, now: datetime) -> Literal["usable", "used", "expired", "revoked"]:
@@ -310,6 +357,7 @@ def register(
     if invite is not None:
         invite.used_by = user.id
         invite.used_at = now
+        user.note = invite.note  # 邀请码上写的"给谁的"作为使用者备注的初始值，管理员之后可以改
     s.flush()
     token = issue_email_token(s, user.id, "verify", cfg.verify_token_hours, now)
     repo.add_audit(
@@ -595,6 +643,25 @@ def set_user_status(
         {"sessions_removed": removed},
         web_actor(admin_id),
     )
+    return user
+
+
+def set_user_note(s: Session, admin_id: int, user_id: int, note: str) -> User:
+    """管理员修改使用者的备注（只在管理页显示；改成空就是去掉备注）。"""
+    cleaned = clean_note(note)
+    user = repo.get_user(s, user_id)
+    if user.note != cleaned:
+        old = user.note
+        user.note = cleaned
+        s.flush()
+        repo.add_audit(
+            s,
+            user_id,
+            "user_note",
+            f"user:{user_id}",
+            {"old": old, "new": cleaned},
+            web_actor(admin_id),
+        )
     return user
 
 
