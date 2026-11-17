@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig, load_config
+from qt.data.quotes import LiveQuote
 from qt.data.store import ParquetStore
 from qt.db import admin_repo
 from qt.db.models import Subscription, User
@@ -27,7 +28,7 @@ from qt.service.accounts import create_subscription, create_user
 from qt.service.actor import CLI
 from qt.service.market import StoreMarket, build_store_market
 from qt.web.app import create_app
-from qt.web.deps import WebDeps
+from qt.web.deps import WebDeps, no_quotes
 from tests.fakes import populate_trading_store
 from tests.jobs.conftest import CASH, DAY, Env, FakeClock, evening
 
@@ -86,8 +87,11 @@ def make_deps(
     mail_dir: Path,
     base_url: str = BASE,
     calendar: Callable[[], TradingCalendar] = _calendar,
+    quotes: Callable[[Collection[str], datetime], dict[str, LiveQuote]] = no_quotes,
 ) -> WebDeps:
-    """按测试需要构造 WebDeps；后台线程关闭。calendar 缺省是只有 2026-11-16 一天的日历。"""
+    """按测试需要构造 WebDeps；后台线程关闭。calendar 缺省是只有 2026-11-16 一天的日历；
+    quotes 缺省不取盘中报价。
+    """
     store = ParquetStore(tmp_path / "data")
     return WebDeps(
         engine=engine,
@@ -98,6 +102,7 @@ def make_deps(
         store=store,
         calendar=calendar,
         market=small_market(store, calendar),
+        quotes=quotes,
         background=False,
     )
 
@@ -120,10 +125,20 @@ def world(tmp_path: Path, db_engine: Engine, db: Session) -> World:
     return World(tmp_path, db_engine)
 
 
-def world_deps(world: World, engine: Engine, tmp_path: Path) -> WebDeps:
+def world_deps(
+    world: World,
+    engine: Engine,
+    tmp_path: Path,
+    quotes: Callable[[Collection[str], datetime], dict[str, LiveQuote]] = no_quotes,
+) -> WebDeps:
     """用 World 的交易日历、行情存储（同一目录）与时钟构造 WebDeps。"""
     return make_deps(
-        engine, tmp_path, world.clock, tmp_path / "mails", calendar=lambda: world.calendar
+        engine,
+        tmp_path,
+        world.clock,
+        tmp_path / "mails",
+        calendar=lambda: world.calendar,
+        quotes=quotes,
     )
 
 

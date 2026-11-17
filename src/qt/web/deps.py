@@ -22,6 +22,7 @@ from starlette.exceptions import HTTPException
 
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig
+from qt.data.quotes import LiveQuote
 from qt.data.store import ParquetStore
 from qt.db.models import User, WebSession
 from qt.mail.send import Sender
@@ -100,6 +101,12 @@ FLASH_MESSAGES: dict[str, str] = {
 }
 
 
+def no_quotes(symbols: Collection[str], now: datetime) -> dict[str, LiveQuote]:
+    """不取盘中报价。"""
+    del symbols, now
+    return {}
+
+
 @dataclass(frozen=True)
 class WebDeps:
     """网页进程的运行环境。测试直接构造；qt web 由 Runtime 构造。"""
@@ -113,6 +120,8 @@ class WebDeps:
     calendar: Callable[[], TradingCalendar]
     # (今天, 账本涉及的股票集合) -> 行情；面板只覆盖这些股票，由 MarketCache.get 提供
     market: Callable[[date, Collection[str]], StoreMarket]
+    # (股票集合, 当前时间) -> 盘中报价；只用于持仓表的显示。缺省不取报价，页面显示收盘价
+    quotes: Callable[[Collection[str], datetime], dict[str, LiveQuote]] = no_quotes
     background: bool = True  # 是否启动补发账号邮件、每日清理的后台线程（测试里关掉）
     secure: bool = field(init=False)
 

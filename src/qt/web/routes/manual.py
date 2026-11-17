@@ -24,7 +24,7 @@ from qt.service.market import StoreMarket, known_symbols
 from qt.web.app import route
 from qt.web.deps import FLASH_MESSAGES, Current, CurrentUser, DbSession, Deps, WebDeps, render
 from qt.web.forms import FormError, parse_date, parse_money, parse_shares
-from qt.web.routes.common import stock_names
+from qt.web.routes.common import live_context, stock_names
 
 router = APIRouter()
 
@@ -33,6 +33,7 @@ _Values = dict[str, str]
 _ONLY_MAIN_BOARD = "目前只支持沪深主板股票"
 _FAILED = (ValidationError, LedgerInconsistentError)
 _STALE_FORM = "表单已失效，请重新填写后提交"
+_HOLDINGS_URL = "/manual/holdings"
 _REPAIR_HINT = "可以到手动账页的流水里作废有问题的记录，或补录入金"
 _SIDES = {"buy": Side.BUY, "sell": Side.SELL}
 _CASH_KINDS: dict[str, Literal["deposit", "withdraw"]] = {
@@ -181,17 +182,7 @@ def _manual_page(
     error: str | None = None,
     status_code: int = 200,
 ) -> Response:
-    today = deps.now().date()
-    page = views.manual_page(
-        s,
-        found.user.id,
-        sub.id,
-        _market(deps, s, found, sub),
-        deps.calendar(),
-        deps.cfg,
-        today,
-        names=stock_names(deps),
-    )
+    page = _book_page(deps, s, found, sub)
     flash = FLASH_MESSAGES.get(msg or "")
     if entry is not None:
         # 网址里的流水编号只在本人当前手动账里找：别人的、不存在的一律 404，不当作没给
@@ -205,8 +196,36 @@ def _manual_page(
         "flash": flash,
         "error": error,
         "page": page,
+        **live_context(deps, page.holdings, _HOLDINGS_URL, levels=True),
     }
     return render(request, "manual.html", context, found=found, status_code=status_code)
+
+
+def _book_page(
+    deps: WebDeps, s: Session, found: Current, sub: Subscription
+) -> views.ManualBookPage:
+    return views.manual_page(
+        s,
+        found.user.id,
+        sub.id,
+        _market(deps, s, found, sub),
+        deps.calendar(),
+        deps.cfg,
+        deps.now().date(),
+        names=stock_names(deps),
+    )
+
+
+@route(router, "GET", "/manual/holdings", "user")
+def manual_holdings(request: Request, found: CurrentUser, deps: Deps, s: DbSession) -> Response:
+    """只返回持仓表这一块，供页面在交易时段定时替换。只看当前未关闭的订阅，不接受订阅编号；
+
+    没有订阅、或流水互相对不上（算不出持仓）时返回空的一块，页面随之停止刷新。
+    """
+    sub = _open_sub(s, found)
+    rows = [] if sub is None else _book_page(deps, s, found, sub).holdings
+    context = live_context(deps, rows, _HOLDINGS_URL, levels=True)
+    return render(request, "_holdings_live.html", context, found=found)
 
 
 @route(router, "GET", "/manual", "user")

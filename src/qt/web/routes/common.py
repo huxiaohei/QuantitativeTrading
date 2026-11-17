@@ -1,10 +1,12 @@
 """只读页面共用的部分：按网址里的 sub 取订阅（归属由服务层校验）、页面顶部需要的数据。"""
 
+from collections.abc import Sequence
 from typing import Annotated
 
 from fastapi import Query
 from sqlalchemy.orm import Session
 
+from qt.data.quotes import in_session
 from qt.db.models import Subscription
 from qt.service import views
 from qt.service.market import security_names
@@ -32,3 +34,24 @@ def page_context(
 def stock_names(deps: WebDeps) -> dict[str, str]:
     """股票代码 -> 名称。"""
     return security_names(deps.store)
+
+
+LIVE_SECONDS = 15
+
+
+def live_context(
+    deps: WebDeps, rows: Sequence[views.HoldingRow], url: str, *, levels: bool
+) -> dict[str, object]:
+    """持仓片段的模板数据。交易时段内取盘中报价并让页面每 LIVE_SECONDS 秒重新取这一块；
+
+    其余时间不请求报价，显示收盘价，也不带刷新地址（页面随之停止刷新）。
+    """
+    now = deps.now()
+    polling = bool(rows) and in_session(now, deps.calendar())
+    quotes = deps.quotes([row.symbol for row in rows], now) if polling else {}
+    return {
+        "live": views.apply_quotes(rows, quotes),
+        "live_url": url if polling else None,
+        "live_seconds": LIVE_SECONDS,
+        "levels": levels,
+    }

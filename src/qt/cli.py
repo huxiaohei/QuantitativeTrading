@@ -338,6 +338,7 @@ def web_command(
     import uvicorn
     from sqlalchemy.orm import Session
 
+    from qt.data.quotes import QuoteCache, fetch_tencent
     from qt.db import admin_repo
     from qt.web.app import create_app
     from qt.web.deps import WebDeps
@@ -365,6 +366,7 @@ def web_command(
             store=runtime.store(),
             calendar=runtime.calendar,
             market=market.get,
+            quotes=QuoteCache(fetch_tencent).get,
         )
     except RuntimeError as exc:  # SetupError 与缺少邮件环境变量都是 RuntimeError
         typer.echo(f"无法启动：{exc}")

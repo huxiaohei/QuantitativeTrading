@@ -32,7 +32,7 @@
 </section>
 <section class="card">
   <h2>持仓</h2>
-  {{ holdings_table(page.holdings, levels=true) }}
+  {% include "_holdings_live.html" %}
 </section>
 {% endif %}
 <section class="card">
