@@ -1,14 +1,15 @@
 """两本账的展示：净值、现金、持仓、流水、净值序列；以及页面行情需要覆盖的股票集合。"""
 
-from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import date
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import date, datetime
 
 from sqlalchemy.orm import Session
 
 from qt.backtest.state import load_state
 from qt.calendar import TradingCalendar
 from qt.config import AppConfig, StrategyConfig
+from qt.data.quotes import LiveQuote
 from qt.db import repo
 from qt.db.models import LedgerEntry
 from qt.models import Position
@@ -47,8 +48,11 @@ class HoldingRow:
     """一只持仓。cost 为含费用的买入总额；取不到收盘价（没有行情）时 close、value、ret、pnl
     为 None。
 
-    ret、pnl 含持有期间收到的现金分红；stop_price、take_price 为止损位、止盈位（手动账才有，
-    移动止盈还没启动时止盈位为 None）。
+    ret、pnl 含持有期间收到的现金分红（cash_received）；stop_price、take_price 为止损位、
+    止盈位（手动账才有，移动止盈还没启动时止盈位为 None）。
+
+    price_source 说明 close 是什么价：close 为收盘价（缺省）；live 为盘中价；suspended 为
+    盘中报价显示停牌或还没成交时的昨收。后两种只由 apply_quotes 给出，只用于显示。
     """
 
     symbol: str
@@ -64,6 +68,21 @@ class HoldingRow:
     origin_label: str
     stop_price: float | None
     take_price: float | None
+    cash_received: float = 0.0
+    price_source: str = "close"
+
+
+@dataclass(frozen=True)
+class LiveHoldings:
+    """按盘中报价改过现价的持仓。quote_time 是用到的报价里最新的时间（没有用到报价为 None）；
+    live_count、suspended_count、close_count 分别是用盘中价、标为停牌、仍用收盘价的只数。
+    """
+
+    rows: list[HoldingRow]
+    quote_time: datetime | None
+    live_count: int
+    suspended_count: int
+    close_count: int
 
 
 @dataclass(frozen=True)
@@ -169,6 +188,49 @@ def _holding(
         origin_label=origin_label(origin),
         stop_price=levels[0],
         take_price=levels[1],
+        cash_received=pos.cash_received,
+    )
+
+
+def _repriced(row: HoldingRow, price: float, source: str) -> HoldingRow:
+    value = row.shares * price
+    return replace(
+        row,
+        close=price,
+        value=value,
+        ret=(value + row.cash_received) / row.cost - 1,
+        pnl=value + row.cash_received - row.cost,
+        price_source=source,
+    )
+
+
+def apply_quotes(rows: Sequence[HoldingRow], quotes: Mapping[str, LiveQuote]) -> LiveHoldings:
+    """把盘中报价覆盖到持仓上，只用于显示：现价、市值、盈亏、收益按报价重算，其余不变。
+
+    报价的现价大于 0 用现价；现价为 0（停牌或还没成交）且有昨收时用昨收并标为停牌；
+    没有报价的保持收盘价。
+    """
+    out: list[HoldingRow] = []
+    times: list[datetime] = []
+    live = suspended = 0
+    for row in rows:
+        quote = quotes.get(row.symbol)
+        if quote is not None and quote.price > 0:
+            out.append(_repriced(row, quote.price, "live"))
+            times.append(quote.at)
+            live += 1
+        elif quote is not None and quote.prev_close > 0:
+            out.append(_repriced(row, quote.prev_close, "suspended"))
+            times.append(quote.at)
+            suspended += 1
+        else:
+            out.append(row)
+    return LiveHoldings(
+        rows=out,
+        quote_time=max(times, default=None),
+        live_count=live,
+        suspended_count=suspended,
+        close_count=len(out) - live - suspended,
     )
 
 
