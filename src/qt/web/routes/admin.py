@@ -5,7 +5,8 @@
 邀请码、使用者列表、运行记录这些页面只有账号层面的信息。管理员另可以只读查看某个使用者的手动账、
 系统账和策略参数（/admin/users/{user_id}/manual、system、strategy；2026-11-17 起，
 使用条款第八节已写明）：
-这些路由只有 GET，不提供任何替使用者录入、作废、改参数的入口；每次打开页面记一条审计日志。
+这些路由只有 GET，不提供任何替使用者录入、作废、改参数的入口；每次打开页面记一条审计日志，
+持仓表的定时刷新 10 分钟内只记一条。
 使用者的信号、日志、总览不在其中。
 """
 
@@ -360,10 +361,22 @@ def _view_base(target: User, tab: str) -> dict[str, object]:
     }
 
 
-def _record_view(s: Session, found: Current, target: User, tab: str) -> None:
-    repo.add_audit(
-        s, target.id, "admin_view", f"user:{target.id}", {"page": tab}, web_actor(found.user.id)
-    )
+_VIEW_LOG_MINUTES = 10
+
+
+def _record_view(s: Session, found: Current, target: User, tab: str, *, always: bool) -> None:
+    """记一条"管理员查看了谁的哪一页"。打开整页每次都记（always）；持仓表这一块在交易时段会被
+    定时请求，同一管理员对同一人同一本账 _VIEW_LOG_MINUTES 分钟内只记一条——直接请求这一块
+    （不经过整页）也因此留痕。
+    """
+    key = f"user:{target.id}"
+    if not always:
+        recent = admin_repo.recent_audit_details(
+            s, found.user.id, "admin_view", key, _VIEW_LOG_MINUTES
+        )
+        if any(detail.get("page") == tab for detail in recent):
+            return
+    repo.add_audit(s, target.id, "admin_view", key, {"page": tab}, web_actor(found.user.id))
 
 
 def _manual_of(deps: WebDeps, s: Session, target: User) -> views.ManualBookPage | None:
@@ -404,7 +417,7 @@ def view_manual(
         "page": page,
         **live_context(deps, rows, url, levels=True),
     }
-    _record_view(s, found, target, "manual")
+    _record_view(s, found, target, "manual", always=True)
     return render(request, "admin_user_view.html", context, found=found)
 
 
@@ -412,12 +425,13 @@ def view_manual(
 def view_manual_holdings(
     request: Request, user_id: int, found: CurrentUser, deps: Deps, s: DbSession
 ) -> Response:
-    """查看页里手动账持仓表这一块，供交易时段定时替换（不另记审计日志）。"""
+    """查看页里手动账持仓表这一块，供交易时段定时替换（审计日志 10 分钟内不重复记）。"""
     target = repo.get_user(s, user_id)
     page = _manual_of(deps, s, target)
     rows = [] if page is None else page.holdings
     url = f"/admin/users/{target.id}/manual/holdings"
     context = live_context(deps, rows, url, levels=True)
+    _record_view(s, found, target, "manual", always=False)
     return render(request, "_holdings_live.html", context, found=found)
 
 
@@ -434,7 +448,7 @@ def view_system(
         "view": view,
         **live_context(deps, rows, url, levels=False),
     }
-    _record_view(s, found, target, "system")
+    _record_view(s, found, target, "system", always=True)
     return render(request, "admin_user_view.html", context, found=found)
 
 
@@ -442,12 +456,13 @@ def view_system(
 def view_system_holdings(
     request: Request, user_id: int, found: CurrentUser, deps: Deps, s: DbSession
 ) -> Response:
-    """查看页里系统账持仓表这一块，供交易时段定时替换（不另记审计日志）。"""
+    """查看页里系统账持仓表这一块，供交易时段定时替换（审计日志 10 分钟内不重复记）。"""
     target = repo.get_user(s, user_id)
     view = _system_of(deps, s, target)
     rows = [] if view is None else view.holdings
     url = f"/admin/users/{target.id}/system/holdings"
     context = live_context(deps, rows, url, levels=False)
+    _record_view(s, found, target, "system", always=False)
     return render(request, "_holdings_live.html", context, found=found)
 
 
@@ -468,7 +483,7 @@ def view_strategy(
         "rows": rows,
         "history": [v for v in all_views if current is None or v.id != current.id],
     }
-    _record_view(s, found, target, "strategy")
+    _record_view(s, found, target, "strategy", always=True)
     return render(request, "admin_user_view.html", context, found=found)
 
 

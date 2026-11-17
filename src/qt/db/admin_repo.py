@@ -1,11 +1,21 @@
 """跨使用者查询：只给每日运行、管理后台等系统级调用方使用，业务接口不得引用。"""
 
-from datetime import date
+from datetime import date, timedelta
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from qt.db.models import RUN_FINISHED, DailyRun, Followup, Invite, Outbox, Subscription, User
+from qt.db.models import (
+    RUN_FINISHED,
+    AuditLog,
+    DailyRun,
+    Followup,
+    Invite,
+    Outbox,
+    Subscription,
+    User,
+)
 from qt.service.errors import NotFoundError
 
 
@@ -99,3 +109,17 @@ def latest_done_day(s: Session) -> date | None:
     """
     stmt = select(func.max(DailyRun.trade_day)).where(DailyRun.status.in_(RUN_FINISHED))
     return s.scalar(stmt)
+
+
+def recent_audit_details(
+    s: Session, actor_user_id: int, action: str, target: str, minutes: int
+) -> list[dict[str, Any]]:
+    """某操作人最近 minutes 分钟内对同一对象的同类审计记录的 detail（按数据库时间算）。"""
+    since = func.now() - timedelta(minutes=minutes)
+    stmt = select(AuditLog.detail).where(
+        AuditLog.actor_user_id == actor_user_id,
+        AuditLog.action == action,
+        AuditLog.target == target,
+        AuditLog.created_at >= since,
+    )
+    return list(s.scalars(stmt))

@@ -10,10 +10,13 @@ from sqlalchemy.orm import Session
 
 from qt.db import repo
 from qt.db.models import AuditLog, LedgerEntry, User
+from qt.service import accounts
+from qt.service.actor import CLI
 from qt.web.app import create_app
 from qt.web.deps import WebDeps
 from tests.jobs.conftest import run_two_days
 from tests.web.conftest import BASE, MakeUser, World, login_as, world_deps
+from tests.web.test_access import owned_digest
 
 ADMIN = "admin@example.com"
 USER = "user@example.com"
@@ -86,16 +89,56 @@ def test_admin_sees_books_and_strategy_read_only_and_each_view_is_logged(
     assert len(list(db.scalars(select(LedgerEntry)))) == entries_before
 
 
-def test_holdings_fragments_work_and_are_not_logged(
+def test_holdings_fragments_are_logged_once_per_book_not_on_every_poll(
     client: TestClient, make_user: MakeUser, world: World, db: Session
+) -> None:
+    admin, user = _setup(client, make_user)
+    run_two_days(world.env, db, user.id)
+    # 不经过整页、直接请求持仓表这一块：也要留痕；反复请求（定时刷新）不重复记
+    for _ in range(3):
+        for book in ("manual", "system"):
+            resp = client.get(f"/admin/users/{user.id}/{book}/holdings")
+            assert resp.status_code == 200
+            assert "<html" not in resp.text and "data-live-holdings" in resp.text
+    logged = _views(db)
+    assert sorted(row.detail["page"] for row in logged) == ["manual", "system"]
+    assert all(row.actor_user_id == admin.id for row in logged)
+
+    # 打开整页之后的定时刷新不再多记；整页每次都记
+    assert client.get(f"/admin/users/{user.id}/manual").status_code == 200
+    assert client.get(f"/admin/users/{user.id}/manual/holdings").status_code == 200
+    assert [row.detail["page"] for row in _views(db)].count("manual") == 2
+
+
+def test_viewing_changes_nothing_of_the_user(
+    client: TestClient, make_user: MakeUser, world: World, db: Session, db_engine: Engine
 ) -> None:
     _admin, user = _setup(client, make_user)
     run_two_days(world.env, db, user.id)
-    for book in ("manual", "system"):
-        resp = client.get(f"/admin/users/{user.id}/{book}/holdings")
-        assert resp.status_code == 200
-        assert "<html" not in resp.text and "data-live-holdings" in resp.text
-    assert _views(db) == []
+    before = owned_digest(db_engine, user.id)
+    world.clock.now = world.clock.now.replace(hour=10, minute=0, second=0)
+    paths = [f"/admin/users/{user.id}/{tab}" for tab in TABS]
+    paths += [f"/admin/users/{user.id}/{book}/holdings" for book in ("manual", "system")]
+    for path in paths:
+        assert client.get(path).status_code == 200, path
+    after = owned_digest(db_engine, user.id)
+    changed = {table for table in before | after if before.get(table) != after.get(table)}
+    assert changed <= {"audit_log"}, changed
+
+
+def test_closed_subscription_can_still_be_viewed(
+    client: TestClient, make_user: MakeUser, world: World, db: Session
+) -> None:
+    _admin, user = _setup(client, make_user)
+    sub = run_two_days(world.env, db, user.id)
+    accounts.close_subscription(db, user.id, sub.id, actor=CLI)
+    db.commit()
+    for tab in TABS:
+        resp = client.get(f"/admin/users/{user.id}/{tab}")
+        assert resp.status_code == 200, tab
+        assert "已关闭" in resp.text
+        for link in WRITE_LINKS:
+            assert link not in resp.text
 
 
 def test_live_url_points_at_the_admin_fragment_during_session(
