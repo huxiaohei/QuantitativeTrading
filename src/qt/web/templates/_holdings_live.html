@@ -1,10 +1,10 @@
-{# 持仓表这一块：交易时段内带刷新地址，由 /static/live.js 定时替换整块 #}
+{# 持仓表这一块：带 data-live-url 时由 /static/live.js 过 data-live-seconds 秒替换整块 #}
 {% from "_tables.html" import holdings_table %}
 <div id="holdings" data-live-holdings{% if live_url %} data-live-url="{{ live_url }}" data-live-seconds="{{ live_seconds }}"{% endif %}>
 {{ holdings_table(live.rows, levels=levels) }}
-{% if live_url %}
+{% if live_on %}
 <p class="muted">
-  {% if live.quote_time %}现价为盘中价，报价时间 {{ live.quote_time.strftime("%H:%M:%S") }}，每 {{ live_seconds }} 秒更新；仅供查看，信号仍按每晚收盘价计算。{% endif %}
+  {% if live.live_count %}现价为盘中价，报价时间 {{ live.quote_time.strftime("%H:%M:%S") }}，交易时段内自动更新；仅供查看，信号仍按每晚收盘价计算。{% endif %}
   {% if live.close_count %}{{ live.close_count }} 只暂时取不到盘中价，显示的是收盘价。{% endif %}
 </p>
 {% endif %}

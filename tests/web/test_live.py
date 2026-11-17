@@ -1,7 +1,7 @@
 """持仓表的盘中价：交易时段内带刷新地址并按报价重算，其余时间与原来一样；片段路由的归属与出错情形。"""
 
 from collections.abc import Collection, Iterator
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 import pytest
@@ -13,14 +13,15 @@ from qt.data.quotes import LiveQuote, QuoteCache
 from qt.db import repo
 from qt.db.models import Subscription, User
 from qt.service import views
+from qt.service.errors import LedgerInconsistentError
 from qt.service.market import build_store_market
+from qt.service.views import books
 from qt.web.app import create_app
 from qt.web.deps import WebDeps
 from tests.jobs.conftest import DAY, run_two_days
 from tests.web.conftest import BASE, CFG, MakeUser, World, login_as, subscribe, world_deps
 
 LIVE_URL = 'data-live-url="/system/holdings"'
-QUOTE_AT = datetime(2026, 1, 1, 10, 0, 3)
 
 
 class FakeQuotes:
@@ -31,18 +32,22 @@ class FakeQuotes:
         self.prices: dict[str, float] = {}
         self.missing: set[str] = set()
         self.fail = False
+        self.at = datetime(2000, 1, 1)
 
     def fetch(self, symbols: Collection[str]) -> dict[str, LiveQuote]:
         self.calls.append(set(symbols))
         if self.fail:
             raise TimeoutError("timed out")
         found = [symbol for symbol in symbols if symbol not in self.missing]
-        return {s: LiveQuote(self.prices.get(s, 123.45), 100.0, QUOTE_AT) for s in found}
+        return {s: LiveQuote(self.prices.get(s, 123.45), 100.0, self.at) for s in found}
 
 
 @pytest.fixture
-def quotes() -> FakeQuotes:
-    return FakeQuotes()
+def quotes(world: World) -> FakeQuotes:
+    """报价时间是网页时钟那一天的 10:00:03。"""
+    fake = FakeQuotes()
+    fake.at = datetime.combine(world.clock.now.date(), time(10, 0, 3))
+    return fake
 
 
 @pytest.fixture
@@ -105,8 +110,8 @@ def test_in_session_the_table_uses_live_prices_and_carries_the_refresh_url(
     assert len(quotes.calls) == 1  # 10 秒内共用缓存，不再请求
 
 
-@pytest.mark.parametrize(("hour", "minute"), [(9, 29), (11, 31), (12, 59), (15, 1), (18, 30)])
-def test_outside_session_nothing_changes_and_no_quote_is_requested(
+@pytest.mark.parametrize(("hour", "minute"), [(15, 1), (18, 30)])
+def test_after_close_nothing_changes_and_no_quote_is_requested(
     client: TestClient,
     make_user: MakeUser,
     world: World,
@@ -123,6 +128,72 @@ def test_outside_session_nothing_changes_and_no_quote_is_requested(
         assert "data-live-holdings" in text
         assert "data-live-url" not in text and "盘中价" not in text and "123.45" not in text
     assert quotes.calls == []
+    del user
+
+
+def test_before_open_the_page_waits_for_the_open_without_requesting_quotes(
+    client: TestClient, make_user: MakeUser, world: World, db: Session, quotes: FakeQuotes
+) -> None:
+    user = _login(client, make_user)
+    run_two_days(world.env, db, user.id)
+    _at(world, 9, 28)
+    for path in ("/system", "/system/holdings"):
+        text = _get(client, path)
+        assert LIVE_URL in text and 'data-live-seconds="120"' in text
+        assert "盘中价" not in text and "123.45" not in text
+    assert quotes.calls == []
+    del user
+
+
+def test_lunch_break_keeps_morning_quotes_and_resumes_at_one(
+    client: TestClient, make_user: MakeUser, world: World, db: Session, quotes: FakeQuotes
+) -> None:
+    user = _login(client, make_user)
+    run_two_days(world.env, db, user.id)
+    _at(world, 12, 58)
+    text = _get(client, "/system/holdings")
+    assert LIVE_URL in text and 'data-live-seconds="120"' in text
+    assert "123.45" in text and "现价为盘中价" in text
+    _at(world, 13, 0)
+    assert 'data-live-seconds="15"' in _get(client, "/system/holdings")
+    del user
+
+
+def test_a_quote_left_from_another_day_is_not_shown_as_live(
+    client: TestClient, make_user: MakeUser, world: World, db: Session, quotes: FakeQuotes
+) -> None:
+    user = _login(client, make_user)
+    sub = run_two_days(world.env, db, user.id)
+    held = _held(world, db, user, sub)
+    quotes.at -= timedelta(days=1)
+    _at(world, 10, 0)
+    text = _get(client, "/system/holdings")
+    assert "123.45" not in text and "现价为盘中价" not in text
+    assert f"{len(held)} 只暂时取不到盘中价，显示的是收盘价。" in text
+
+
+def test_manual_fragment_with_inconsistent_ledger_is_empty_and_does_not_poll(
+    client: TestClient,
+    make_user: MakeUser,
+    world: World,
+    db: Session,
+    quotes: FakeQuotes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = _login(client, make_user)
+    sub = run_two_days(world.env, db, user.id)
+    _at(world, 10, 0)
+
+    def broken(*args: object, **kwargs: object) -> views.ManualBookView:
+        del args, kwargs
+        raise LedgerInconsistentError("现金不足")
+
+    monkeypatch.setattr(books, "manual_book", broken)
+    text = _get(client, "/manual/holdings")
+    assert "data-live-holdings" in text and "data-live-url" not in text
+    assert "没有持仓。" in text
+    assert quotes.calls == []
+    del sub
 
 
 def test_quote_failure_falls_back_to_close_and_page_still_works(
@@ -149,13 +220,13 @@ def test_suspended_and_missing_symbols_are_labelled(
     quotes.prices = {held[0].symbol: 0.0}
     _at(world, 13, 0)
     text = _get(client, "/system/holdings")
-    assert '100.00 <span class="muted">停牌</span>' in text
+    assert '100.00 <span class="muted">停牌或暂无成交</span>' in text
 
-    quotes.missing = {h.symbol for h in held}
-    world.clock.advance(world.clock.now.replace(second=30) - world.clock.now)
+    # 全部是停牌或暂无成交：没有一只是盘中价，不写"现价为盘中价"
+    quotes.prices = {h.symbol: 0.0 for h in held}
+    world.clock.advance(timedelta(seconds=30))
     text = _get(client, "/system/holdings")
-    # 来源这次没给：继续用上一次的报价
-    assert "停牌" in text and "暂时取不到" not in text
+    assert text.count("停牌或暂无成交") == len(held) and "现价为盘中价" not in text
 
 
 def test_manual_page_and_fragment(

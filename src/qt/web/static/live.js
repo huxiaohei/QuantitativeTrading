@@ -5,6 +5,7 @@
   var MARK = "data-live-holdings";
   var timer = null;
   var busy = false;
+  var stopped = false;
 
   function block() {
     return document.querySelector("[data-live-url]");
@@ -12,17 +13,18 @@
 
   function refresh() {
     var el = block();
-    if (el === null || busy || document.hidden) {
+    if (el === null || busy || stopped || document.hidden) {
       return;
     }
     busy = true;
     fetch(el.getAttribute("data-live-url"), { credentials: "same-origin", cache: "no-store" })
       .then(function (response) {
-        // 登录过期时会被转到登录页：不是这一块的内容一律不替换
-        if (!response.ok || response.redirected) {
+        // 登录过期时会被转到登录页：不替换，也不再继续取（刷新页面后会要求重新登录）
+        if (response.redirected) {
+          stopped = true;
           return null;
         }
-        return response.text();
+        return response.ok ? response.text() : null;
       })
       .then(function (html) {
         var current = block();
@@ -50,7 +52,7 @@
       timer = null;
     }
     var el = block();
-    if (el === null) {
+    if (el === null || stopped) {
       return;
     }
     var seconds = parseInt(el.getAttribute("data-live-seconds"), 10);

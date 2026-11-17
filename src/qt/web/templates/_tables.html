@@ -73,7 +73,7 @@
     <td>{{ h.symbol }} {{ h.name }}</td>
     <td class="num">{{ h.shares | shares }}</td>
     <td class="num">{{ h.cost_price | price }}</td>
-    <td class="num">{{ h.close | price }}{% if h.price_source == "suspended" %} <span class="muted">停牌</span>{% endif %}</td>
+    <td class="num">{{ h.close | price }}{% if h.price_source == "suspended" %} <span class="muted">停牌或暂无成交</span>{% endif %}</td>
     <td class="num">{{ h.value | money }}</td>
     <td class="num {{ h.pnl | trend }}">{{ h.pnl | money }}</td>
     <td class="num {{ h.ret | trend }}">{{ h.ret | pct }}</td>

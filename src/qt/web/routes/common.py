@@ -6,7 +6,7 @@ from typing import Annotated
 from fastapi import Query
 from sqlalchemy.orm import Session
 
-from qt.data.quotes import in_session
+from qt.data.quotes import LivePlan, live_plan, same_day
 from qt.db.models import Subscription
 from qt.service import views
 from qt.service.market import security_names
@@ -36,22 +36,21 @@ def stock_names(deps: WebDeps) -> dict[str, str]:
     return security_names(deps.store)
 
 
-LIVE_SECONDS = 15
-
-
 def live_context(
     deps: WebDeps, rows: Sequence[views.HoldingRow], url: str, *, levels: bool
 ) -> dict[str, object]:
-    """持仓片段的模板数据。交易时段内取盘中报价并让页面每 LIVE_SECONDS 秒重新取这一块；
-
-    其余时间不请求报价，显示收盘价，也不带刷新地址（页面随之停止刷新）。
+    """持仓片段的模板数据。交易日开盘到收盘之间用盘中报价（只留今天的报价），并告诉页面过多少秒
+    再来取这一块；收盘后、非交易日、没有持仓时不请求报价，显示收盘价，也不带刷新地址。
     """
     now = deps.now()
-    polling = bool(rows) and in_session(now, deps.calendar())
-    quotes = deps.quotes([row.symbol for row in rows], now) if polling else {}
+    plan = live_plan(now, deps.calendar()) if rows else LivePlan(False, None)
+    quotes = (
+        same_day(deps.quotes([row.symbol for row in rows], now), now) if plan.use_quotes else {}
+    )
     return {
         "live": views.apply_quotes(rows, quotes),
-        "live_url": url if polling else None,
-        "live_seconds": LIVE_SECONDS,
+        "live_on": plan.use_quotes,
+        "live_url": url if plan.seconds is not None else None,
+        "live_seconds": plan.seconds,
         "levels": levels,
     }

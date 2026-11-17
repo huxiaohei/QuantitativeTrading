@@ -167,19 +167,22 @@ def test_new_day_builds_again(world: World, counter: Counter) -> None:
     assert counter.calls == 2
 
 
-def test_keeps_at_most_eight_and_drops_least_recently_used(world: World, counter: Counter) -> None:
+def test_keeps_a_bounded_number_and_drops_least_recently_used(
+    world: World, counter: Counter
+) -> None:
     cache = _cache(world, [world.today])
-    sets = [{f"6000{i:02d}"} for i in range(10)]
-    for symbols in sets[:8]:
+    limit = web_market.MAX_ENTRIES
+    sets = [{f"6{i:05d}"} for i in range(limit + 2)]
+    for symbols in sets[:limit]:
         cache.get(world.today, symbols)
-    assert counter.calls == 8
+    assert counter.calls == limit
     cache.get(world.today, sets[0])  # 刚用过：成为最近使用
-    cache.get(world.today, sets[8])  # 第 9 份：丢掉最久未用的 sets[1]
-    assert counter.calls == 9
+    cache.get(world.today, sets[limit])  # 多出的一份：丢掉最久未用的 sets[1]
+    assert counter.calls == limit + 1
     cache.get(world.today, sets[0])
-    assert counter.calls == 9
+    assert counter.calls == limit + 1
     cache.get(world.today, sets[1])
-    assert counter.calls == 10
+    assert counter.calls == limit + 2
 
 
 def test_concurrent_first_gets_build_once(world: World, monkeypatch: pytest.MonkeyPatch) -> None:

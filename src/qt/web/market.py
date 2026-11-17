@@ -1,7 +1,8 @@
 """网页进程的行情缓存。
 
 全量指标面板在真实数据上要占几个 GB 内存（见任务报告的测量），服务器放不下，
-所以按"当前账本涉及的股票集合"缓存：键是（日期，股票集合），最多保留 8 份，最久未用的先丢。
+所以按"当前账本涉及的股票集合"缓存：键是（日期，股票集合），最多保留 24 份，最久未用的先丢
+（持仓表在交易时段定时刷新，每个打开的页面都会反复用到自己那一份；一份只覆盖一本账的几只股票）。
 构建在锁内进行，同时到来的请求等待同一次构建而不是各建一份。
 """
 
@@ -15,7 +16,7 @@ from qt.config import AppConfig
 from qt.data.store import ParquetStore
 from qt.service.market import StoreMarket, build_store_market
 
-MAX_ENTRIES = 8
+MAX_ENTRIES = 24
 
 
 class MarketCache:
